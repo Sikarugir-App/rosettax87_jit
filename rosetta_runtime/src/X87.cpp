@@ -21,8 +21,8 @@
 #include "openlibm/s_ilogb.h"
 
 #include "rosetta_core/CoreConfig.h"
-#include "rosetta_core/CustomTranslationHook.h"
 #include "rosetta_core/Opcode.h"
+#include "rosetta_core/RosettaCore.h"
 #include "rosetta_core/RuntimeLibC.h"
 #include "RuntimeConfig.h"
 // clang-format on
@@ -45,8 +45,8 @@
                      "br " #REGISTER);                                 \
     }
 
-#include "rosetta_core/CustomTranslationHook.h"
 #include "rosetta_core/Opcode.h"
+#include "rosetta_core/RosettaCore.h"
 #include "rosetta_core/RuntimeLibC.h"
 
 void* init_library(SymbolList const* a1, uint64_t a2, ThreadContextOffsets const* a3) {
@@ -54,7 +54,7 @@ void* init_library(SymbolList const* a1, uint64_t a2, ThreadContextOffsets const
     exportsInit();
     rosetta_set_config(&kConfig);
 
-    printf("RosettaRuntimex87 built %s\n", __DATE__ " " __TIME__);
+    printf("RosettaRuntimex87 built %s - Rosetta Version 0x%llx\n", __DATE__ " " __TIME__, (unsigned long long)kImports.version);
 
     uintptr_t runtime_library_base =
         reinterpret_cast<uintptr_t>(orig_init_library) - kOffsets.init_library_rva;
@@ -62,8 +62,8 @@ void* init_library(SymbolList const* a1, uint64_t a2, ThreadContextOffsets const
     uintptr_t transaction_result_size_addr =
         runtime_library_base + kOffsets.transaction_result_size_addr;
 
-    printf("Installing JIT Translation Hook at 0x%lx\n", (unsigned long)translation_ptr);
-    init_custom_translation_hook(translation_ptr, transaction_result_size_addr);
+    printf("Installing JIT Translation Hook at 0x%llx\n", translation_ptr);
+    rosetta_core_init(kImports.version, translation_ptr, transaction_result_size_addr);
     printf("JIT Translation Hook installed\n");
 
     return orig_init_library(a1, a2, a3);

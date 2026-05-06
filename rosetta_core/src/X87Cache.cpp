@@ -215,10 +215,10 @@ int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
                         uint64_t disabled_ops_mask) {
     int count = 0;
     for (int64_t i = insn_idx; i < num_instrs; i++) {
-        if (!is_handled_x87(instr_array[i].opcode))
+        if (!is_handled_x87(instr_array[i].opcode()))
             break;
         if (disabled_ops_mask) {
-            const auto id = opcode_to_id_local(instr_array[i].opcode);
+            const auto id = opcode_to_id_local(instr_array[i].opcode());
             if (id != OpcodeId::kCount &&
                 ((disabled_ops_mask >> static_cast<int>(id)) & 1u))
                 break;

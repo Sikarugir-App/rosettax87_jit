@@ -28,6 +28,8 @@ set(ROSETTA_CORE_SOURCES
     src/RuntimeRoutine.cpp
     src/RuntimeLibC.cpp
     src/IRModuleData.cpp
+    src/OpcodeCompatibility.cpp
+    src/RosettaCore.cpp
 )
 
 # --- Standard build (used by aotinvoke / oahd_inject) ---

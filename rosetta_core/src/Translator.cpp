@@ -84,7 +84,7 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                                        IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx)
     -> std::optional<int64_t> {
     const auto cur_instr = &instr_array[insn_idx];
-    const auto opcode = cur_instr->opcode;
+    const auto opcode = cur_instr->opcode();
     auto& cache = translation_result->x87_cache;
 
     // If extended FPR scratch is enabled, upgrade the mask from 8-reg to 16-reg form on first use.
