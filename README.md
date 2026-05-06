@@ -69,30 +69,25 @@ These flags are primarily useful for narrowing down bugs by selectively disablin
 | `ROSETTA_X87_DISABLE_OPS=op1,op2,...` | Disable specific opcodes (comma-separated) |
 | `ROSETTA_X87_DISABLE_FUSIONS=f1,f2,...` | Disable specific fusions (comma-separated) |
 | `ROSETTA_X87_LOGS=1` | Enable verbose logging output from the loader |
-| `ROSETTA_X87_FORCE_ATTACH=1` | Always attach the debugger, bypassing the automatic x64 detection |
-
-### Automatic x64 Bypass
-
-When used with Wine, `runtime_loader` automatically detects whether the Windows executable is 32-bit (x86) or 64-bit (x64) by reading its PE headers. 64-bit programs do not use x87 instructions, so the loader passes them through directly without attaching the debugger.
 
 ## Usage with Wine
 
-### Windows Applications
+> **Deprecated:** `wine@devel` removed support for the `ROSETTA_X87_PATH` environment variable, so the integration described below no longer works. There is no replacement at this time. The section is retained for historical reference.
 
-You can use the brew `wine@devel` cask with RosettaHack x87+JIT. It supports launching Windows applications through Wine with an environment variable `ROSETTA_X87_PATH`.
+### ~~Windows Applications~~
 
-1. Install `wine@devel` using [Homebrew](https://brew.sh/)
+~~You can use the brew `wine@devel` cask with RosettaHack x87+JIT. It supports launching Windows applications through Wine with an environment variable `ROSETTA_X87_PATH`.~~
 
-```bash
-brew install --cask wine@devel
-```
+~~1. Install `wine@devel` using [Homebrew](https://brew.sh/)~~
 
-2. To permanently set the environment variable, add the following to your `~/.bashrc` or `~/.zshrc` file:
-```bash
-export ROSETTA_X87_PATH=/Path/To/runtime_loader
-```
+~~`brew install --cask wine@devel`~~
+
+~~2. To permanently set the environment variable, add the following to your `~/.bashrc` or `~/.zshrc` file:~~
+
+~~`export ROSETTA_X87_PATH=/Path/To/runtime_loader`~~
 
 3. Run the Windows application
+
 ```bash
 wine PATH_TO_BINARY.exe
 ```
