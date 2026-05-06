@@ -506,110 +506,6 @@ public:
 // Define the static constant outside the class
 const unsigned int MuhDebugger::AARCH64_BREAKPOINT = 0xD4200000;
 
-// Resolve a Windows-style path (e.g. "C:\foo\bar.exe") to a macOS path
-// using the Wine prefix dosdevices mapping.
-static std::string resolveWinePath(const char* winPath) {
-    const char* prefix = getenv("WINEPREFIX");
-    std::string winePrefix = prefix ? prefix : (std::string(getenv("HOME")) + "/.wine");
-
-    // Find drive letter (e.g. "C:")
-    if (strlen(winPath) < 3 || winPath[1] != ':')
-        return {};
-
-    char driveLetter = tolower(winPath[0]);
-    std::string dosDevice = winePrefix + "/dosdevices/" + driveLetter + ":";
-
-    // Resolve the symlink to get the real drive root
-    char resolved[PATH_MAX];
-    if (!realpath(dosDevice.c_str(), resolved))
-        return {};
-
-    // Convert the rest of the path: skip "C:", replace backslashes
-    std::string result = resolved;
-    const char* rest = winPath + 2;
-    for (; *rest; rest++) {
-        result += (*rest == '\\') ? '/' : *rest;
-    }
-    return result;
-}
-
-// Read PE headers to determine if a Windows executable is 32-bit (x86).
-// Returns true if the file is a 32-bit PE, false otherwise.
-static bool isX86PE(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f)
-        return false;
-
-    // Read DOS header magic ("MZ")
-    uint16_t dosMagic;
-    if (fread(&dosMagic, 2, 1, f) != 1 || dosMagic != 0x5A4D) {
-        fclose(f);
-        return false;
-    }
-
-    // Read PE header offset from DOS header at 0x3C
-    uint32_t peOffset;
-    fseek(f, 0x3C, SEEK_SET);
-    if (fread(&peOffset, 4, 1, f) != 1) {
-        fclose(f);
-        return false;
-    }
-
-    // Read PE signature ("PE\0\0") and Machine field
-    fseek(f, peOffset, SEEK_SET);
-    uint32_t peSig;
-    if (fread(&peSig, 4, 1, f) != 1 || peSig != 0x00004550) {
-        fclose(f);
-        return false;
-    }
-
-    uint16_t machine;
-    if (fread(&machine, 2, 1, f) != 1) {
-        fclose(f);
-        return false;
-    }
-    fclose(f);
-
-    return machine == 0x014C; // IMAGE_FILE_MACHINE_I386
-}
-
-// Find a Windows .exe path in argv and check if it's a 32-bit x86 program.
-// Returns true if a 32-bit PE was found (needs x87 JIT), false to bypass.
-static bool needsX87JIT(int argc, char* argv[]) {
-    for (int i = 2; i < argc; i++) {
-        // Windows-style path (drive letter + colon)
-        if (strlen(argv[i]) >= 3 && argv[i][1] == ':') {
-            std::string nativePath = resolveWinePath(argv[i]);
-            if (nativePath.empty()) {
-                LOG("Could not resolve Wine path '%s', assuming x86.\n", argv[i]);
-                return true;
-            }
-            LOG("Resolved '%s' -> '%s'\n", argv[i], nativePath.c_str());
-            bool x86 = isX86PE(nativePath);
-            LOG("PE architecture: %s\n", x86 ? "x86 (32-bit)" : "x64 (64-bit)");
-            return x86;
-        }
-
-        // Bare .exe filename — resolve relative to cwd
-        size_t len = strlen(argv[i]);
-        if (len >= 4 && strcasecmp(argv[i] + len - 4, ".exe") == 0) {
-            if (isX86PE(argv[i])) {
-                LOG("'%s' is x86 (32-bit)\n", argv[i]);
-                return true;
-            }
-            FILE* f = fopen(argv[i], "rb");
-            if (f) {
-                fclose(f);
-                LOG("'%s' is x64 (64-bit), skipping\n", argv[i]);
-                return false;
-            }
-            // File not found in cwd, continue scanning
-        }
-    }
-    // No exe found in argv, default to skipping
-    return false;
-}
-
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         fprintf(stderr, "%s <path to program>\n", argv[0]);
@@ -617,14 +513,6 @@ int main(int argc, char* argv[]) {
     }
 
     logsEnabled = getenv("ROSETTA_X87_LOGS");
-
-    // Skip debugger attachment for 64-bit Windows programs (no x87 needed)
-    if (!getenv("ROSETTA_X87_FORCE_ATTACH") && !needsX87JIT(argc, argv)) {
-        LOG("Program is x64, skipping x87 JIT. Passing through.\n");
-        execv(argv[1], &argv[1]);
-        perror("execv");
-        return 1;
-    }
 
     LOG("Launching debugger.\n");
 
