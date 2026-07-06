@@ -62,6 +62,7 @@ ALL_TESTS=(
     test_ficom
     test_rc_recache
     test_fstpt_gs
+    test_ir_deferred
 )
 
 RED='\033[0;31m'

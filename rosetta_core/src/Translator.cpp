@@ -119,9 +119,11 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     // fusion), and lowers directly to AArch64.
     {
         const bool ir_disabled = g_rosetta_config && g_rosetta_config->disable_x87_ir;
-        if (!ir_disabled && cache.active() && cache.run_remaining >= 3 &&
-            cache.top_dirty == 0 && cache.deferred_push_count == 0 &&
-            cache.deferred_pop_count == 0 && !cache.perm_dirty) {
+        // Deferred cache state (top_dirty, deferred push/pop tags, FXCH perm)
+        // no longer blocks the IR: compile_run folds it into the build and the
+        // lowering epilogue, so mid-run entry after a deferred FXCH or partial
+        // per-instruction translation still gets IR lowering.
+        if (!ir_disabled && cache.active() && cache.run_remaining >= 3) {
             const int ir_consumed = X87IR::compile_run(
                 translation_result, instr_array, num_instrs, insn_idx, cache.run_remaining);
             if (ir_consumed > 0) {

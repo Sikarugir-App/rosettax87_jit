@@ -180,8 +180,12 @@ struct Context {
 
 // Build IR from a sequence of x87 instructions.
 // Returns the number of instructions consumed (stored in ctx.consumed).
+// `perm` (optional): deferred-FXCH permutation carried in from the cache —
+// logical depth d initially lives at physical depth perm[d]. Non-identity
+// entries are force-resolved so lowering materializes the swap (identity
+// afterward); the reads are DSE-able if the run overwrites those slots.
 bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start_idx,
-           int run_length);
+           int run_length, const int8_t* perm = nullptr);
 
 // Run optimization passes on the IR (DSE, FMA detection, FCOM+FSTSW fusion).
 void optimize(Context& ctx);

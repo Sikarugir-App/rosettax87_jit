@@ -216,8 +216,21 @@ static bool build_fcmov(Context& ctx, IRInstr* instr, int aarch64_cond) {
 // ── Main build loop ─────────────────────────────────────────────────────────
 
 bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start_idx,
-           int run_length) {
+           int run_length, const int8_t* perm) {
     ctx.init();
+
+    // Fold a carried-in deferred-FXCH permutation: logical depth d initially
+    // lives at physical depth perm[d].  Swapped slots are force-resolved so
+    // the epilogue materializes the permutation (the caller resets the perm
+    // to identity after lowering).
+    if (perm) {
+        for (int d = 0; d < 8; d++)
+            ctx.slot_val[d] = static_cast<int16_t>(-(perm[d] + 1));
+        for (int d = 0; d < 8; d++) {
+            if (perm[d] != d && ctx.resolve(d) < 0)
+                return false;
+        }
+    }
 
     for (int i = 0; i < run_length && (start_idx + i) < num_instrs; i++) {
         auto* instr = &instr_array[start_idx + i];

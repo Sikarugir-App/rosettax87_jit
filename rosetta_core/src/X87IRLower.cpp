@@ -138,6 +138,12 @@ void lower(Context& ctx, TranslationResult* result) {
     int Xst_base = TranslatorX87::x87_get_st_base(*result);
     int Wd_tmp = alloc_gpr(*result, 2);
 
+    // Carried-in deferred cache state (mid-run entry). The epilogue folds
+    // these into its TOP/tag writeback; step 6 then clears the flags.
+    const bool entry_top_dirty = result->x87_cache.top_dirty != 0;
+    const int entry_push_count = result->x87_cache.deferred_push_count;
+    const int entry_pop_count = result->x87_cache.deferred_pop_count;
+
     // ── FPR assignment ──────────────────────────────────────────────────────
     FPRState fprs;
     fprs.compute_last_uses(ctx);
@@ -619,7 +625,8 @@ void lower(Context& ctx, TranslationResult* result) {
                 emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1,
                                  kSwImm12, Xbase, Wd_sw);
 
-                // Patch TOP if pops occurred before this FSTSW.
+                // Patch TOP if pops occurred before this FSTSW, or if the
+                // in-memory TOP was already stale on entry (carried top_dirty).
                 int16_t td = n.inputs[2];  // top_delta snapshot
                 if (td != 0) {
                     int Wd_adj = alloc_free_gpr(*result);
@@ -632,6 +639,11 @@ void lower(Context& ctx, TranslationResult* result) {
                     emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
                                   Wd_adj, Wd_sw);
                     free_gpr(*result, Wd_adj);
+                } else if (entry_top_dirty) {
+                    // BFI Wd_sw, Wd_top, #11, #3 — memory TOP is stale;
+                    // Wd_top already holds the correct masked value.
+                    emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
+                                  Wd_top, Wd_sw);
                 }
 
                 // BFI W_ax, Wd_sw, #0, #16 — write status_word into x86 AX
@@ -677,29 +689,35 @@ void lower(Context& ctx, TranslationResult* result) {
         emit_store_st(buf, Xbase, Wd_top, d, Wd_tmp, Dd, Xst_base);
     }
 
-    // 3. Write TOP to status_word (if changed).
-    if (ctx.top_delta != 0) {
+    // 3. Write TOP to status_word if changed, or if it was already stale on
+    //    entry (carried-in top_dirty from deferred pushes/pops).
+    if (ctx.top_delta != 0 || entry_top_dirty) {
         emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
     }
 
-    // 4. Update tag word for net pushes/pops.
-    if (ctx.top_delta != 0) {
-        int Wd_tmp2 = alloc_free_gpr(*result);
-        if (ctx.top_delta > 0) {
-            // Net pops: use the batch helper.
+    // 4. Update tag word, folding in carried-in deferred push/pop tag updates
+    //    (P pending set-valid, Q pending set-empty; P and Q never coexist).
+    //    Relative to the FINAL top:
+    //      valid slots:  V = max(0, P - top_delta)   at TOP .. TOP+V-1
+    //      empty slots:  M = max(0, top_delta + Q - P) at TOP-M .. TOP-1
+    //    With P = Q = 0 this reduces to the plain net push/pop cases.
+    {
+        const int set_valid = (entry_push_count - ctx.top_delta > 0)
+                                  ? entry_push_count - ctx.top_delta : 0;
+        const int set_empty = (ctx.top_delta + entry_pop_count - entry_push_count > 0)
+                                  ? ctx.top_delta + entry_pop_count - entry_push_count : 0;
+        if (set_valid > 0 || set_empty > 0) {
+            int Wd_tmp2 = alloc_free_gpr(*result);
             int Wd_tagw = alloc_free_gpr(*result);
-            emit_x87_tag_set_empty_batch(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2,
-                                          Wd_tagw, ctx.top_delta);
+            if (set_empty > 0)
+                emit_x87_tag_set_empty_batch(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2,
+                                              Wd_tagw, set_empty);
+            if (set_valid > 0)
+                emit_x87_tag_set_valid_batch(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2,
+                                              Wd_tagw, set_valid);
             free_gpr(*result, Wd_tagw);
-        } else {
-            // Net pushes: clear tag bits for new slots.
-            int abs_delta = -ctx.top_delta;
-            int Wd_tagw = alloc_free_gpr(*result);
-            emit_x87_tag_set_valid_batch(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2,
-                                          Wd_tagw, abs_delta);
-            free_gpr(*result, Wd_tagw);
+            free_gpr(*result, Wd_tmp2);
         }
-        free_gpr(*result, Wd_tmp2);
     }
 
     // 5. Free all remaining FPRs held by node values.
@@ -758,7 +776,7 @@ void lower(Context& ctx, TranslationResult* result) {
 //
 // Fused FCmp/FTst holds 1 GPR (Wd_packed) alive across nodes until FStsw.
 // We track this as a "held" count that overlaps with per-node transient demand.
-int peak_live_gprs(const Context& ctx) {
+int peak_live_gprs(const Context& ctx, bool entry_deferred) {
     // Determine if RC caching will be active (same logic as lower()).
     bool rc_cache = false;
     if (!(g_rosetta_config && g_rosetta_config->fast_round)) {
@@ -890,8 +908,9 @@ int peak_live_gprs(const Context& ctx) {
         if (nzcv_hoist && i == nzcv_last_cmp) held--;
     }
 
-    // Epilogue: if top_delta != 0, needs 2 more transient GPRs (Wd_tmp2 + Wd_tagw)
-    if (ctx.top_delta != 0) {
+    // Epilogue: if top_delta != 0 (or carried-in deferred tag/top state must be
+    // materialized), needs 2 more transient GPRs (Wd_tmp2 + Wd_tagw)
+    if (ctx.top_delta != 0 || entry_deferred) {
         int epilogue_total = pinned + held + 2;
         if (epilogue_total > peak) peak = epilogue_total;
     }
@@ -1012,7 +1031,12 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
                 int64_t start_idx, int run_length) {
     Context ctx;
 
-    if (!build(ctx, instr_array, num_instrs, start_idx, run_length))
+
+    // Fold carried-in deferred-FXCH permutation into the initial slot map.
+    const auto& cache = result->x87_cache;
+    const int8_t* perm = cache.perm_dirty ? cache.perm : nullptr;
+
+    if (!build(ctx, instr_array, num_instrs, start_idx, run_length, perm))
         return 0;
 
     optimize(ctx);
@@ -1027,10 +1051,13 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
 
     // Gate lowering on GPR pressure vs. available pool.
     {
+        const bool entry_deferred = cache.top_dirty != 0 ||
+                                    cache.deferred_push_count > 0 ||
+                                    cache.deferred_pop_count > 0;
         uint32_t gpr_pool = result->free_gpr_mask;
         int gpr_available = 0;
         while (gpr_pool) { gpr_available++; gpr_pool &= gpr_pool - 1; }
-        if (peak_live_gprs(ctx) > gpr_available) {
+        if (peak_live_gprs(ctx, entry_deferred) > gpr_available) {
             return 0;
         }
     }
