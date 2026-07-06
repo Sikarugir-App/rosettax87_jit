@@ -90,11 +90,16 @@ static int16_t build_int_load(Context& ctx, IROperand* op) {
     return id;
 }
 
-// Build a constant-push (FLDL2E, FLDL2T, etc.)
+// Build a constant-push (FLDL2E, FLDL2T, etc.), reusing a prior node with
+// the same bit pattern.
 static int16_t build_const(Context& ctx, uint64_t bits) {
+    if (ctx.const_f64_node >= 0 && ctx.const_f64_bits == bits)
+        return ctx.const_f64_node;
     auto id = ctx.add_node(Op::ConstF64);
     if (id < 0) return -1;
     ctx.nodes[id].imm_bits = bits;
+    ctx.const_f64_node = id;
+    ctx.const_f64_bits = bits;
     return id;
 }
 
@@ -302,14 +307,22 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
         switch (op) {
             // ── Loads / pushes ──────────────────────────────────────────
             case kOpcodeName_fldz: {
-                auto id = ctx.add_node(Op::ConstZero);
-                if (id < 0) { ok = false; break; }
+                auto id = ctx.const_zero_node;
+                if (id < 0) {
+                    id = ctx.add_node(Op::ConstZero);
+                    if (id < 0) { ok = false; break; }
+                    ctx.const_zero_node = id;
+                }
                 ctx.push(id);
                 break;
             }
             case kOpcodeName_fld1: {
-                auto id = ctx.add_node(Op::ConstOne);
-                if (id < 0) { ok = false; break; }
+                auto id = ctx.const_one_node;
+                if (id < 0) {
+                    id = ctx.add_node(Op::ConstOne);
+                    if (id < 0) { ok = false; break; }
+                    ctx.const_one_node = id;
+                }
                 ctx.push(id);
                 break;
             }

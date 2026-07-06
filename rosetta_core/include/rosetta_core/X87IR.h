@@ -115,6 +115,13 @@ struct Context {
     int8_t     mem_cse_count;
     int8_t     mem_cse_next;               // rotating overwrite cursor when full
 
+    // Const dedup: reuse prior ConstZero/ConstOne/ConstF64 nodes.
+    // Consts are pure values — never invalidated within a run.
+    int16_t  const_zero_node;
+    int16_t  const_one_node;
+    int16_t  const_f64_node;        // most recent ConstF64
+    uint64_t const_f64_bits;        // its bit pattern
+
     // CC tracking for FCOM+FSTSW fusion.
     int16_t last_fcmp;              // most recent FCmp/FTst node ID, or -1
 
@@ -130,6 +137,9 @@ struct Context {
         consumed = 0;
         last_fcmp = -1;
         last_fcomi = -1;
+        const_zero_node = -1;
+        const_one_node = -1;
+        const_f64_node = -1;
         for (int i = 0; i < 8; i++) {
             slot_val[i] = static_cast<int16_t>(-(i + 1));
             initial_read[i] = -1;
