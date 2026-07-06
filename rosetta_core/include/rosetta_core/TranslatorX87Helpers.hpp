@@ -214,7 +214,7 @@ auto emit_x87_pop_n_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd
                              int n) -> void;
 
 // OPT-D: Fully-deferred push — only TOP decrement (2 instrs).
-// Skips BOTH store_top AND tag word update.  Caller sets tag_push_pending
+// Skips BOTH store_top AND tag word update.  Caller sets deferred_push_count
 // and top_dirty on x87_cache.  The pending tag must be flushed (or cancelled
 // by a subsequent pop on the same slot) before any code that reads the tag word.
 auto emit_x87_push_fully_deferred(AssemblerBuffer& buf, int Wd_top) -> void;

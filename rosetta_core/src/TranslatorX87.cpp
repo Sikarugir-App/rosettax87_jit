@@ -1375,15 +1375,14 @@ auto translate_fstsw(TranslationResult* a1, IRInstr* a2) -> void {
         a1->x87_cache.top_dirty = 0;
     }
 
-    // OPT-D: FSTSW doesn't call x87_end, so it must flush the pending tag
+    // OPT-D: FSTSW doesn't call x87_end, so it must flush the pending tags
     // itself.  Otherwise, if FSTSW is the last instruction in the cache run,
-    // x87_cache_tick clears tag_push_pending without emitting the tag-clear,
-    // leaving the tag word in memory with kEmpty for the pushed slot.
-    if (a1->x87_cache.tag_push_pending && base_cached) {
+    // x87_cache_tick clears deferred_push_count without emitting the tag
+    // updates, leaving the tag word in memory with kEmpty for pushed slots.
+    if (a1->x87_cache.deferred_push_count > 0 && base_cached) {
         const int Wd_tag_tmp = alloc_free_gpr(*a1);
-        emit_x87_tag_clear(buf, Xbase, a1->x87_cache.top_gpr, Wd_sw, Wd_tag_tmp);
+        x87_flush_deferred_pushes(buf, *a1, Xbase, a1->x87_cache.top_gpr, Wd_sw, Wd_tag_tmp);
         free_gpr(*a1, Wd_tag_tmp);
-        a1->x87_cache.tag_push_pending = 0;
     }
 
     // LDRH Wd_sw, [Xbase, #0x02]   — load status_word (16-bit halfword)

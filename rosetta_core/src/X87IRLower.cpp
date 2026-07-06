@@ -712,7 +712,7 @@ void lower(Context& ctx, TranslationResult* result) {
 
     // 6. Clean up cache deferred state (we handled everything inline).
     result->x87_cache.top_dirty = 0;
-    result->x87_cache.tag_push_pending = 0;
+    result->x87_cache.deferred_push_count = 0;
     result->x87_cache.deferred_pop_count = 0;
     result->x87_cache.reset_perm();
 

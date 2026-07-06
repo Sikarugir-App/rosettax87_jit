@@ -489,7 +489,7 @@ void emit_x87_pop_n_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd
 //
 // Emits only the 2-instruction TOP decrement (SUB + AND).  Both the
 // status_word writeback (store_top) AND the tag word update (mark kValid)
-// are deferred.  The caller sets top_dirty = 1 and tag_push_pending = 1
+// are deferred.  The caller sets top_dirty = 1 and deferred_push_count = 1
 // on x87_cache.
 //
 // The pending tag must be resolved before any code that reads the tag word:

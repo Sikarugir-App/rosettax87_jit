@@ -232,7 +232,7 @@ static auto try_fuse_fld_arithp(TranslationResult* a1, IRInstr* fld_instr, IRIns
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
     // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
-    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+    if (!(a1->x87_cache.deferred_push_count && a1->x87_cache.top_dirty))
         x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_st0 = alloc_free_fpr(*a1);
@@ -322,8 +322,13 @@ static auto try_fuse_fxch_arithp(TranslationResult* a1, IRInstr* fxch_instr, IRI
     // The FXCH is absorbed (no code emitted), but it consumes one tick.
     // Pre-decrement run_remaining so the delegated translate function's
     // x87_end(consumed=1) sees the correct budget and flushes deferred
-    // state when the fusion is at the end of a cache run.
-    if (a1->x87_cache.run_remaining > 0)
+    // state when the fusion is at the end of a cache run.  The borrowed
+    // tick is restored after delegation (see below) so the caller's two
+    // tick() calls leave run_remaining at R-2, not R-3 — otherwise the run
+    // expires one instruction early and tick()'s silent clear drops still-
+    // deferred top/tag state.
+    const bool borrowed_tick = a1->x87_cache.run_remaining > 0;
+    if (borrowed_tick)
         a1->x87_cache.run_remaining--;
 
     switch (next_op) {
@@ -360,6 +365,11 @@ static auto try_fuse_fxch_arithp(TranslationResult* a1, IRInstr* fxch_instr, IRI
         default:
             return std::nullopt;
     }
+
+    // Restore the borrowed tick: the caller ticks once per consumed
+    // instruction (2), which accounts for the FXCH.
+    if (borrowed_tick && a1->x87_cache.run_remaining > 0)
+        a1->x87_cache.run_remaining++;
 
     return 2;
 }
@@ -403,7 +413,7 @@ static auto try_fuse_fld_fstp(TranslationResult* a1, IRInstr* fld_instr, IRInstr
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
     // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
-    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+    if (!(a1->x87_cache.deferred_push_count && a1->x87_cache.top_dirty))
         x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_val = alloc_free_fpr(*a1);
@@ -688,7 +698,7 @@ static auto try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
     // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
-    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+    if (!(a1->x87_cache.deferred_push_count && a1->x87_cache.top_dirty))
         x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_fld = alloc_free_fpr(*a1);
@@ -846,7 +856,7 @@ static auto try_fuse_fld_arith_arithp(TranslationResult* a1, IRInstr* fld_instr,
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
     // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
-    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+    if (!(a1->x87_cache.deferred_push_count && a1->x87_cache.top_dirty))
         x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_fld = alloc_free_fpr(*a1);
@@ -1054,7 +1064,7 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
         const int Wd_sw = alloc_free_gpr(*a1);
 
         // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
-        if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        if (!(a1->x87_cache.deferred_push_count && a1->x87_cache.top_dirty))
             x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
         // LDRH Wd_sw, [Xbase, #status_word]
@@ -1154,7 +1164,7 @@ static auto try_fuse_fld_fcomp(TranslationResult* a1, IRInstr* fld_instr, IRInst
         const int Wd_sw = alloc_free_gpr(*a1);
 
         // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
-        if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        if (!(a1->x87_cache.deferred_push_count && a1->x87_cache.top_dirty))
             x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
         // LDRH Wd_sw, [Xbase, #status_word]
@@ -1375,7 +1385,7 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
         const int Wd_sw = alloc_free_gpr(*a1);
 
         // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
-        if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        if (!(a1->x87_cache.deferred_push_count && a1->x87_cache.top_dirty))
             x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
         // LDRH Wd_sw, [Xbase, #status_word]
@@ -1837,7 +1847,7 @@ static auto try_fuse_fstp_fld(TranslationResult* a1, IRInstr* fstp_instr, IRInst
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
     // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
-    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+    if (!(a1->x87_cache.deferred_push_count && a1->x87_cache.top_dirty))
         x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     // FSTP ST(0) is "discard top" — the old ST(0) value is not stored anywhere,

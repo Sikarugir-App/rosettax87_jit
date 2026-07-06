@@ -120,7 +120,7 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     {
         const bool ir_disabled = g_rosetta_config && g_rosetta_config->disable_x87_ir;
         if (!ir_disabled && cache.active() && cache.run_remaining >= 3 &&
-            cache.top_dirty == 0 && cache.tag_push_pending == 0 &&
+            cache.top_dirty == 0 && cache.deferred_push_count == 0 &&
             cache.deferred_pop_count == 0 && !cache.perm_dirty) {
             const int ir_consumed = X87IR::compile_run(
                 translation_result, instr_array, num_instrs, insn_idx, cache.run_remaining);
