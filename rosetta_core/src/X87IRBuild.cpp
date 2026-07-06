@@ -6,9 +6,57 @@
 
 namespace X87IR {
 
+// ── Memory CSE ──────────────────────────────────────────────────────────────
+
+// Operand identity for memory CSE. Only MemRef and AbsMem participate;
+// compare fields explicitly (the union has padding that may be garbage).
+static bool mem_operand_equal(const IROperand* a, const IROperand* b) {
+    if (a->kind != b->kind) return false;
+    if (a->kind == IROperandKind::MemRef) {
+        return a->mem.size == b->mem.size &&
+               a->mem.addr_size == b->mem.addr_size &&
+               a->mem.seg_override == b->mem.seg_override &&
+               a->mem.mem_flags == b->mem.mem_flags &&
+               a->mem.base_reg == b->mem.base_reg &&
+               a->mem.index_reg == b->mem.index_reg &&
+               a->mem.shift_amount == b->mem.shift_amount &&
+               a->mem.disp == b->mem.disp;
+    }
+    if (a->kind == IROperandKind::AbsMem) {
+        return a->abs_mem.size == b->abs_mem.size &&
+               a->abs_mem.addr_size == b->abs_mem.addr_size &&
+               a->abs_mem.value == b->abs_mem.value;
+    }
+    return false;
+}
+
+static int16_t mem_cse_lookup(Context& ctx, const IROperand* op, Op kind) {
+    for (int i = 0; i < ctx.mem_cse_count; i++) {
+        if (ctx.mem_cse_kind[i] == kind && mem_operand_equal(ctx.mem_cse_op[i], op))
+            return ctx.mem_cse_val[i];
+    }
+    return -1;
+}
+
+static void mem_cse_insert(Context& ctx, IROperand* op, Op kind, int16_t val) {
+    if (op->kind != IROperandKind::MemRef && op->kind != IROperandKind::AbsMem)
+        return;
+    int slot;
+    if (ctx.mem_cse_count < Context::kMemCSESlots) {
+        slot = ctx.mem_cse_count++;
+    } else {
+        slot = ctx.mem_cse_next;
+        ctx.mem_cse_next = static_cast<int8_t>((slot + 1) % Context::kMemCSESlots);
+    }
+    ctx.mem_cse_op[slot] = op;
+    ctx.mem_cse_kind[slot] = kind;
+    ctx.mem_cse_val[slot] = val;
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 // Build a memory load node. Returns node ID or -1 on bail (e.g. m80).
+// Identical operands within the run reuse the prior load's value (CSE).
 static int16_t build_fp_load(Context& ctx, IROperand* op) {
     Op load_op;
     switch (op->mem.size) {
@@ -16,9 +64,12 @@ static int16_t build_fp_load(Context& ctx, IROperand* op) {
         case IROperandSize::S64: load_op = Op::LoadF64; break;
         default: return -1;  // m80 → bail
     }
+    auto hit = mem_cse_lookup(ctx, op, load_op);
+    if (hit >= 0) return hit;
     auto id = ctx.add_node(load_op);
     if (id < 0) return -1;
     ctx.nodes[id].mem_operand = op;
+    mem_cse_insert(ctx, op, load_op, id);
     return id;
 }
 
@@ -30,9 +81,12 @@ static int16_t build_int_load(Context& ctx, IROperand* op) {
         case IROperandSize::S64: load_op = Op::LoadI64; break;
         default: return -1;
     }
+    auto hit = mem_cse_lookup(ctx, op, load_op);
+    if (hit >= 0) return hit;
     auto id = ctx.add_node(load_op);
     if (id < 0) return -1;
     ctx.nodes[id].mem_operand = op;
+    mem_cse_insert(ctx, op, load_op, id);
     return id;
 }
 
@@ -55,6 +109,12 @@ static bool build_fp_store(Context& ctx, IROperand* op, int16_t val_node) {
     auto id = ctx.add_node(store_op, val_node);
     if (id < 0) return false;
     ctx.nodes[id].mem_operand = op;
+    // The store may alias any cached load. Then forward the stored value to
+    // later loads of the same operand — f64 only: a store/load round-trip is
+    // bit-exact for f64, but F32 narrows (a reload widens the rounded value).
+    ctx.mem_cse_clear();
+    if (store_op == Op::StoreF64)
+        mem_cse_insert(ctx, op, Op::LoadF64, val_node);
     return true;
 }
 
@@ -71,6 +131,8 @@ static bool build_int_store(Context& ctx, IROperand* op, int16_t val_node, bool 
     if (id < 0) return false;
     ctx.nodes[id].mem_operand = op;
     if (truncate) ctx.nodes[id].flags |= kTruncate;
+    // May alias any cached load; no forwarding (f64→int isn't invertible).
+    ctx.mem_cse_clear();
     return true;
 }
 
@@ -539,6 +601,9 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                     instr->operands[0].reg.reg.index());
                 // inputs[2] = top_delta snapshot (for TOP patching in lowering)
                 ctx.nodes[id].inputs[2] = ctx.top_delta;
+                // The AX write may change a cached operand's address (EAX/RAX
+                // as base/index) — conservatively drop all CSE entries.
+                ctx.mem_cse_clear();
                 break;
             }
 
@@ -555,6 +620,8 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 auto id = ctx.add_node(Op::LoadCW);
                 if (id < 0) { ok = false; break; }
                 ctx.nodes[id].mem_operand = &instr->operands[0];
+                // Writes guest memory — may alias any cached load.
+                ctx.mem_cse_clear();
                 break;
             }
 

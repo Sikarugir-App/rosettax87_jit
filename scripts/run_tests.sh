@@ -63,6 +63,7 @@ ALL_TESTS=(
     test_rc_recache
     test_fstpt_gs
     test_ir_deferred
+    test_mem_cse
 )
 
 RED='\033[0;31m'

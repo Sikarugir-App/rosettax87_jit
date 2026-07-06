@@ -103,6 +103,18 @@ struct Context {
     // Dedup cache for initial-slot reads (avoids duplicate ReadSt nodes).
     int16_t initial_read[8];        // node ID for initial depth d, or -1
 
+    // Memory CSE table: recent load results (and forwardable f64 stores)
+    // keyed by operand identity. Within a run, guest GPRs cannot change
+    // (only x87 instructions — the sole exception, FSTSW AX, clears the
+    // table), so identical operands always address the same location.
+    // Cleared conservatively on any memory write (Store*, FNSTCW).
+    static constexpr int kMemCSESlots = 4;
+    IROperand* mem_cse_op[kMemCSESlots];   // operand identity (compared by value)
+    Op         mem_cse_kind[kMemCSESlots]; // the Load* op an entry satisfies
+    int16_t    mem_cse_val[kMemCSESlots];  // node ID holding the f64 value
+    int8_t     mem_cse_count;
+    int8_t     mem_cse_next;               // rotating overwrite cursor when full
+
     // CC tracking for FCOM+FSTSW fusion.
     int16_t last_fcmp;              // most recent FCmp/FTst node ID, or -1
 
@@ -122,6 +134,12 @@ struct Context {
             slot_val[i] = static_cast<int16_t>(-(i + 1));
             initial_read[i] = -1;
         }
+        mem_cse_clear();
+    }
+
+    void mem_cse_clear() {
+        mem_cse_count = 0;
+        mem_cse_next = 0;
     }
 
     // Append a new node and return its index.
