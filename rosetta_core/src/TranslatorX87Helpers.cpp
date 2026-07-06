@@ -862,36 +862,38 @@ void emit_fcom_cc_write_sw(AssemblerBuffer& buf, TranslationResult& a1,
     free_gpr(a1, Wd_sw);
 }
 // =============================================================================
-// RC dispatch — binary TBNZ tree over pre-extracted RC bits [1:0] in Wd_rc.
-//
-// Layout (each idx = 1 instruction):
-//   [0] TBNZ Wd_rc, #1, +6   → [6]   ; RC ∈ {2,3}
-//   [1] TBNZ Wd_rc, #0, +3   → [4]   ; RC=1
-//   [2] op(RC=0 nearest)
-//   [3] B +7                 → [10]  ; done
-//   [4] op(RC=1 floor)
-//   [5] B +5                 → [10]
-//   [6] TBNZ Wd_rc, #0, +3   → [9]   ; RC=3
-//   [7] op(RC=2 ceil)
-//   [8] B +2                 → [10]
-//   [9] op(RC=3 truncate)
-//  [10] done
+// RC dispatch — binary tree over pre-extracted RC bits [1:0] in Wd_rc.
 //
 // Wd_rc is only read (never written), so cached RC values survive dispatch.
+//
+// _fcvt uses speculation: the FCVT into the Wd_int scratch has no side
+// effects, so each subtree converts with its first candidate mode and only
+// re-converts when the low RC bit says otherwise.  This keeps branch
+// instructions 8 bytes apart (back-to-back branch pairs measurably stall the
+// M-series front end when the second one is taken) with at most 2 taken
+// branches on any path:
+//
+//   [0] TBNZ Wd_rc, #1, +5 → [5]   ; RC ∈ {2,3}
+//   [1] FCVTNS                      ; speculative RC=0
+//   [2] TBZ  Wd_rc, #0, +6 → [8]   ; RC=0 done
+//   [3] FCVTMS                      ; RC=1 floor
+//   [4] B +4 → [8]
+//   [5] FCVTPS                      ; speculative RC=2 ceil
+//   [6] TBZ  Wd_rc, #0, +2 → [8]   ; RC=2 done
+//   [7] FCVTZS                      ; RC=3 truncate
+//   [8] done
 // =============================================================================
 
 void emit_x87_rc_dispatch_fcvt(AssemblerBuffer& buf, int Wd_rc, int Wd_int,
                                 int Dd_val, int is_64bit_int) {
     // FCVT*S rmode field: NS=0 (nearest), PS=1 (ceil), MS=2 (floor), ZS=3 (trunc)
-    emit_tbz(buf, /*TBNZ*/1, /*bit*/1, Wd_rc, 6);
-    emit_tbz(buf, /*TBNZ*/1, /*bit*/0, Wd_rc, 3);
+    emit_tbz(buf, /*TBNZ*/1, /*bit*/1, Wd_rc, 5);
     emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=f64*/1, /*rmode=NS*/0, Wd_int, Dd_val);
-    emit_b(buf, 7);
+    emit_tbz(buf, /*TBZ*/0, /*bit*/0, Wd_rc, 6);
     emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=f64*/1, /*rmode=MS*/2, Wd_int, Dd_val);
-    emit_b(buf, 5);
-    emit_tbz(buf, /*TBNZ*/1, /*bit*/0, Wd_rc, 3);
+    emit_b(buf, 4);
     emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=f64*/1, /*rmode=PS*/1, Wd_int, Dd_val);
-    emit_b(buf, 2);
+    emit_tbz(buf, /*TBZ*/0, /*bit*/0, Wd_rc, 2);
     emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=f64*/1, /*rmode=ZS*/3, Wd_int, Dd_val);
 }
 
