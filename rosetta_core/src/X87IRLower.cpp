@@ -304,6 +304,14 @@ void lower(Context& ctx, TranslationResult* result) {
             emit_fmul_f64(buf, Dd, Dn, Dm);
             break;
         }
+        case Op::FNMul: {
+            int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
+            int Dd = fprs.try_reuse_input(ctx, i);
+            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
+            emit_fnmul_f64(buf, Dd, Dn, Dm);
+            break;
+        }
         case Op::FDiv: {
             int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
             int Dd = fprs.try_reuse_input(ctx, i);
@@ -834,6 +842,7 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
         case Op::ReadSt:
         case Op::ConstZero: case Op::ConstOne: case Op::ConstF64:
         case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
+        case Op::FNMul:
         case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
         case Op::FNeg: case Op::FAbs: case Op::FSqrt:
         case Op::FCSel:
@@ -985,6 +994,7 @@ int peak_live_fprs(const Context& ctx) {
             produces_fpr = true;
             break;
         case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
+        case Op::FNMul:
         case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
         case Op::FNeg: case Op::FAbs: case Op::FSqrt: case Op::FRndInt:
         case Op::FCSel:

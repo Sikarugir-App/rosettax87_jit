@@ -128,6 +128,7 @@ auto emit_fp_dp2(AssemblerBuffer& buf, int type, int opcode, int Rd, int Rn, int
 auto emit_fadd_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm) -> void;
 auto emit_fsub_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm) -> void;
 auto emit_fmul_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm) -> void;
+auto emit_fnmul_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm) -> void;
 auto emit_fdiv_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm) -> void;
 
 // Scalar FP data-processing, 3 sources

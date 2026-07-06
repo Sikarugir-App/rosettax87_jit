@@ -488,6 +488,12 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             case kOpcodeName_fchs: {
                 auto st0 = ctx.resolve(0);
                 if (st0 < 0) { ok = false; break; }
+                // Double negation: reuse the FNeg's input directly (exact,
+                // incl. NaN sign). DSE reaps the orphan FNeg if unused.
+                if (ctx.nodes[st0].op == Op::FNeg) {
+                    ctx.slot_val[0] = ctx.nodes[st0].inputs[0];
+                    break;
+                }
                 auto id = ctx.add_node(Op::FNeg, st0);
                 if (id < 0) { ok = false; break; }
                 ctx.slot_val[0] = id;

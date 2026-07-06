@@ -104,6 +104,76 @@ static void pass_dse(Context& ctx) {
     }
 }
 
+// ── Pass 1.5: FNeg folding ──────────────────────────────────────────────────
+//
+// fchs is common in game FP code. Fold single-use FNeg nodes into their
+// consumer (all rewrites are IEEE-exact — FSub(x,y) computes x + (-y)):
+//   FAdd(x, FNeg(y)) → FSub(x, y)
+//   FAdd(FNeg(x), y) → FSub(y, x)
+//   FSub(x, FNeg(y)) → FAdd(x, y)
+//   FNeg(FMul(a, b)) with single-use mul → FNMul(a, b)   (one FNMUL insn)
+// Runs before pass_fma so the rewritten FAdd/FSub feed FMA detection.
+// Note: FNMul diverges from FMUL+FNEG only in the sign bit of a NaN result
+// (AArch64 propagates the input NaN unnegated) — same fidelity class as the
+// FMA fusion's rounding difference, accepted.
+
+static void pass_fneg_fold(Context& ctx) {
+    int16_t use_count[kMaxNodes] = {};
+    for (int d = 0; d < 8; d++) {
+        if (ctx.slot_val[d] >= 0 && ctx.slot_val[d] < ctx.num_nodes)
+            use_count[ctx.slot_val[d]]++;
+    }
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        for (int j = 0; j < 3; j++) {
+            if (n.inputs[j] >= 0) use_count[n.inputs[j]]++;
+        }
+    }
+
+    auto single_use_op = [&](int16_t id, Op op) {
+        return id >= 0 && id < ctx.num_nodes && ctx.nodes[id].op == op &&
+               !(ctx.nodes[id].flags & kDead) && use_count[id] == 1;
+    };
+
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+
+        if (n.op == Op::FAdd || n.op == Op::FSub) {
+            int16_t in0 = n.inputs[0], in1 = n.inputs[1];
+            if (single_use_op(in1, Op::FNeg)) {
+                auto& neg = ctx.nodes[in1];
+                n.op = (n.op == Op::FAdd) ? Op::FSub : Op::FAdd;
+                n.inputs[1] = neg.inputs[0];
+                neg.flags |= kDead;
+                use_count[in1] = 0;
+                if (neg.inputs[0] >= 0) use_count[neg.inputs[0]]++;
+            } else if (n.op == Op::FAdd && single_use_op(in0, Op::FNeg)) {
+                auto& neg = ctx.nodes[in0];
+                n.op = Op::FSub;
+                n.inputs[0] = in1;
+                n.inputs[1] = neg.inputs[0];
+                neg.flags |= kDead;
+                use_count[in0] = 0;
+                if (neg.inputs[0] >= 0) use_count[neg.inputs[0]]++;
+            }
+        } else if (n.op == Op::FNeg) {
+            int16_t m = n.inputs[0];
+            if (single_use_op(m, Op::FMul)) {
+                auto& mul = ctx.nodes[m];
+                n.op = Op::FNMul;
+                n.inputs[0] = mul.inputs[0];
+                n.inputs[1] = mul.inputs[1];
+                mul.flags |= kDead;
+                use_count[m] = 0;
+                if (mul.inputs[0] >= 0) use_count[mul.inputs[0]]++;
+                if (mul.inputs[1] >= 0) use_count[mul.inputs[1]]++;
+            }
+        }
+    }
+}
+
 // ── Pass 2: FMA Detection ───────────────────────────────────────────────────
 //
 // Pattern: FMul(a, b) with exactly one use → FAdd(mul, c) or FAdd(c, mul)
@@ -220,6 +290,7 @@ static void pass_fcom_fstsw_fusion(Context& ctx) {
 void optimize(Context& ctx) {
     pass_dead_compares(ctx);
     pass_dse(ctx);
+    pass_fneg_fold(ctx);
     pass_fma(ctx);
     pass_fcom_fstsw_fusion(ctx);
 }

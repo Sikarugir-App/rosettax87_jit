@@ -333,6 +333,9 @@ auto emit_fsub_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm) -> void {
 auto emit_fmul_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm) -> void {
     emit_fp_dp2(buf, /*type=*/1, /*FMUL=*/0, Dd, Dn, Dm);
 }
+auto emit_fnmul_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm) -> void {
+    emit_fp_dp2(buf, /*type=*/1, /*FNMUL=*/8, Dd, Dn, Dm);
+}
 auto emit_fdiv_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm) -> void {
     emit_fp_dp2(buf, /*type=*/1, /*FDIV=*/1, Dd, Dn, Dm);
 }

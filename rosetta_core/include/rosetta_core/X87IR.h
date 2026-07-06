@@ -27,6 +27,7 @@ enum class Op : uint8_t {
 
     // Binary arithmetic
     FAdd, FSub, FMul, FDiv,
+    FNMul,          // -(inputs[0] * inputs[1])  (AArch64 FNMUL, from FNeg∘FMul)
 
     // FMA: inputs[0]*inputs[1] + inputs[2]  (FMADD encoding)
     //       inputs[2] - inputs[0]*inputs[1]  (FMSUB encoding)
