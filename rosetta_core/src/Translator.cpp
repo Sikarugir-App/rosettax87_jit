@@ -113,17 +113,21 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
         }
     }
 
-    // ── IR pipeline: try whole-run optimization for runs of 3+ ─────────────
-    // The IR fires once at the start of a fresh run (no deferred cache state).
+    // ── IR pipeline: try whole-run optimization for runs of 2+ ─────────────
     // It builds an SSA-like IR, runs optimization passes (DSE, FMA, FCOM+FSTSW
     // fusion), and lowers directly to AArch64.
     {
         const bool ir_disabled = g_rosetta_config && g_rosetta_config->disable_x87_ir;
+        // Minimum run length for the IR pipeline. Runs of exactly 2 also go
+        // through the IR: benchmarks show pairs the peephole fusions don't
+        // cover gain up to ~28% (e.g. fld+fistp), while fusion-covered pairs
+        // regress ≤2% (the fusions still handle pairs the IR declines).
+        constexpr int kX87IRMinRun = 2;
         // Deferred cache state (top_dirty, deferred push/pop tags, FXCH perm)
         // no longer blocks the IR: compile_run folds it into the build and the
         // lowering epilogue, so mid-run entry after a deferred FXCH or partial
         // per-instruction translation still gets IR lowering.
-        if (!ir_disabled && cache.active() && cache.run_remaining >= 3) {
+        if (!ir_disabled && cache.active() && cache.run_remaining >= kX87IRMinRun) {
             const int ir_consumed = X87IR::compile_run(
                 translation_result, instr_array, num_instrs, insn_idx, cache.run_remaining);
             if (ir_consumed > 0) {
