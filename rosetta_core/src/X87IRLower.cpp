@@ -609,22 +609,24 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::FStsw: {
             static constexpr int16_t kSwImm12 = kX87StatusWordOff / 2;  // = 1
 
+            int Wd_sw;
             if (n.flags & kFcomFused) {
-                // Fused: retrieve packed CC from the FCmp node.
+                // Fused: RMW status_word with the packed CC held from the
+                // FCmp, keeping the merged value in a GPR — skips the LDRH
+                // reload of the halfword just stored (a store→load hazard).
                 int16_t fcmp_id = n.inputs[0];
                 int Wd_packed = fprs.get(fcmp_id);
 
-                // RMW status_word with packed CC bits.
-                emit_fcom_cc_write_sw(buf, *result, Xbase, Wd_packed);
+                Wd_sw = emit_fcom_cc_write_sw_keep(buf, *result, Xbase, Wd_packed);
                 free_gpr(*result, Wd_packed);
                 fprs.node_fpr[fcmp_id] = -1;
-            }
-            // Both paths: load status_word (which now has correct CC), BFI into AX.
-            {
-                int Wd_sw = alloc_free_gpr(*result);
+            } else {
+                // Non-fused: load status_word (CC already written by FCmp).
+                Wd_sw = alloc_free_gpr(*result);
                 emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1,
                                  kSwImm12, Xbase, Wd_sw);
-
+            }
+            {
                 // Patch TOP if pops occurred before this FSTSW, or if the
                 // in-memory TOP was already stale on entry (carried top_dirty).
                 int16_t td = n.inputs[2];  // top_delta snapshot
@@ -862,17 +864,16 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
         // (Wd_save + Wd_packed + Wd_cc + Wd_vs simultaneously live)
         // Hoisted: no per-node Wd_save (3 transient), but Wd_nzcv_saved is
         // held from the first compare through the last (held++ below).
-        // If fused, Wd_packed stays alive after → held++
+        // If fused, Wd_packed stays alive after — but it is already part of
+        // this node's transient count, so the held++ happens after node_total
+        // below (adding it here would double-count it and spuriously bail
+        // every fused single-compare run: 4 pinned + 4 + 1 = 9 > 8 pool).
         case Op::FCmp: case Op::FTst:
             if (nzcv_hoist) {
                 transient = 3;
                 if (i == nzcv_first_cmp) held++;  // Wd_nzcv_saved acquired
             } else {
                 transient = 4;
-            }
-            if (n.flags & kFcomFused) {
-                // After the node, Wd_packed remains held until FStsw
-                held++;
             }
             break;
 
@@ -884,9 +885,9 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
         // FStsw: fused path holds Wd_packed (counted in held) + up to 2 more
         // Non-fused: up to 2 (Wd_sw + Wd_adj)
         case Op::FStsw:
-            // emit_fcom_cc_write_sw adds 1 internally (Wd_sw), then the LDRH
-            // block adds Wd_sw + possibly Wd_adj.
-            // Fused: Wd_packed(held) + max(Wd_sw_inner=1, Wd_sw+Wd_adj=2) = 2
+            // Fused: emit_fcom_cc_write_sw_keep allocates Wd_sw while
+            // Wd_packed (held) is still live, then Wd_packed is freed and
+            // Wd_sw + possibly Wd_adj coexist → peak 2 alongside held-1.
             // Non-fused: max(Wd_sw+Wd_adj) = 2
             transient = 2;
             if (n.flags & kFcomFused) {
@@ -903,6 +904,11 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
 
         int node_total = pinned + held + transient;
         if (node_total > peak) peak = node_total;
+
+        // Fused FCmp/FTst: Wd_packed survives the node (until FStsw). It was
+        // counted in this node's transient demand; from here on it's held.
+        if ((n.op == Op::FCmp || n.op == Op::FTst) && (n.flags & kFcomFused))
+            held++;
 
         // Wd_nzcv_saved is released at the end of the last compare node.
         if (nzcv_hoist && i == nzcv_last_cmp) held--;

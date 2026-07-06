@@ -308,6 +308,12 @@ void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
 void emit_fcom_cc_write_sw(AssemblerBuffer& buf, TranslationResult& a1,
                             int Xbase, int Wd_packed);
 
+// Same RMW, but returns the GPR holding the merged status_word instead of
+// freeing it — lets the caller reuse the value (e.g. FSTSW AX) without
+// reloading the halfword it just stored. Caller frees the returned GPR.
+int emit_fcom_cc_write_sw_keep(AssemblerBuffer& buf, TranslationResult& a1,
+                                int Xbase, int Wd_packed);
+
 // =============================================================================
 // RC dispatch — binary tree over the x87 RC field (control_word bits [11:10],
 // pre-extracted into Wd_rc bits [1:0]).
