@@ -4,7 +4,9 @@
 #include <utility>
 
 #include "rosetta_core/AssemblerHelpers.hpp"
+#include "rosetta_core/IRInstr.h"
 #include "rosetta_core/IROperand.h"
+#include "rosetta_core/Opcode.h"
 #include "rosetta_core/Register.h"
 #include "rosetta_core/TranslationResult.h"
 #include "rosetta_core/TranslatorHelpers.hpp"
@@ -100,6 +102,48 @@ struct FPRState {
         return -1;
     }
 };
+
+// ── Guest-flags deadness after the run ──────────────────────────────────────
+//
+// Host NZCV holds the guest's materialized EFLAGS; each FCmp/FTst wraps its
+// FCMP in an MRS/MSR pair (or one hoisted pair per group) to preserve them.
+// If the first flag-relevant guest instruction after the run fully redefines
+// EFLAGS, the pre-run flags are dead and the save/restore can be skipped
+// entirely — the dominant pattern is `fcomp; fnstsw ax; test/and ...; jcc`.
+//
+// Whitelist walk: only instructions that neither read nor write EFLAGS may
+// sit between the run and the redefinition. Anything unknown — including
+// reaching block end, since the terminator may be a JCC and Rosetta itself
+// treats flags as live across RET/CALL — keeps the conservative pair.
+static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_t end_idx) {
+    for (int64_t i = end_idx; i < num_instrs; i++) {
+        switch (instr_array[i].opcode()) {
+            // Full EFLAGS definers (write SF/ZF/CF/OF/PF; AF at worst
+            // architecturally undefined): pre-run flags die here.
+            case kOpcodeName_and:
+            case kOpcodeName_or:
+            case kOpcodeName_xor:
+            case kOpcodeName_test:
+            case kOpcodeName_cmp:
+            case kOpcodeName_add:
+            case kOpcodeName_sub:
+                return true;
+            // Flag-neutral instructions (neither read nor write EFLAGS).
+            case kOpcodeName_mov:
+            case kOpcodeName_movzx:
+            case kOpcodeName_movsx:
+            case kOpcodeName_movsxd:
+            case kOpcodeName_lea:
+            case kOpcodeName_push:
+            case kOpcodeName_pop:
+            case kOpcodeName_nop:
+                continue;
+            default:
+                return false;  // reader / partial definer / unknown
+        }
+    }
+    return false;  // block end reached without a full redefinition
+}
 
 // ── Base-address cache ──────────────────────────────────────────────────────
 //
@@ -326,14 +370,17 @@ void lower(Context& ctx, TranslationResult* result) {
             Wd_rc_cached = alloc_free_gpr(*result);
     }
 
-    // ── NZCV hoisting: one MRS/MSR pair around all FCmp/FTst in the run ─────
-    // Instead of saving/restoring guest NZCV per compare, save once before the
-    // first compare and restore once after the last.  Safe only when no node
-    // legitimately writes/reads NZCV in between (FComI writes it for the
-    // guest; FCSel reads it) — nothing else emitted by this pipeline touches
-    // flags.
+    // ── NZCV hoisting / elision around FCmp/FTst ────────────────────────────
+    // Hoisting: instead of saving/restoring guest NZCV per compare, save once
+    // before the first compare and restore once after the last.  Safe only
+    // when no node legitimately writes/reads NZCV in between (FComI writes it
+    // for the guest; FCSel reads it) — nothing else emitted by this pipeline
+    // touches flags.
+    // Elision (nzcv_skip): when compile_run proved the guest flags dead after
+    // the run (ctx.nzcv_dead), drop the MRS/MSR pair entirely.
     int nzcv_first_cmp = -1, nzcv_last_cmp = -1;
     bool nzcv_hoist = false;
+    bool nzcv_skip = false;
     {
         int cmp_count = 0;
         bool has_nzcv_user = false;
@@ -347,7 +394,8 @@ void lower(Context& ctx, TranslationResult* result) {
                 cmp_count++;
             }
         }
-        nzcv_hoist = !has_nzcv_user && cmp_count >= 2;
+        nzcv_skip = ctx.nzcv_dead && !has_nzcv_user && cmp_count >= 1;
+        nzcv_hoist = !nzcv_skip && !has_nzcv_user && cmp_count >= 2;
     }
     int Wd_nzcv_saved = -1;
 
@@ -641,8 +689,8 @@ void lower(Context& ctx, TranslationResult* result) {
         // ── Compare ─────────────────────────────────────────────────────
         case Op::FCmp: {
             int Wd_packed;
-            if (nzcv_hoist) {
-                if (Wd_nzcv_saved < 0) {
+            if (nzcv_skip || nzcv_hoist) {
+                if (nzcv_hoist && Wd_nzcv_saved < 0) {
                     Wd_nzcv_saved = alloc_free_gpr(*result);
                     emit_mrs_nzcv(buf, Wd_nzcv_saved);
                 }
@@ -650,7 +698,7 @@ void lower(Context& ctx, TranslationResult* result) {
 
                 Wd_packed = alloc_free_gpr(*result);
                 emit_fcom_cc_pack_hoisted(buf, *result, Wd_packed);
-                if (i == nzcv_last_cmp) {
+                if (nzcv_hoist && i == nzcv_last_cmp) {
                     emit_msr_nzcv(buf, Wd_nzcv_saved);
                     free_gpr(*result, Wd_nzcv_saved);
                     Wd_nzcv_saved = -1;
@@ -678,8 +726,8 @@ void lower(Context& ctx, TranslationResult* result) {
         }
         case Op::FTst: {
             int Wd_packed;
-            if (nzcv_hoist) {
-                if (Wd_nzcv_saved < 0) {
+            if (nzcv_skip || nzcv_hoist) {
+                if (nzcv_hoist && Wd_nzcv_saved < 0) {
                     Wd_nzcv_saved = alloc_free_gpr(*result);
                     emit_mrs_nzcv(buf, Wd_nzcv_saved);
                 }
@@ -687,7 +735,7 @@ void lower(Context& ctx, TranslationResult* result) {
 
                 Wd_packed = alloc_free_gpr(*result);
                 emit_fcom_cc_pack_hoisted(buf, *result, Wd_packed);
-                if (i == nzcv_last_cmp) {
+                if (nzcv_hoist && i == nzcv_last_cmp) {
                     emit_msr_nzcv(buf, Wd_nzcv_saved);
                     free_gpr(*result, Wd_nzcv_saved);
                     Wd_nzcv_saved = -1;
@@ -977,11 +1025,13 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
     int pinned = 4;  // Xbase, Wd_top, Wd_tmp, Xst_base
     if (rc_cache) pinned++;  // Wd_rc_cached
 
-    // NZCV hoisting mirror (same predicate as lower()): when active, one GPR
-    // (Wd_nzcv_saved) is held from the first FCmp/FTst through the last, and
-    // each compare no longer allocates a per-node Wd_save.
+    // NZCV hoisting/elision mirror (same predicates as lower()): when hoisting,
+    // one GPR (Wd_nzcv_saved) is held from the first FCmp/FTst through the
+    // last, and each compare no longer allocates a per-node Wd_save. When
+    // eliding (nzcv_skip), compares cost 3 transient with nothing held.
     int nzcv_first_cmp = -1, nzcv_last_cmp = -1;
     bool nzcv_hoist = false;
+    bool nzcv_skip = false;
     {
         int cmp_count = 0;
         bool has_nzcv_user = false;
@@ -995,7 +1045,8 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
                 cmp_count++;
             }
         }
-        nzcv_hoist = !has_nzcv_user && cmp_count >= 2;
+        nzcv_skip = ctx.nzcv_dead && !has_nzcv_user && cmp_count >= 1;
+        nzcv_hoist = !nzcv_skip && !has_nzcv_user && cmp_count >= 2;
     }
 
     // Simulate GPR pressure across IR nodes.
@@ -1050,7 +1101,9 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
         // below (adding it here would double-count it and spuriously bail
         // every fused single-compare run: 4 pinned + 4 + 1 = 9 > 8 pool).
         case Op::FCmp: case Op::FTst:
-            if (nzcv_hoist) {
+            if (nzcv_skip) {
+                transient = 3;  // Wd_packed + Wd_cc + Wd_vs, no save
+            } else if (nzcv_hoist) {
                 transient = 3;
                 if (i == nzcv_first_cmp) held++;  // Wd_nzcv_saved acquired
             } else {
@@ -1228,6 +1281,12 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
         return 0;
 
     optimize(ctx);
+
+    // Guest-flags deadness: scan the guest instructions after the consumed
+    // run; if they fully redefine EFLAGS before any possible reader, the
+    // FCmp/FTst NZCV save/restore is elided in lowering.
+    ctx.nzcv_dead = nzcv_dead_after_run(instr_array, num_instrs,
+                                        start_idx + ctx.consumed) ? 1 : 0;
 
     // Gate lowering on actual FPR pressure vs. available pool.
     uint32_t fpr_pool = result->free_fpr_mask;

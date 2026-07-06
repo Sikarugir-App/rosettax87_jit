@@ -138,6 +138,11 @@ struct Context {
     int16_t addr_cache_rep[2];
     int8_t  addr_cache_n;
 
+    // Guest EFLAGS are provably dead after this run (the next flag-relevant
+    // guest instruction fully redefines them) — FCmp/FTst may skip the NZCV
+    // save/restore. Set by compile_run from the post-run instruction stream.
+    int8_t  nzcv_dead;
+
     void init() {
         num_nodes = 0;
         top_delta = 0;
@@ -147,6 +152,7 @@ struct Context {
         addr_cache_rep[0] = -1;
         addr_cache_rep[1] = -1;
         addr_cache_n = 0;
+        nzcv_dead = 0;
         const_zero_node = -1;
         const_one_node = -1;
         const_f64_node = -1;

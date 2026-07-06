@@ -186,6 +186,42 @@ static clock_t bench_fstsw(void) {
     return clock() - start;
 }
 
+/* The dominant compiled pattern: fcomp; fnstsw; TEST — the full-EFLAGS
+ * redefinition right after the run lets the JIT drop the NZCV save/restore
+ * around the FCMP entirely. */
+static clock_t bench_fcomp_fnstsw_test(void) {
+    clock_t start = clock();
+    volatile double cmp = 5.0;
+    volatile uint16_t r;
+    for (int i = 0; i < TIMES; i++)
+        __asm__ volatile (
+            "fld1\n\t"
+            "fcompl %1\n\t"
+            "fnstsw %%ax\n\t"
+            "testw $0x4500, %%ax\n\t"
+            "setz %%al\n\t"
+            "movzbw %%al, %%ax\n\t"
+            "movw %%ax, %0\n\t"
+            : "=m"(r) : "m"(cmp) : "ax", "cc");
+    return clock() - start;
+}
+
+/* Same shape with AND (MSVC-style masking of the CC bits). */
+static clock_t bench_fcomp_fnstsw_and(void) {
+    clock_t start = clock();
+    volatile double cmp = 0.5;
+    volatile uint16_t r;
+    for (int i = 0; i < TIMES; i++)
+        __asm__ volatile (
+            "fld1\n\t"
+            "fcompl %1\n\t"
+            "fnstsw %%ax\n\t"
+            "andw $0x4500, %%ax\n\t"
+            "movw %%ax, %0\n\t"
+            : "=m"(r) : "m"(cmp) : "ax", "cc");
+    return clock() - start;
+}
+
 int main(void) {
     struct { const char *name; clock_t (*fn)(void); } benches[] = {
         {"fcom_st",   bench_fcom_st},
@@ -200,6 +236,8 @@ int main(void) {
         {"fucomip",   bench_fucomip},
         {"ftst",      bench_ftst},
         {"fstsw",     bench_fstsw},
+        {"fcomp_fnstsw_test", bench_fcomp_fnstsw_test},
+        {"fcomp_fnstsw_and",  bench_fcomp_fnstsw_and},
     };
     int n = (int)(sizeof(benches) / sizeof(benches[0]));
     for (int i = 0; i < n; i++) {
