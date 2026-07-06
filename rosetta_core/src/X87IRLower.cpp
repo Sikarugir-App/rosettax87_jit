@@ -909,8 +909,8 @@ int peak_live_gprs(const Context& ctx) {
 //     the point they are emitted until their last use is emitted.
 //   - free_dead_inputs() fires at the end of each node, so the transient peak
 //     *during* a node is: (currently live) + 1 for the new output, before dead
-//     inputs are freed.  try_reuse_input() can avoid the +1 by recycling a
-//     dying input's FPR, but we conservatively ignore reuse here.
+//     inputs are freed.  try_reuse_input() avoids the +1 by recycling a dying
+//     input's FPR; we model it with the same claim order as lower().
 //   - StoreF32 allocates one extra transient FPR (Ds_tmp) that is freed before
 //     the node ends.  Model as a +1 spike.
 //   - StoreI*, FCmp, FTst, FStsw produce no FPR output and need no extra FPRs.
@@ -947,24 +947,42 @@ int peak_live_fprs(const Context& ctx) {
         if (n.flags & kDead) continue;
 
         // Allocate FPR for nodes that produce an FPR-bearing value.
+        // Ops that call try_reuse_input() in lower() can recycle a dying
+        // input's FPR for their output (net-zero live change); model that
+        // with the exact same claim order (inputs[0..2], first dying wins).
         bool produces_fpr = false;
+        bool can_reuse = false;
         switch (n.op) {
         case Op::ReadSt:
         case Op::LoadF64: case Op::LoadF32:
         case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
         case Op::ConstZero: case Op::ConstOne: case Op::ConstF64:
+            produces_fpr = true;
+            break;
         case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
         case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
         case Op::FNeg: case Op::FAbs: case Op::FSqrt: case Op::FRndInt:
         case Op::FCSel:
             produces_fpr = true;
+            can_reuse = true;
             break;
         default:
             break;
         }
 
         if (produces_fpr) {
-            live++;
+            bool reused = false;
+            if (can_reuse) {
+                for (int j = 0; j < 3; j++) {
+                    int16_t in = n.inputs[j];
+                    if (in >= 0 && last_use[in] == i && holding[in]) {
+                        holding[in] = false;  // FPR claimed by this node's output
+                        reused = true;
+                        break;
+                    }
+                }
+            }
+            if (!reused) live++;
             holding[i] = true;
             if (live > peak) peak = live;
         }
