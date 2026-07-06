@@ -132,12 +132,21 @@ struct Context {
     // How many x87 instructions were successfully consumed.
     int16_t consumed;
 
+    // Base-address cache plan (filled by compile_run after the pressure gate,
+    // consumed by lower()): node IDs whose mem_operand is the representative
+    // operand of a cached guest base; addr_cache_n = how many are enabled.
+    int16_t addr_cache_rep[2];
+    int8_t  addr_cache_n;
+
     void init() {
         num_nodes = 0;
         top_delta = 0;
         consumed = 0;
         last_fcmp = -1;
         last_fcomi = -1;
+        addr_cache_rep[0] = -1;
+        addr_cache_rep[1] = -1;
+        addr_cache_n = 0;
         const_zero_node = -1;
         const_one_node = -1;
         const_f64_node = -1;

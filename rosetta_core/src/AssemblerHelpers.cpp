@@ -293,6 +293,20 @@ auto emit_fldr_imm(AssemblerBuffer& buf, int size, int Dt, int Rn, int16_t imm12
     emit_ldr_str_imm(buf, size, /*is_fp=*/1, /*opc=*/1, imm12, Rn, Dt);
 }
 
+auto emit_fldur_fstur(AssemblerBuffer& buf, int size, int is_load, int16_t imm9, int Rn,
+                      int Vt) -> void {
+    // LDUR/STUR (SIMD&FP), unscaled signed 9-bit offset, no writeback.
+    // size=2 → S (f32), size=3 → D (f64).
+    // Encoding: size(2) 111 V=1 00 opc(2) 0 imm9 00 Rn Rt
+    uint32_t insn = 0x3C000000u;
+    insn |= (uint32_t)(size & 3) << 30;
+    insn |= (uint32_t)(is_load & 1) << 22;
+    insn |= ((uint32_t)imm9 & 0x1FF) << 12;
+    insn |= (uint32_t)(Rn & 0x1F) << 5;
+    insn |= (uint32_t)(Vt & 0x1F);
+    buf.emit(insn);
+}
+
 auto emit_fstr_imm(AssemblerBuffer& buf, int size, int Dt, int Rn, int16_t imm12) -> void {
     emit_ldr_str_imm(buf, size, /*is_fp=*/1, /*opc=*/0, imm12, Rn, Dt);
 }

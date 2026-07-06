@@ -47,6 +47,7 @@ ALL_BENCHMARKS=(
     bench_tag_batch
     bench_fistp_multi
     bench_mem_cse
+    bench_addr_fold
 )
 
 RED='\033[0;31m'

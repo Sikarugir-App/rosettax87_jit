@@ -94,6 +94,11 @@ auto emit_ldr_str_reg(AssemblerBuffer& buf, int size, int is_fp, int opc, int Rm
 auto emit_ldr_str_imm_ext(AssemblerBuffer& buf, int data_size, int write_back, int extend_mode,
                           int16_t offset, int Rn, int Rt) -> void;
 
+// LDUR / STUR (SIMD&FP) — unscaled signed 9-bit offset, no writeback.
+// size: 2=S (f32), 3=D (f64).  is_load: 1=LDUR, 0=STUR.
+auto emit_fldur_fstur(AssemblerBuffer& buf, int size, int is_load, int16_t imm9, int Rn,
+                      int Vt) -> void;
+
 // LDR GPR immediate — thin wrapper: is_fp=0, opc=1
 auto emit_ldr_imm(AssemblerBuffer& buf, int size, int Rt, int Rn, int16_t imm12) -> void;
 

@@ -101,6 +101,101 @@ struct FPRState {
     }
 };
 
+// ── Base-address cache ──────────────────────────────────────────────────────
+//
+// Game-profile data shows runs dominated by f32/f64 memory traffic through a
+// shared guest base register ([reg+disp] locals, vectors, matrices).  Instead
+// of emitting ADD Waddr, Wbase, #disp + LDR [Xaddr] per access, materialize
+// the base once per run and fold each displacement into the LDR/STR immediate.
+//
+// Correctness: guest GPRs cannot change within a run (only x87 instructions;
+// the one exception, FSTSW AX, is handled by excluding RAX-based operands
+// when an FStsw is present).  Semantics note for 32-bit addressing: folding
+// computes zext32(base) + disp instead of zext32(base + disp) — divergence
+// only on 32-bit pointer wraparound, impossible for valid pointers with
+// |disp| ≤ 32 KB.
+
+static bool addr_operand_base_cacheable(const IROperand* op) {
+    return op->kind == IROperandKind::MemRef && op->mem.seg_override == 0 &&
+           (op->mem.mem_flags & 1) != 0;  // has_base
+}
+
+// Same address computation modulo displacement.
+static bool addr_base_key_equal(const IROperand* a, const IROperand* b) {
+    return a->mem.addr_size == b->mem.addr_size &&
+           a->mem.mem_flags == b->mem.mem_flags &&
+           a->mem.base_reg == b->mem.base_reg &&
+           a->mem.index_reg == b->mem.index_reg &&
+           a->mem.shift_amount == b->mem.shift_amount;
+}
+
+static bool addr_disp_foldable(const IROperand* op, bool is_f64) {
+    const int64_t disp = op->mem.disp;
+    const int scale = is_f64 ? 8 : 4;
+    if (disp >= 0 && disp % scale == 0 && disp / scale <= 4095) return true;
+    return disp >= -256 && disp <= 255;  // LDUR/STUR imm9
+}
+
+static bool addr_uses_rax(const IROperand* op) {
+    if ((op->mem.mem_flags & 1) && (op->mem.base_reg & 0xF) == 0) return true;
+    if ((op->mem.mem_flags & 2) && (op->mem.index_reg & 0xF) == 0) return true;
+    return false;
+}
+
+// Pick up to 2 base keys with ≥2 foldable f32/f64 accesses each; store the
+// representative node IDs in ctx.addr_cache_rep.  Returns the planned count.
+// The caller (compile_run) degrades the plan to fit the GPR pool — each
+// cached base pins exactly one extra GPR for the whole run.
+static int plan_addr_cache(Context& ctx) {
+    bool has_fstsw = false;
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (!(n.flags & kDead) && n.op == Op::FStsw) { has_fstsw = true; break; }
+    }
+
+    struct { int16_t node; int count; } keys[6];
+    int nkeys = 0;
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        bool is_f64;
+        switch (n.op) {
+            case Op::LoadF64: case Op::StoreF64: is_f64 = true; break;
+            case Op::LoadF32: case Op::StoreF32: is_f64 = false; break;
+            default: continue;
+        }
+        const IROperand* mo = n.mem_operand;
+        if (!addr_operand_base_cacheable(mo)) continue;
+        if (has_fstsw && addr_uses_rax(mo)) continue;
+        if (!addr_disp_foldable(mo, is_f64)) continue;
+        int k = 0;
+        for (; k < nkeys; k++) {
+            if (addr_base_key_equal(ctx.nodes[keys[k].node].mem_operand, mo)) {
+                keys[k].count++;
+                break;
+            }
+        }
+        if (k == nkeys && nkeys < 6) {
+            keys[nkeys].node = static_cast<int16_t>(i);
+            keys[nkeys].count = 1;
+            nkeys++;
+        }
+    }
+
+    int picked = 0;
+    for (int round = 0; round < 2; round++) {
+        int best = -1;
+        for (int k = 0; k < nkeys; k++) {
+            if (keys[k].count >= 2 && (best < 0 || keys[k].count > keys[best].count))
+                best = k;
+        }
+        if (best < 0) break;
+        ctx.addr_cache_rep[picked++] = keys[best].node;
+        keys[best].count = 0;
+    }
+    return picked;
+}
+
 // ── RC preamble: load control_word and extract rounding-control bits ────────
 
 static void emit_rc_preamble(AssemblerBuffer& buf, int Xbase, int Wd_out) {
@@ -147,6 +242,47 @@ void lower(Context& ctx, TranslationResult* result) {
     // ── FPR assignment ──────────────────────────────────────────────────────
     FPRState fprs;
     fprs.compute_last_uses(ctx);
+
+    // ── Base-address cache: materialize planned guest bases ────────────────
+    const int addr_n = ctx.addr_cache_n;
+    IROperand* addr_rep[2] = {nullptr, nullptr};
+    int addr_reg[2] = {-1, -1};
+    bool addr_owned[2] = {false, false};
+    for (int k = 0; k < addr_n; k++) {
+        addr_rep[k] = ctx.nodes[ctx.addr_cache_rep[k]].mem_operand;
+        IROperand base_op = *addr_rep[k];
+        base_op.mem.disp = 0;
+        addr_reg[k] = compute_operand_address(*result, true, &base_op, GPR::XZR);
+        // The 64-bit no-disp path returns the guest register itself (nothing
+        // allocated); only scratch-pool registers are ours to free.
+        addr_owned[k] = ((kGprScratchMask >> addr_reg[k]) & 1u) != 0;
+    }
+
+    // Emit a Load*/Store* access through a cached base + immediate offset.
+    // Returns false if the operand matches no cached base (or the disp fits
+    // neither form) — caller falls back to compute_operand_address.
+    auto emit_cached_access = [&](const Node& n, int size, int is_load, int Vt) -> bool {
+        for (int k = 0; k < addr_n; k++) {
+            if (!addr_base_key_equal(n.mem_operand, addr_rep[k])) continue;
+            const int64_t disp = n.mem_operand->mem.disp;
+            const int scale = (size == 3) ? 8 : 4;
+            if (disp >= 0 && disp % scale == 0 && disp / scale <= 4095) {
+                if (is_load)
+                    emit_fldr_imm(buf, size, Vt, addr_reg[k],
+                                  static_cast<int16_t>(disp / scale));
+                else
+                    emit_fstr_imm(buf, size, Vt, addr_reg[k],
+                                  static_cast<int16_t>(disp / scale));
+            } else if (disp >= -256 && disp <= 255) {
+                emit_fldur_fstur(buf, size, is_load, static_cast<int16_t>(disp),
+                                 addr_reg[k], Vt);
+            } else {
+                continue;
+            }
+            return true;
+        }
+        return false;
+    };
 
     // ── RC caching: hoist LDRH+UBFX when ≥2 RC consumers in a segment ────
     int Wd_rc_cached = -1;
@@ -210,17 +346,21 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::LoadF64: {
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-            emit_fldr_imm(buf, 3, Dd, addr, 0);
-            free_gpr(*result, addr);
+            if (!emit_cached_access(n, 3, /*is_load=*/1, Dd)) {
+                int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
+                emit_fldr_imm(buf, 3, Dd, addr, 0);
+                free_gpr(*result, addr);
+            }
             break;
         }
         case Op::LoadF32: {
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-            emit_fldr_imm(buf, 2, Dd, addr, 0);
-            free_gpr(*result, addr);
+            if (!emit_cached_access(n, 2, /*is_load=*/1, Dd)) {
+                int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
+                emit_fldr_imm(buf, 2, Dd, addr, 0);
+                free_gpr(*result, addr);
+            }
             emit_fcvt_s_to_d(buf, Dd, Dd);
             break;
         }
@@ -419,18 +559,23 @@ void lower(Context& ctx, TranslationResult* result) {
 
         // ── Memory stores ───────────────────────────────────────────────
         case Op::StoreF64: {
-            int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-            emit_fstr_imm(buf, 3, fprs.get(n.inputs[0]), addr, 0);
-            free_gpr(*result, addr);
+            int Dd_val = fprs.get(n.inputs[0]);
+            if (!emit_cached_access(n, 3, /*is_load=*/0, Dd_val)) {
+                int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
+                emit_fstr_imm(buf, 3, Dd_val, addr, 0);
+                free_gpr(*result, addr);
+            }
             break;
         }
         case Op::StoreF32: {
             // Narrow f64 → f32, then store.
             int Ds_tmp = alloc_free_fpr(*result);
             emit_fcvt_d_to_s(buf, Ds_tmp, fprs.get(n.inputs[0]));
-            int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-            emit_fstr_imm(buf, 2, Ds_tmp, addr, 0);
-            free_gpr(*result, addr);
+            if (!emit_cached_access(n, 2, /*is_load=*/0, Ds_tmp)) {
+                int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
+                emit_fstr_imm(buf, 2, Ds_tmp, addr, 0);
+                free_gpr(*result, addr);
+            }
             free_fpr(*result, Ds_tmp);
             break;
         }
@@ -745,6 +890,10 @@ void lower(Context& ctx, TranslationResult* result) {
     result->x87_cache.reset_perm();
 
     // 7. Free scratch GPRs.
+    for (int k = 0; k < addr_n; k++) {
+        if (addr_owned[k])
+            free_gpr(*result, addr_reg[k]);
+    }
     if (Wd_rc_cached >= 0)
         free_gpr(*result, Wd_rc_cached);
     free_gpr(*result, Wd_tmp);
@@ -1073,9 +1222,17 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
         uint32_t gpr_pool = result->free_gpr_mask;
         int gpr_available = 0;
         while (gpr_pool) { gpr_available++; gpr_pool &= gpr_pool - 1; }
-        if (peak_live_gprs(ctx, entry_deferred) > gpr_available) {
+        const int peak = peak_live_gprs(ctx, entry_deferred);
+        if (peak > gpr_available) {
             return 0;
         }
+        // Base-address cache: each cached base pins exactly one extra GPR for
+        // the whole run (on top of every per-node total), so peak+N is exact.
+        // Degrade the plan until it fits.
+        int addr_n = plan_addr_cache(ctx);
+        while (addr_n > 0 && peak + addr_n > gpr_available)
+            addr_n--;
+        ctx.addr_cache_n = static_cast<int8_t>(addr_n);
     }
 
     lower(ctx, result);
