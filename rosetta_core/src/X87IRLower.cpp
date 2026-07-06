@@ -162,6 +162,31 @@ void lower(Context& ctx, TranslationResult* result) {
             Wd_rc_cached = alloc_gpr(*result, 3);
     }
 
+    // ── NZCV hoisting: one MRS/MSR pair around all FCmp/FTst in the run ─────
+    // Instead of saving/restoring guest NZCV per compare, save once before the
+    // first compare and restore once after the last.  Safe only when no node
+    // legitimately writes/reads NZCV in between (FComI writes it for the
+    // guest; FCSel reads it) — nothing else emitted by this pipeline touches
+    // flags.
+    int nzcv_first_cmp = -1, nzcv_last_cmp = -1;
+    bool nzcv_hoist = false;
+    {
+        int cmp_count = 0;
+        bool has_nzcv_user = false;
+        for (int i = 0; i < ctx.num_nodes; i++) {
+            auto& n = ctx.nodes[i];
+            if (n.flags & kDead) continue;
+            if (n.op == Op::FComI || n.op == Op::FCSel) { has_nzcv_user = true; break; }
+            if (n.op == Op::FCmp || n.op == Op::FTst) {
+                if (nzcv_first_cmp < 0) nzcv_first_cmp = i;
+                nzcv_last_cmp = i;
+                cmp_count++;
+            }
+        }
+        nzcv_hoist = !has_nzcv_user && cmp_count >= 2;
+    }
+    int Wd_nzcv_saved = -1;
+
     // ── Emit each IR node ───────────────────────────────────────────────────
     for (int i = 0; i < ctx.num_nodes; i++) {
         auto& n = ctx.nodes[i];
@@ -433,13 +458,30 @@ void lower(Context& ctx, TranslationResult* result) {
 
         // ── Compare ─────────────────────────────────────────────────────
         case Op::FCmp: {
-            int Wd_save = alloc_free_gpr(*result);
-            emit_mrs_nzcv(buf, Wd_save);
-            emit_fcmp_f64(buf, fprs.get(n.inputs[0]), fprs.get(n.inputs[1]));
+            int Wd_packed;
+            if (nzcv_hoist) {
+                if (Wd_nzcv_saved < 0) {
+                    Wd_nzcv_saved = alloc_free_gpr(*result);
+                    emit_mrs_nzcv(buf, Wd_nzcv_saved);
+                }
+                emit_fcmp_f64(buf, fprs.get(n.inputs[0]), fprs.get(n.inputs[1]));
 
-            int Wd_packed = alloc_free_gpr(*result);
-            emit_fcom_cc_pack(buf, *result, Wd_packed, Wd_save);
-            // emit_fcom_cc_pack restores NZCV and frees Wd_save internally.
+                Wd_packed = alloc_free_gpr(*result);
+                emit_fcom_cc_pack_hoisted(buf, *result, Wd_packed);
+                if (i == nzcv_last_cmp) {
+                    emit_msr_nzcv(buf, Wd_nzcv_saved);
+                    free_gpr(*result, Wd_nzcv_saved);
+                    Wd_nzcv_saved = -1;
+                }
+            } else {
+                int Wd_save = alloc_free_gpr(*result);
+                emit_mrs_nzcv(buf, Wd_save);
+                emit_fcmp_f64(buf, fprs.get(n.inputs[0]), fprs.get(n.inputs[1]));
+
+                Wd_packed = alloc_free_gpr(*result);
+                emit_fcom_cc_pack(buf, *result, Wd_packed, Wd_save);
+                // emit_fcom_cc_pack restores NZCV and frees Wd_save internally.
+            }
 
             if (n.flags & kFcomFused) {
                 // Fused: keep packed CC alive for FStsw to consume.
@@ -453,12 +495,29 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
         case Op::FTst: {
-            int Wd_save = alloc_free_gpr(*result);
-            emit_mrs_nzcv(buf, Wd_save);
-            emit_fcmp_zero_f64(buf, fprs.get(n.inputs[0]));
+            int Wd_packed;
+            if (nzcv_hoist) {
+                if (Wd_nzcv_saved < 0) {
+                    Wd_nzcv_saved = alloc_free_gpr(*result);
+                    emit_mrs_nzcv(buf, Wd_nzcv_saved);
+                }
+                emit_fcmp_zero_f64(buf, fprs.get(n.inputs[0]));
 
-            int Wd_packed = alloc_free_gpr(*result);
-            emit_fcom_cc_pack(buf, *result, Wd_packed, Wd_save);
+                Wd_packed = alloc_free_gpr(*result);
+                emit_fcom_cc_pack_hoisted(buf, *result, Wd_packed);
+                if (i == nzcv_last_cmp) {
+                    emit_msr_nzcv(buf, Wd_nzcv_saved);
+                    free_gpr(*result, Wd_nzcv_saved);
+                    Wd_nzcv_saved = -1;
+                }
+            } else {
+                int Wd_save = alloc_free_gpr(*result);
+                emit_mrs_nzcv(buf, Wd_save);
+                emit_fcmp_zero_f64(buf, fprs.get(n.inputs[0]));
+
+                Wd_packed = alloc_free_gpr(*result);
+                emit_fcom_cc_pack(buf, *result, Wd_packed, Wd_save);
+            }
 
             if (n.flags & kFcomFused) {
                 fprs.node_fpr[i] = static_cast<int8_t>(Wd_packed);
@@ -718,6 +777,27 @@ int peak_live_gprs(const Context& ctx) {
     int pinned = 4;  // Xbase, Wd_top, Wd_tmp, Xst_base
     if (rc_cache) pinned++;  // Wd_rc_cached
 
+    // NZCV hoisting mirror (same predicate as lower()): when active, one GPR
+    // (Wd_nzcv_saved) is held from the first FCmp/FTst through the last, and
+    // each compare no longer allocates a per-node Wd_save.
+    int nzcv_first_cmp = -1, nzcv_last_cmp = -1;
+    bool nzcv_hoist = false;
+    {
+        int cmp_count = 0;
+        bool has_nzcv_user = false;
+        for (int i = 0; i < ctx.num_nodes; i++) {
+            const auto& n = ctx.nodes[i];
+            if (n.flags & kDead) continue;
+            if (n.op == Op::FComI || n.op == Op::FCSel) { has_nzcv_user = true; break; }
+            if (n.op == Op::FCmp || n.op == Op::FTst) {
+                if (nzcv_first_cmp < 0) nzcv_first_cmp = i;
+                nzcv_last_cmp = i;
+                cmp_count++;
+            }
+        }
+        nzcv_hoist = !has_nzcv_user && cmp_count >= 2;
+    }
+
     // Simulate GPR pressure across IR nodes.
     // "held" tracks GPRs held alive across node boundaries (fused FCmp→FStsw).
     int held = 0;
@@ -762,9 +842,16 @@ int peak_live_gprs(const Context& ctx) {
 
         // FCmp/FTst: 4 peak inside emit_fcom_cc_pack
         // (Wd_save + Wd_packed + Wd_cc + Wd_vs simultaneously live)
+        // Hoisted: no per-node Wd_save (3 transient), but Wd_nzcv_saved is
+        // held from the first compare through the last (held++ below).
         // If fused, Wd_packed stays alive after → held++
         case Op::FCmp: case Op::FTst:
-            transient = 4;
+            if (nzcv_hoist) {
+                transient = 3;
+                if (i == nzcv_first_cmp) held++;  // Wd_nzcv_saved acquired
+            } else {
+                transient = 4;
+            }
             if (n.flags & kFcomFused) {
                 // After the node, Wd_packed remains held until FStsw
                 held++;
@@ -798,6 +885,9 @@ int peak_live_gprs(const Context& ctx) {
 
         int node_total = pinned + held + transient;
         if (node_total > peak) peak = node_total;
+
+        // Wd_nzcv_saved is released at the end of the last compare node.
+        if (nzcv_hoist && i == nzcv_last_cmp) held--;
     }
 
     // Epilogue: if top_delta != 0, needs 2 more transient GPRs (Wd_tmp2 + Wd_tagw)

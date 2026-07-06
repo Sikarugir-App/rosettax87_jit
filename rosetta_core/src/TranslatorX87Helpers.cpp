@@ -807,6 +807,35 @@ void emit_fcom_cc_pack(AssemblerBuffer& buf, TranslationResult& a1,
 }
 
 // =============================================================================
+// NZCV-hoisted variant of emit_fcom_cc_pack: identical CC packing but does
+// NOT restore NZCV.  Used when the caller saves/restores NZCV once around a
+// whole group of compares (IR run) instead of per-compare.
+// =============================================================================
+void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
+                                int Wd_result) {
+    const int Wd_cc = alloc_free_gpr(a1);
+    const int Wd_vs = alloc_free_gpr(a1);
+
+    emit_cset(buf, /*is_64bit=*/0, /*CC=*/3, Wd_cc);     // 1 if carry clear (LT)
+    emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_vs);     // 1 if overflow (UN)
+    emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_result); // 1 if equal
+
+    // C0 = CC | VS
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 0, Wd_cc, Wd_cc);
+    // C3 = EQ | VS
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 0, Wd_result, Wd_result);
+
+    // Pack: Wd_result = (C0 << 8) | (C2 << 10) | (C3 << 14)
+    emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,
+                  /*immr=*/24, /*imms=*/23, Wd_cc, Wd_cc);  // LSL #8
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 10, Wd_cc, Wd_cc);
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_result, 14, Wd_cc, Wd_result);
+
+    free_gpr(a1, Wd_vs);
+    free_gpr(a1, Wd_cc);
+}
+
+// =============================================================================
 // OPT-L: RMW status_word — clear C0/C1/C2/C3, OR in packed CC bits, store.
 //
 // C1 (bit 9) is cleared per Intel SDM for all FCOM variants.

@@ -294,6 +294,11 @@ void emit_x87_perm_flush(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp
 void emit_fcom_cc_pack(AssemblerBuffer& buf, TranslationResult& a1,
                         int Wd_result, int Wd_save);
 
+// NZCV-hoisted variant: same CC packing, but does NOT restore NZCV. The
+// caller is responsible for one MRS/MSR pair around the whole compare group.
+void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
+                                int Wd_result);
+
 // =============================================================================
 // OPT-L: RMW status_word — clear C0/C1/C2/C3, OR in packed CC bits, store.
 //

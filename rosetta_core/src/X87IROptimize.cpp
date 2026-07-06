@@ -2,6 +2,35 @@
 
 namespace X87IR {
 
+// ── Pass 0: Dead-compare elimination ────────────────────────────────────────
+//
+// FCmp/FTst's only architectural effect is writing C0/C2/C3 into status_word
+// (exceptions are unmodeled). FStsw is the only IR node that reads
+// status_word, and run end is the final observer. So a compare whose CC bits
+// are overwritten by a later FCmp/FTst, with no FStsw in between, has no
+// observable effect and can be killed outright — its FCMP, the NZCV
+// save/restore, the CC pack, and the status_word RMW all disappear, and its
+// value inputs may cascade dead in pass_dse.
+//
+// Backward scan: `overwritten` is true when a live FCmp/FTst lies below with
+// no FStsw between it and the current node.
+
+static void pass_dead_compares(Context& ctx) {
+    bool overwritten = false;
+    for (int i = ctx.num_nodes - 1; i >= 0; i--) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        if (n.op == Op::FStsw) {
+            overwritten = false;
+        } else if (n.op == Op::FCmp || n.op == Op::FTst) {
+            if (overwritten)
+                n.flags |= kDead;
+            else
+                overwritten = true;
+        }
+    }
+}
+
 // ── Pass 1: Dead Store Elimination ──────────────────────────────────────────
 //
 // Walk backward. A value node is dead if it has no live consumers (no other
@@ -189,6 +218,7 @@ static void pass_fcom_fstsw_fusion(Context& ctx) {
 // ── Public API ──────────────────────────────────────────────────────────────
 
 void optimize(Context& ctx) {
+    pass_dead_compares(ctx);
     pass_dse(ctx);
     pass_fma(ctx);
     pass_fcom_fstsw_fusion(ctx);
