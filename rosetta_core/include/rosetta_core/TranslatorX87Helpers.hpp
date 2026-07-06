@@ -302,3 +302,20 @@ void emit_fcom_cc_pack(AssemblerBuffer& buf, TranslationResult& a1,
 // =============================================================================
 void emit_fcom_cc_write_sw(AssemblerBuffer& buf, TranslationResult& a1,
                             int Xbase, int Wd_packed);
+
+// =============================================================================
+// RC dispatch — binary tree over the x87 RC field (control_word bits [11:10],
+// pre-extracted into Wd_rc bits [1:0]).
+//
+// Emits a 10-instruction TBNZ tree (3 TBNZ + 4 ops + 3 B): every path executes
+// exactly 2 test-branches + 1 op (+1 B except RC=3).  Wd_rc is NOT clobbered,
+// so a cached RC value can be dispatched repeatedly without a scratch copy.
+//
+//   x87 RC → op:  RC=0 nearest, RC=1 floor, RC=2 ceil, RC=3 truncate
+//
+// _fcvt:  f64 → signed int    (FCVTNS/FCVTMS/FCVTPS/FCVTZS  Wd_int, Dd_val)
+// _frint: f64 → integral f64  (FRINTN/FRINTM/FRINTP/FRINTZ  Dd, Dn)
+// =============================================================================
+void emit_x87_rc_dispatch_fcvt(AssemblerBuffer& buf, int Wd_rc, int Wd_int,
+                                int Dd_val, int is_64bit_int);
+void emit_x87_rc_dispatch_frint(AssemblerBuffer& buf, int Wd_rc, int Dd, int Dn);

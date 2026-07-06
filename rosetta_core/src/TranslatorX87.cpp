@@ -1136,11 +1136,11 @@ auto translate_fmul(TranslationResult* a1, IRInstr* a2) -> void {
 // the same slot, so the load/store is skipped. The pop still fires for fstp_stack.
 //
 // The Memory path (fst / fstp) stores ST(0) to a memory address.
-// S80 is handed off to a runtime routine (kRuntimeRoutine_fstp_fp80 / fst_fp80)
-// because the 80-bit extended format has a different exponent bias (16383 vs
-// 1023) and an explicit integer bit — it cannot be produced from a 64-bit double
-// via a plain FCVT, and writing only 8 bytes to an m80fp destination corrupts
-// the 2-byte exponent field at addr+8.
+// S80 uses the inline double → f80 conversion path below (the 80-bit extended
+// format has a different exponent bias, 16383 vs 1023, and an explicit integer
+// bit — it cannot be produced from a 64-bit double via a plain FCVT, and
+// writing only 8 bytes to an m80fp destination would corrupt the 2-byte
+// exponent field at addr+8).
 // is_f32 is only valid for the S32/S64 direct-emit memory path.
 auto translate_fst(TranslationResult* a1, IRInstr* a2) -> void {
     AssemblerBuffer& buf = a1->insn_buf;
@@ -1838,103 +1838,26 @@ auto translate_fistp(TranslationResult* a1, IRInstr* a2) -> void {
     //   base = 0x1E200000 | (sf<<31) | (ftype<<22) | (aarch64_rmode<<19)
     //   insn = base | (Rn<<5) | Rd
     //
-    // We dispatch at runtime via a 3-branch CBZ chain. The fall-through path
-    // (RC=3, truncate) is kept last since it is the default x87 mode and
-    // requires no rounding-specific branch. All branch offsets are fixed and
-    // small — no fixup system is needed.
+    // Dispatch at runtime via the shared binary TBNZ tree (see
+    // emit_x87_rc_dispatch_fcvt): LDRH+UBFX preamble, then 2 test-branches on
+    // every path.  All branch offsets are fixed and small — no fixup needed.
     //
-    //   Instruction layout (each idx = 1 AArch64 instruction = 4 bytes):
-    //   [0] LDRH  Wd_rc, [Xbase, #0]          ; load control_word
-    //   [1] UBFM  Wd_rc, Wd_rc, #10, #11      ; UBFX bits[11:10] → bits[1:0]
-    //   [2] CBZ   Wd_rc, +28                  ; RC==0 → [9] FCVTNS
-    //   [3] SUB   Wd_rc, Wd_rc, #1
-    //   [4] CBZ   Wd_rc, +28                  ; RC==1 → [11] FCVTMS
-    //   [5] SUB   Wd_rc, Wd_rc, #1
-    //   [6] CBZ   Wd_rc, +28                  ; RC==2 → [13] FCVTPS
-    //   [7] FCVTZS Wd_int, Dd_val             ; RC=3 truncate (fall-through)
-    //   [8] B     +24                         ; → [14] done
-    //   [9] FCVTNS Wd_int, Dd_val             ; RC=0 nearest
-    //  [10] B     +16                         ; → [14] done
-    //  [11] FCVTMS Wd_int, Dd_val             ; RC=1 floor (the crash case)
-    //  [12] B     +8                          ; → [14] done
-    //  [13] FCVTPS Wd_int, Dd_val             ; RC=2 ceil
-    //  [14] ; done — fall through to store
-    //
-    // Wd_rc reuses Wd_tmp (free after emit_load_st).
-    //
-    // FCVT*S encoding: 0x1E200000 | (sf<<31) | (ftype<<22) | (aarch64_rmode<<19) | (Rn<<5) | Rd
-    //   sf=0 for 32-bit int result, sf=1 for 64-bit.  ftype=1 for f64 source.
-    //   rmode field: NS=0, PS=1, MS=2, ZS=3.
+    // Wd_rc reuses Wd_tmp (free after emit_load_st; the tree is non-destructive).
 
     const int is_64bit_int = (int_size == IROperandSize::S64) ? 1 : 0;
     const int Wd_rc = Wd_tmp;  // free after emit_load_st — reuse as RC scratch
 
     if (g_rosetta_config && g_rosetta_config->fast_round) {
         // Fast path: assume RC=0 (round-to-nearest). Single instruction.
-        // Correct for blocks that contain no FLDCW (fast_round=1: always; =2/smart: per-block).
         emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=FCVTNS*/ 0, Wd_int,
                             Dd_val);
     } else {
-        // Full dispatch: read RC from control_word and branch to the correct FCVT*S.
-        //
-        //   Instruction layout (each idx = 1 AArch64 instruction = 4 bytes):
-        //   [0] LDRH  Wd_rc, [Xbase, #0]          ; load control_word
-        //   [1] UBFM  Wd_rc, Wd_rc, #10, #11      ; UBFX bits[11:10] → bits[1:0]
-        //   [2] CBZ   Wd_rc, +28                  ; RC==0 → [9] FCVTNS
-        //   [3] SUB   Wd_rc, Wd_rc, #1
-        //   [4] CBZ   Wd_rc, +28                  ; RC==1 → [11] FCVTMS
-        //   [5] SUB   Wd_rc, Wd_rc, #1
-        //   [6] CBZ   Wd_rc, +28                  ; RC==2 → [13] FCVTPS
-        //   [7] FCVTZS Wd_int, Dd_val             ; RC=3 truncate (fall-through)
-        //   [8] B     +24                         ; → [14] done
-        //   [9] FCVTNS Wd_int, Dd_val             ; RC=0 nearest
-        //  [10] B     +16                         ; → [14] done
-        //  [11] FCVTMS Wd_int, Dd_val             ; RC=1 floor (the crash case)
-        //  [12] B     +8                          ; → [14] done
-        //  [13] FCVTPS Wd_int, Dd_val             ; RC=2 ceil
-        //  [14] ; done — fall through to store
-
-        // [0] LDRH Wd_rc, [Xbase, #0]  ; control_word (offset 0, imm12=0)
+        // LDRH Wd_rc, [Xbase, #0]  ; control_word (offset 0, imm12=0)
         emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, /*imm12=*/0, Xbase, Wd_rc);
-
-        // [1] UBFX Wd_rc, Wd_rc, #10, #2  → bits[11:10] in bits[1:0]
-        // UBFM: immr=lsb=10, imms=lsb+width-1=11
+        // UBFX Wd_rc, Wd_rc, #10, #2  → bits[11:10] in bits[1:0]
         emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0, /*immr*/ 10, /*imms*/ 11, Wd_rc,
                       Wd_rc);
-
-        // [2] CBZ Wd_rc, +28  (+7 instructions → idx 9)
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-
-        // [3] SUB Wd_rc, Wd_rc, #1
-        emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
-
-        // [4] CBZ Wd_rc, +28  (+7 instructions → idx 11)
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-
-        // [5] SUB Wd_rc, Wd_rc, #1
-        emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
-
-        // [6] CBZ Wd_rc, +28  (+7 instructions → idx 13)
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-
-        // [7] FCVTZS (rmode=3)  RC=3 truncate
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 3, Wd_int, Dd_val);
-        // [8] B +24  (+6 instructions → idx 14)
-        emit_b(buf, 6);
-
-        // [9] FCVTNS (rmode=0)  RC=0 nearest
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 0, Wd_int, Dd_val);
-        // [10] B +16  (+4 instructions → idx 14)
-        emit_b(buf, 4);
-
-        // [11] FCVTMS (rmode=2)  RC=1 floor
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 2, Wd_int, Dd_val);
-        // [12] B +8  (+2 instructions → idx 14)
-        emit_b(buf, 2);
-
-        // [13] FCVTPS (rmode=1)  RC=2 ceil
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 1, Wd_int, Dd_val);
-        // [14] done — Wd_int now holds the correctly rounded integer.
+        emit_x87_rc_dispatch_fcvt(buf, Wd_rc, Wd_int, Dd_val, is_64bit_int);
     }
 
     // Step 3: compute destination address
@@ -2333,41 +2256,10 @@ auto translate_frndint(TranslationResult* a1, IRInstr* /*a2*/) -> void {
         // LDRH Wd_rc, [Xbase, #0]   imm12=0 → byte offset 0
         emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, /*imm12=*/0, Xbase, Wd_rc);
         // UBFX Wd_rc, Wd_rc, #10, #2   →  bits[11:10] in bits[1:0]
-        // UBFM immr=10, imms=11  (width = imms-immr+1 = 2 bits → RC values 0..3)
         emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0, /*immr*/ 10, /*imms*/ 11, Wd_rc,
                       Wd_rc);
-
-        // ── Runtime dispatch: CBZ/SUB chain ──────────────────────────────────────
-        //
-        // [D+0] CBZ Wd_rc, +28  (imm19=7 → branch offset 28 bytes → [D+28] FRINTN)
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-        // [D+4] SUB Wd_rc, Wd_rc, #1
-        emit_add_imm(buf, /*is_64=*/0, /*sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
-        // [D+8] CBZ Wd_rc, +28  (target = D+8+28 = D+36 → [D+36] FRINTM)
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-        // [D+12] SUB Wd_rc, Wd_rc, #1
-        emit_add_imm(buf, /*is_64=*/0, /*sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
-        // [D+16] CBZ Wd_rc, +28  (target = D+16+28 = D+44 → [D+44] FRINTP)
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-
-        // [D+20] FRINTZ Dd, Dd   RC=3 (truncate) — fall-through path
-        emit_fp_dp1(buf, /*type=*/1 /*f64*/, /*FRINTZ=*/11, Dd, Dd);
-        // [D+24] B +24           skip to done  (imm26=6 → offset 24 → D+24+24 = D+48)
-        emit_b(buf, 6);
-
-        // [D+28] FRINTN Dd, Dd   RC=0 (round nearest, ties to even)
-        emit_fp_dp1(buf, /*type=*/1 /*f64*/, /*FRINTN=*/8, Dd, Dd);
-        // [D+32] B +16           (imm26=4 → offset 16 → D+32+16 = D+48)
-        emit_b(buf, 4);
-
-        // [D+36] FRINTM Dd, Dd   RC=1 (floor, toward −∞)
-        emit_fp_dp1(buf, /*type=*/1 /*f64*/, /*FRINTM=*/10, Dd, Dd);
-        // [D+40] B +8            (imm26=2 → offset 8 → D+40+8 = D+48)
-        emit_b(buf, 2);
-
-        // [D+44] FRINTP Dd, Dd   RC=2 (ceil, toward +∞)
-        emit_fp_dp1(buf, /*type=*/1 /*f64*/, /*FRINTP=*/9, Dd, Dd);
-        // [D+48] done ─────────────────────────────────────────────────────────────
+        // Shared binary TBNZ dispatch tree → FRINTN/M/P/Z
+        emit_x87_rc_dispatch_frint(buf, Wd_rc, Dd, Dd);
     }
 
     // Opt 3: Wd_tmp still holds the ST(0) byte offset written by emit_load_st.
@@ -2573,7 +2465,7 @@ auto translate_fist(TranslationResult* a1, IRInstr* a2) -> void {
     // Load ST(0)
     emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp, Dd_val, Xst_base);
 
-    // Rounding mode dispatch — same CBZ/SUB chain as translate_fistp.
+    // Rounding mode dispatch — same shared TBNZ tree as translate_fistp.
     const int is_64bit_int = (int_size == IROperandSize::S64) ? 1 : 0;
     const int Wd_rc = Wd_tmp;
 
@@ -2582,31 +2474,12 @@ auto translate_fist(TranslationResult* a1, IRInstr* a2) -> void {
         emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=FCVTNS*/ 0, Wd_int,
                             Dd_val);
     } else {
-        // [0] LDRH Wd_rc, [Xbase, #0]
+        // LDRH Wd_rc, [Xbase, #0]  ; control_word
         emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, /*imm12=*/0, Xbase, Wd_rc);
-        // [1] UBFX Wd_rc, Wd_rc, #10, #2
+        // UBFX Wd_rc, Wd_rc, #10, #2
         emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0, /*immr*/ 10, /*imms*/ 11, Wd_rc,
                       Wd_rc);
-
-        // [2] CBZ Wd_rc, +28 → [9] FCVTNS
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-        // [3] SUB Wd_rc, Wd_rc, #1
-        emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
-        // [4] CBZ Wd_rc, +28 → [11] FCVTMS
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-        // [5] SUB Wd_rc, Wd_rc, #1
-        emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
-        // [6] CBZ Wd_rc, +28 → [13] FCVTPS
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 3, Wd_int, Dd_val); // [7] FCVTZS (RC=3)
-        emit_b(buf, 6);                                                                              // [8] B +24 → done
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 0, Wd_int, Dd_val); // [9] FCVTNS (RC=0)
-        emit_b(buf, 4);                                                                              // [10] B +16 → done
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 2, Wd_int, Dd_val); // [11] FCVTMS (RC=1)
-        emit_b(buf, 2);                                                                              // [12] B +8 → done
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 1, Wd_int, Dd_val); // [13] FCVTPS (RC=2)
-        // [14] done
+        emit_x87_rc_dispatch_fcvt(buf, Wd_rc, Wd_int, Dd_val, is_64bit_int);
     }
 
     // Store integer to memory

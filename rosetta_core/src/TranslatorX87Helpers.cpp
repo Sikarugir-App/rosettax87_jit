@@ -832,3 +832,50 @@ void emit_fcom_cc_write_sw(AssemblerBuffer& buf, TranslationResult& a1,
 
     free_gpr(a1, Wd_sw);
 }
+// =============================================================================
+// RC dispatch — binary TBNZ tree over pre-extracted RC bits [1:0] in Wd_rc.
+//
+// Layout (each idx = 1 instruction):
+//   [0] TBNZ Wd_rc, #1, +6   → [6]   ; RC ∈ {2,3}
+//   [1] TBNZ Wd_rc, #0, +3   → [4]   ; RC=1
+//   [2] op(RC=0 nearest)
+//   [3] B +7                 → [10]  ; done
+//   [4] op(RC=1 floor)
+//   [5] B +5                 → [10]
+//   [6] TBNZ Wd_rc, #0, +3   → [9]   ; RC=3
+//   [7] op(RC=2 ceil)
+//   [8] B +2                 → [10]
+//   [9] op(RC=3 truncate)
+//  [10] done
+//
+// Wd_rc is only read (never written), so cached RC values survive dispatch.
+// =============================================================================
+
+void emit_x87_rc_dispatch_fcvt(AssemblerBuffer& buf, int Wd_rc, int Wd_int,
+                                int Dd_val, int is_64bit_int) {
+    // FCVT*S rmode field: NS=0 (nearest), PS=1 (ceil), MS=2 (floor), ZS=3 (trunc)
+    emit_tbz(buf, /*TBNZ*/1, /*bit*/1, Wd_rc, 6);
+    emit_tbz(buf, /*TBNZ*/1, /*bit*/0, Wd_rc, 3);
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=f64*/1, /*rmode=NS*/0, Wd_int, Dd_val);
+    emit_b(buf, 7);
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=f64*/1, /*rmode=MS*/2, Wd_int, Dd_val);
+    emit_b(buf, 5);
+    emit_tbz(buf, /*TBNZ*/1, /*bit*/0, Wd_rc, 3);
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=f64*/1, /*rmode=PS*/1, Wd_int, Dd_val);
+    emit_b(buf, 2);
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=f64*/1, /*rmode=ZS*/3, Wd_int, Dd_val);
+}
+
+void emit_x87_rc_dispatch_frint(AssemblerBuffer& buf, int Wd_rc, int Dd, int Dn) {
+    // FRINT* fp_dp1 opcode: FRINTN=8, FRINTP=9, FRINTM=10, FRINTZ=11
+    emit_tbz(buf, /*TBNZ*/1, /*bit*/1, Wd_rc, 6);
+    emit_tbz(buf, /*TBNZ*/1, /*bit*/0, Wd_rc, 3);
+    emit_fp_dp1(buf, /*type=f64*/1, /*FRINTN*/8, Dd, Dn);
+    emit_b(buf, 7);
+    emit_fp_dp1(buf, /*type=f64*/1, /*FRINTM*/10, Dd, Dn);
+    emit_b(buf, 5);
+    emit_tbz(buf, /*TBNZ*/1, /*bit*/0, Wd_rc, 3);
+    emit_fp_dp1(buf, /*type=f64*/1, /*FRINTP*/9, Dd, Dn);
+    emit_b(buf, 2);
+    emit_fp_dp1(buf, /*type=f64*/1, /*FRINTZ*/11, Dd, Dn);
+}

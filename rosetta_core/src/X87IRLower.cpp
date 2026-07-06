@@ -110,70 +110,11 @@ static void emit_rc_preamble(AssemblerBuffer& buf, int Xbase, int Wd_out) {
     emit_bitfield(buf, /*is_64=*/0, /*UBFM*/2, /*N*/0, /*immr*/10, /*imms*/11, Wd_out, Wd_out);
 }
 
-// ── Cached RC dispatch for FISTP/FIST ──────────────────────────────────────
-//
-// Uses a pre-extracted RC value in Wd_rc_cached.  Copies to Wd_rc_scratch
-// first because the CBZ/SUB chain is destructive.
-
-static void emit_rcmode_dispatch_cached(AssemblerBuffer& buf, int Wd_int, int Dd_val,
-                                         int is_64bit_int, int Wd_rc_cached,
-                                         int Wd_rc_scratch) {
-    // [0] MOV Wd_rc_scratch, Wd_rc_cached
-    emit_mov_reg(buf, /*is_64bit=*/0, Wd_rc_scratch, Wd_rc_cached);
-    // [1] CBZ Wd_rc_scratch, +7 → [8] FCVTNS
-    emit_cbz(buf, 0, 0, Wd_rc_scratch, 7);
-    // [2] SUB Wd_rc_scratch, Wd_rc_scratch, #1
-    emit_add_imm(buf, 0, 1, 0, 0, 1, Wd_rc_scratch, Wd_rc_scratch);
-    // [3] CBZ Wd_rc_scratch, +7 → [10] FCVTMS
-    emit_cbz(buf, 0, 0, Wd_rc_scratch, 7);
-    // [4] SUB
-    emit_add_imm(buf, 0, 1, 0, 0, 1, Wd_rc_scratch, Wd_rc_scratch);
-    // [5] CBZ Wd_rc_scratch, +7 → [12] FCVTPS
-    emit_cbz(buf, 0, 0, Wd_rc_scratch, 7);
-    // [6] FCVTZS (rmode=3)  RC=3 truncate
-    emit_fcvt_fp_to_int(buf, is_64bit_int, 1, 3, Wd_int, Dd_val);
-    // [7] B +6 → done
-    emit_b(buf, 6);
-    // [8] FCVTNS (rmode=0)  RC=0 nearest
-    emit_fcvt_fp_to_int(buf, is_64bit_int, 1, 0, Wd_int, Dd_val);
-    // [9] B +4 → done
-    emit_b(buf, 4);
-    // [10] FCVTMS (rmode=2)  RC=1 floor
-    emit_fcvt_fp_to_int(buf, is_64bit_int, 1, 2, Wd_int, Dd_val);
-    // [11] B +2 → done
-    emit_b(buf, 2);
-    // [12] FCVTPS (rmode=1)  RC=2 ceil
-    emit_fcvt_fp_to_int(buf, is_64bit_int, 1, 1, Wd_int, Dd_val);
-    // [13] done
-}
-
-// ── Cached RC dispatch for FRndInt ─────────────────────────────────────────
-
-static void emit_frint_dispatch_cached(AssemblerBuffer& buf, int Dd, int Dn,
-                                        int Wd_rc_cached, int Wd_rc_scratch) {
-    emit_mov_reg(buf, 0, Wd_rc_scratch, Wd_rc_cached);
-    emit_cbz(buf, 0, 0, Wd_rc_scratch, 7);
-    emit_add_imm(buf, 0, 1, 0, 0, 1, Wd_rc_scratch, Wd_rc_scratch);
-    emit_cbz(buf, 0, 0, Wd_rc_scratch, 7);
-    emit_add_imm(buf, 0, 1, 0, 0, 1, Wd_rc_scratch, Wd_rc_scratch);
-    emit_cbz(buf, 0, 0, Wd_rc_scratch, 7);
-    // RC=3: FRINTZ (truncate) — fall-through
-    emit_fp_dp1(buf, 1, /*FRINTZ=*/11, Dd, Dn);
-    emit_b(buf, 6);
-    // RC=0: FRINTN (nearest)
-    emit_fp_dp1(buf, 1, /*FRINTN=*/8, Dd, Dn);
-    emit_b(buf, 4);
-    // RC=1: FRINTM (floor)
-    emit_fp_dp1(buf, 1, /*FRINTM=*/10, Dd, Dn);
-    emit_b(buf, 2);
-    // RC=2: FRINTP (ceil)
-    emit_fp_dp1(buf, 1, /*FRINTP=*/9, Dd, Dn);
-}
-
 // ── Rounding-mode dispatch for FISTP/FIST ──────────────────────────────────
 //
-// Emits the same 15-instruction CBZ/SUB chain as translate_fistp (or a single
-// FCVTNS under fast_round).  See TranslatorX87.cpp for the detailed layout.
+// Reads control_word, extracts RC, then emits the shared binary TBNZ dispatch
+// tree (or a single FCVTNS under fast_round).  Wd_rc is left holding the
+// extracted RC value (the tree is non-destructive).
 
 static void emit_rcmode_dispatch(AssemblerBuffer& buf, int Wd_int, int Dd_val,
                                   int is_64bit_int, int Xbase, int Wd_rc) {
@@ -182,36 +123,8 @@ static void emit_rcmode_dispatch(AssemblerBuffer& buf, int Wd_int, int Dd_val,
         emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=FCVTNS*/ 0,
                             Wd_int, Dd_val);
     } else {
-        // [0] LDRH Wd_rc, [Xbase, #0]  ; control_word
-        emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, /*imm12=*/0, Xbase, Wd_rc);
-        // [1] UBFX Wd_rc, Wd_rc, #10, #2
-        emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0, /*immr*/ 10, /*imms*/ 11,
-                      Wd_rc, Wd_rc);
-        // [2] CBZ Wd_rc, +7 → [9] FCVTNS
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-        // [3] SUB Wd_rc, Wd_rc, #1
-        emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
-        // [4] CBZ Wd_rc, +7 → [11] FCVTMS
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-        // [5] SUB Wd_rc, Wd_rc, #1
-        emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
-        // [6] CBZ Wd_rc, +7 → [13] FCVTPS
-        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
-        // [7] FCVTZS (rmode=3)  RC=3 truncate
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 3, Wd_int, Dd_val);
-        // [8] B +6 → done
-        emit_b(buf, 6);
-        // [9] FCVTNS (rmode=0)  RC=0 nearest
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 0, Wd_int, Dd_val);
-        // [10] B +4 → done
-        emit_b(buf, 4);
-        // [11] FCVTMS (rmode=2)  RC=1 floor
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 2, Wd_int, Dd_val);
-        // [12] B +2 → done
-        emit_b(buf, 2);
-        // [13] FCVTPS (rmode=1)  RC=2 ceil
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=*/ 1, Wd_int, Dd_val);
-        // [14] done
+        emit_rc_preamble(buf, Xbase, Wd_rc);
+        emit_x87_rc_dispatch_fcvt(buf, Wd_rc, Wd_int, Dd_val, is_64bit_int);
     }
 }
 
@@ -300,7 +213,7 @@ void lower(Context& ctx, TranslationResult* result) {
             int Wd_val = alloc_free_gpr(*result);
             emit_ldr_imm(buf, /*size=S32*/2, Wd_val, addr, 0);
             free_gpr(*result, addr);
-            // SXTW + SCVTF: sign-extend 32→64 then convert
+            // SCVTF W-form treats the 32-bit source as signed
             emit_scvtf(buf, /*is_64_int=*/0, /*ftype=f64*/1, Dd, Wd_val);
             free_gpr(*result, Wd_val);
             break;
@@ -442,30 +355,11 @@ void lower(Context& ctx, TranslationResult* result) {
                     emit_rc_preamble(buf, Xbase, Wd_rc_cached);
                     rc_cache_valid = true;
                 }
-                emit_frint_dispatch_cached(buf, Dd, Dn, Wd_rc_cached, Wd_tmp);
+                emit_x87_rc_dispatch_frint(buf, Wd_rc_cached, Dd, Dn);
             } else {
                 int Wd_rc = alloc_gpr(*result, 3);
-                // LDRH Wd_rc, [Xbase, #0]  — read control_word
-                emit_ldr_str_imm(buf, 1, 0, 1, 0, Xbase, Wd_rc);
-                // UBFX Wd_rc, Wd_rc, #10, #2  — extract RC
-                emit_bitfield(buf, 0, 2, 0, 10, 11, Wd_rc, Wd_rc);
-                // CBZ/SUB dispatch chain
-                emit_cbz(buf, 0, 0, Wd_rc, 7);                         // RC==0 → FRINTN
-                emit_add_imm(buf, 0, 1, 0, 0, 1, Wd_rc, Wd_rc);       // SUB 1
-                emit_cbz(buf, 0, 0, Wd_rc, 7);                         // RC==1 → FRINTM
-                emit_add_imm(buf, 0, 1, 0, 0, 1, Wd_rc, Wd_rc);       // SUB 1
-                emit_cbz(buf, 0, 0, Wd_rc, 7);                         // RC==2 → FRINTP
-                // RC=3: FRINTZ (truncate) — fall-through
-                emit_fp_dp1(buf, 1, /*FRINTZ=*/11, Dd, Dn);
-                emit_b(buf, 6);
-                // RC=0: FRINTN (nearest)
-                emit_fp_dp1(buf, 1, /*FRINTN=*/8, Dd, Dn);
-                emit_b(buf, 4);
-                // RC=1: FRINTM (floor)
-                emit_fp_dp1(buf, 1, /*FRINTM=*/10, Dd, Dn);
-                emit_b(buf, 2);
-                // RC=2: FRINTP (ceil)
-                emit_fp_dp1(buf, 1, /*FRINTP=*/9, Dd, Dn);
+                emit_rc_preamble(buf, Xbase, Wd_rc);
+                emit_x87_rc_dispatch_frint(buf, Wd_rc, Dd, Dn);
                 free_gpr(*result, Wd_rc);
             }
             break;
@@ -523,8 +417,8 @@ void lower(Context& ctx, TranslationResult* result) {
                     emit_rc_preamble(buf, Xbase, Wd_rc_cached);
                     rc_cache_valid = true;
                 }
-                emit_rcmode_dispatch_cached(buf, Wd_int, Dd_val, is_64bit_int,
-                                             Wd_rc_cached, Wd_tmp);
+                emit_x87_rc_dispatch_fcvt(buf, Wd_rc_cached, Wd_int, Dd_val,
+                                           is_64bit_int);
             } else {
                 // FISTP/FIST: respect rounding mode from control_word.
                 emit_rcmode_dispatch(buf, Wd_int, Dd_val, is_64bit_int, Xbase, Wd_tmp);
