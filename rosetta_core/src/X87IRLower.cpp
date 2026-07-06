@@ -150,7 +150,26 @@ static int plan_addr_cache(Context& ctx) {
     bool has_fstsw = false;
     for (int i = 0; i < ctx.num_nodes; i++) {
         const auto& n = ctx.nodes[i];
-        if (!(n.flags & kDead) && n.op == Op::FStsw) { has_fstsw = true; break; }
+        if (n.flags & kDead) continue;
+        if (n.op == Op::FStsw) has_fstsw = true;
+        // Any segment-override memory operand in the run disables the cache:
+        // the GS/TLS fallback path fixed-allocates pool slot 7 (x29) mid-run,
+        // which would assert if a cached base happens to hold it (and the FS/GS
+        // paths also allocate more transient GPRs than the pressure model
+        // attributes to a Load/Store node).
+        switch (n.op) {
+            case Op::LoadF64: case Op::LoadF32:
+            case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
+            case Op::StoreF64: case Op::StoreF32:
+            case Op::StoreI16: case Op::StoreI32: case Op::StoreI64:
+            case Op::StoreCW: case Op::LoadCW:
+                if (n.mem_operand->kind == IROperandKind::MemRef &&
+                    n.mem_operand->mem.seg_override != 0)
+                    return 0;
+                break;
+            default:
+                break;
+        }
     }
 
     struct { int16_t node; int count; } keys[6];
@@ -301,7 +320,10 @@ void lower(Context& ctx, TranslationResult* result) {
             if (is_rc && ++rc_count >= 2) { use_rc_cache = true; break; }
         }
         if (use_rc_cache)
-            Wd_rc_cached = alloc_gpr(*result, 3);
+            // alloc_free_gpr, NOT alloc_gpr(pool 3): the addr cache may
+            // already hold x25 (any scratch), and fixed-slot allocation
+            // asserts on collision. The RC dispatch works from any register.
+            Wd_rc_cached = alloc_free_gpr(*result);
     }
 
     // ── NZCV hoisting: one MRS/MSR pair around all FCmp/FTst in the run ─────
@@ -536,7 +558,8 @@ void lower(Context& ctx, TranslationResult* result) {
                 }
                 emit_x87_rc_dispatch_frint(buf, Wd_rc_cached, Dd, Dn);
             } else {
-                int Wd_rc = alloc_gpr(*result, 3);
+                // alloc_free_gpr, NOT alloc_gpr(pool 3) — see RC cache above.
+                int Wd_rc = alloc_free_gpr(*result);
                 emit_rc_preamble(buf, Xbase, Wd_rc);
                 emit_x87_rc_dispatch_frint(buf, Wd_rc, Dd, Dn);
                 free_gpr(*result, Wd_rc);

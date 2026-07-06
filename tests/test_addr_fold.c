@@ -116,6 +116,32 @@ static double fstsw_rax_base(const double *p, uint16_t *sw_out) {
     return out;
 }
 
+/* ==== addr cache + RC cache in one run (2 FISTPs → pool-slot GPR) ====
+ * Base+index addressing forces the cached base into an allocated scratch
+ * register (a plain 64-bit register base is used directly), reproducing
+ * the pool-slot collision seen with 32-bit game code. */
+static void addr_cache_with_rc_cache(const double *p, int32_t *i0, int32_t *i1) {
+    __asm__ volatile(
+        "fldl (%2,%3,8)\n\t"       /* 2.25 */
+        "faddl 8(%2,%3,8)\n\t"     /* 5.75 — two same-key accesses → addr cache */
+        "fldl 8(%2,%3,8)\n\t"      /* 3.5 on top */
+        "fistpl %0\n\t"            /* two non-truncating int stores → RC cache */
+        "fistpl %1\n"
+        : "=m"(*i0), "=m"(*i1) : "r"(p), "r"((long)0));
+}
+
+/* ==== addr cache + FRNDINT (per-node pool-slot GPR) in one run ==== */
+static double addr_cache_with_frndint(const double *p) {
+    double out;
+    __asm__ volatile(
+        "fldl (%1,%2,8)\n\t"
+        "faddl 8(%1,%2,8)\n\t"     /* two same-key accesses → addr cache */
+        "frndint\n\t"
+        "fstpl %0\n"
+        : "=m"(out) : "r"(p), "r"((long)0));
+    return out;
+}
+
 /* ==== many distinct bases: only 2 cached, rest fall back ==== */
 static double three_bases(const double *p, const double *q, const double *r) {
     double out;
@@ -178,6 +204,17 @@ int main(void) {
     {
         double a[2] = {1.0, 2.0}, b[2] = {4.0, 8.0}, c[2] = {16.0, 32.0};
         check("three bases", three_bases(a, b, c), 63.0);
+    }
+    {
+        double a[2] = {2.25, 3.5};
+        int32_t i0 = -1, i1 = -1;
+        addr_cache_with_rc_cache(a, &i0, &i1);
+        check("addr+rc cache: fistp #1", (double)i0, 4.0);   /* 3.5 → 4 nearest */
+        check("addr+rc cache: fistp #2", (double)i1, 6.0);   /* 5.75 → 6 */
+    }
+    {
+        double a[2] = {1.25, 2.5};
+        check("addr cache + frndint", addr_cache_with_frndint(a), 4.0);  /* 3.75 → 4 */
     }
 
     printf("\n%d failure(s)\n", failures);
