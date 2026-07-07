@@ -68,6 +68,7 @@ ALL_TESTS=(
     test_addr_fold
     test_const_promote
     test_f32_raw
+    test_fuse_fcom_test
 )
 
 RED='\033[0;31m'

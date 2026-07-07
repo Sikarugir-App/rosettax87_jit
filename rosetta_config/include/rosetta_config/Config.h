@@ -96,7 +96,8 @@ struct RosettaConfig {
     uint8_t  disable_x87_ir;         // ROSETTA_X87_DISABLE_IR=1 — disable IR optimization pipeline
     uint8_t  extended_fpr_scratch;   // ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 — expand FPR scratch pool from 8 (V24–V31) to 16 (V16–V31)
     uint8_t  disable_const_promote;  // ROSETTA_X87_DISABLE_CONST_PROMOTE=1 — don't promote loads from read-only absolute addresses to constants
-    uint8_t  _pad[2];
+    uint8_t  fuse_fcom_test;         // ROSETTA_X87_FUSE_FCOM_TEST=1 — fuse fcom+fnstsw+test into FCMP+CSET+TST (leaves AX/status-word CC stale; opt-in)
+    uint8_t  _pad[1];
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

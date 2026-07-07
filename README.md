@@ -54,6 +54,7 @@ All flags are set via environment variables and read at runtime.
 |----------|-------------|
 | `ROSETTA_X87_FAST_ROUND=1` | Skip rounding mode dispatch (faster but unsafe for FLDCW-heavy code) |
 | `ROSETTA_X87_EXTENDED_FPR_SCRATCH=1` | Expand FPR scratch register pool |
+| `ROSETTA_X87_FUSE_FCOM_TEST=1` | Fuse `fcom`+`fnstsw ax`+`test` into FCMP+CSET+TST (~3× faster compares; leaves AX and status-word CC bits stale after the fused pattern) |
 
 ### Debugging & Troubleshooting
 

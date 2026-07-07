@@ -79,6 +79,9 @@ enum NodeFlags : uint8_t {
     kFcomFused    = 1 << 1,    // FCOM+FSTSW fused: CC stays in register
     kTruncate     = 1 << 2,    // StoreI*: always truncate (FISTTP), skip RC dispatch
     kFcomIPopping = 1 << 3,    // FComI: pop ST(0) after compare (FCOMIP/FUCOMIP)
+    kTestFused    = 1 << 4,    // FCmp/FTst + FStsw: the guest TEST after the run
+                               // is consumed; lower to FCMP + CSET + TST (the
+                               // AArch64 cond lives in the FStsw node's imm_bits)
 };
 
 // ── IR node ─────────────────────────────────────────────────────────────────
@@ -263,7 +266,10 @@ void lower(Context& ctx, TranslationResult* result);
 
 // Main entry point: build + optimize + lower.
 // Returns the number of x87 instructions consumed (0 = IR couldn't handle any).
+// `tail_consumed` (optional out): number of additional non-x87 guest
+// instructions consumed past the run (the TEST of a fcom+fnstsw+test fusion).
+// The caller must skip these but must NOT tick the x87 run cache for them.
 int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_instrs,
-                int64_t start_idx, int run_length);
+                int64_t start_idx, int run_length, int* tail_consumed = nullptr);
 
 }  // namespace X87IR

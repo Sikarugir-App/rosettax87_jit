@@ -128,9 +128,13 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
         // lowering epilogue, so mid-run entry after a deferred FXCH or partial
         // per-instruction translation still gets IR lowering.
         if (!ir_disabled && cache.active() && cache.run_remaining >= kX87IRMinRun) {
-            const int ir_consumed = X87IR::compile_run(
-                translation_result, instr_array, num_instrs, insn_idx, cache.run_remaining);
+            int tail_consumed = 0;  // non-x87 instrs consumed past the run
+                                    // (the TEST of a fcom+fnstsw+test fusion)
+            const int ir_consumed =
+                X87IR::compile_run(translation_result, instr_array, num_instrs, insn_idx,
+                                   cache.run_remaining, &tail_consumed);
             if (ir_consumed > 0) {
+                // Tick only the x87 run; the consumed tail is not part of it.
                 for (int i = 0; i < ir_consumed; i++)
                     cache.tick();
                 if (cache.active()) {
@@ -141,7 +145,7 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                 translation_result->free_fpr_mask =
                     translation_result->_unoccupied_temporary_fprs_for_xmm_scalars;
                 translation_result->_pinned_temporary_scalars = 0;
-                return insn_idx + ir_consumed;
+                return insn_idx + ir_consumed + tail_consumed;
             }
         }
     }

@@ -910,6 +910,14 @@ void lower(Context& ctx, TranslationResult* result) {
 
         // ── Compare ─────────────────────────────────────────────────────
         case Op::FCmp: {
+            if (n.flags & kTestFused) {
+                // Fused with the guest TEST: just set NZCV; the paired FStsw
+                // emits CSET+TST. No save/restore (nzcv_dead by construction),
+                // no CC pack, no status-word write. Nothing emitted between
+                // here and the FStsw sets flags (loads/stores/arith/FCVT).
+                emit_fcmp_f64(buf, fprs.get(n.inputs[0]), fprs.get(n.inputs[1]));
+                break;
+            }
             int Wd_packed;
             if (nzcv_skip || nzcv_hoist) {
                 if (nzcv_hoist && Wd_nzcv_saved < 0) {
@@ -947,6 +955,10 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
         case Op::FTst: {
+            if (n.flags & kTestFused) {
+                emit_fcmp_zero_f64(buf, fprs.get(n.inputs[0]));
+                break;
+            }
             int Wd_packed;
             if (nzcv_skip || nzcv_hoist) {
                 if (nzcv_hoist && Wd_nzcv_saved < 0) {
@@ -1054,6 +1066,23 @@ void lower(Context& ctx, TranslationResult* result) {
         // ── FSTSW AX ───────────────────────────────────────────────────
         case Op::FStsw: {
             static constexpr int16_t kSwImm12 = kX87StatusWordOff / 2;  // = 1
+
+            if (n.flags & kTestFused) {
+                // Fused with the consumed guest TEST: reproduce its flag
+                // output from the FCMP's NZCV.  CSET Wt, <cond> computes
+                // "CC & mask != 0"; TST Wt, #1 then yields the x86 TEST
+                // flags exactly (Z per mask, N = C = V = 0).  Rosetta's
+                // following jcc/setcc reads them directly.  The status word
+                // and AX are intentionally not written (see the fusion's
+                // fidelity notes).
+                int Wt = alloc_free_gpr(*result);
+                emit_cset(buf, /*is_64bit=*/0, static_cast<int>(n.imm_bits & 0xF), Wt);
+                // TST Wt, #1  (ANDS WZR, Wt, #1)
+                emit_logical_imm(buf, /*is_64bit=*/0, /*ANDS=*/3, /*N=*/0,
+                                 /*immr=*/0, /*imms=*/0, Wt, GPR::XZR);
+                free_gpr(*result, Wt);
+                break;
+            }
 
             int Wd_sw;
             if (n.flags & kFcomFused) {
@@ -1403,7 +1432,9 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
         // below (adding it here would double-count it and spuriously bail
         // every fused single-compare run: 4 pinned + 4 + 1 = 9 > 8 pool).
         case Op::FCmp: case Op::FTst:
-            if (nzcv_skip) {
+            if (n.flags & kTestFused) {
+                transient = 0;  // bare FCMP, no pack, nothing held
+            } else if (nzcv_skip) {
                 transient = 3;  // Wd_packed + Wd_cc + Wd_vs, no save
             } else if (nzcv_hoist) {
                 transient = 3;
@@ -1421,11 +1452,12 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
         // FStsw: fused path holds Wd_packed (counted in held) + up to 2 more
         // Non-fused: up to 2 (Wd_sw + Wd_adj)
         case Op::FStsw:
-            // Fused: emit_fcom_cc_write_sw_keep allocates Wd_sw while
+            // Test-fused: just the CSET target GPR.
+            // FCom-fused: emit_fcom_cc_write_sw_keep allocates Wd_sw while
             // Wd_packed (held) is still live, then Wd_packed is freed and
             // Wd_sw + possibly Wd_adj coexist → peak 2 alongside held-1.
             // Non-fused: max(Wd_sw+Wd_adj) = 2
-            transient = 2;
+            transient = (n.flags & kTestFused) ? 1 : 2;
             if (n.flags & kFcomFused) {
                 // Wd_packed is released during this node
                 held--;
@@ -1590,10 +1622,184 @@ int peak_live_fprs(const Context& ctx) {
     return peak;
 }
 
+// ── fcom + fnstsw + test fusion ─────────────────────────────────────────────
+//
+// The dominant compare idiom is `fcomp; fnstsw ax; test ah, imm; jcc` — the
+// status word is materialized only so TEST can mask the CC bits and set ZF.
+// When the run ends in a kFcomFused FCmp/FTst + FStsw pair and the guest
+// instruction immediately after the run is that TEST, consume it and lower
+// the pair to FCMP + CSET + TST instead:
+//
+//   ZF = ((CC & mask) == 0)  becomes  CSET Wt, <cond>; TST Wt, #1
+//
+// where <cond> reads the FCMP's NZCV directly (CC bit semantics: C0 = lo|vs,
+// C2 = vs, C3 = eq|vs). The TST reproduces the x86 TEST's flag output
+// *exactly* for N/Z/C/V (N=0 since no CC mask reaches bit 7/15 of the result;
+// C=OF=0 per the x86 spec) — any NZCV-reading jcc/setcc that Rosetta
+// translates afterward sees correct flags. Only PF (parity of the masked
+// byte) is unrepresentable, so the scan below bails on parity consumers.
+//
+// Fidelity trades (why this is opt-in via ROSETTA_X87_FUSE_FCOM_TEST):
+//   - guest AX is NOT updated with the status word (dead in real code — the
+//     TEST is its only consumer),
+//   - status_word CC bits in X87State go stale (dead in real code — every
+//     FNSTSW is preceded by its own compare),
+//   - a parity read of this TEST's flags hidden behind a non-whitelisted
+//     instruction or an indirect control transfer would misbehave.
+// Only TEST fuses — AND writes AH, which multiway idioms re-read
+// (and ah, 0x45; cmp ah, 0x40; ...), and register liveness is not visible.
+
+// x86 register-operand encoding (verified against Rosetta's IR): high nibble
+// is the width class (0 = 8-bit low, 1 = 8-bit high, 2 = 16-bit), low nibble
+// the register index. AH = 0x10, AX = 0x20.
+static constexpr uint8_t kX86RegAH = 0x10;
+static constexpr uint8_t kX86RegAX = 0x20;
+
+// Walk the guest instructions after the consumed TEST and prove no parity
+// consumer can read its flags. jcc/setcc read (checked, don't write); the
+// full-EFLAGS definers and flag-neutral instructions mirror
+// nzcv_dead_after_run's whitelist; anything unknown bails conservatively.
+static bool no_parity_reader_after(IRInstr* instr_array, int64_t num_instrs,
+                                   int64_t idx) {
+    for (int64_t i = idx; i < num_instrs; i++) {
+        switch (instr_array[i].opcode()) {
+            case kOpcodeName_jcc:
+            case kOpcodeName_setcc: {
+                const auto& c = instr_array[i].operands[0];
+                if (c.kind != IROperandKind::ConditionCode) return false;
+                const int cc = c.cc.cc & 0xF;
+                if (cc == 10 || cc == 11) return false;  // p / np
+                continue;  // reads flags only; fallthrough successor follows
+            }
+            // PF definers: the TEST's parity dies here. (This scan only
+            // guards parity — N/Z/C/V from the fused TST are exact — so
+            // partial-EFLAGS definers like INC/DEC/NEG, which leave CF alone
+            // but define PF, terminate it too.)
+            case kOpcodeName_and:
+            case kOpcodeName_or:
+            case kOpcodeName_xor:
+            case kOpcodeName_test:
+            case kOpcodeName_cmp:
+            case kOpcodeName_add:
+            case kOpcodeName_sub:
+            case kOpcodeName_inc:
+            case kOpcodeName_dec:
+            case kOpcodeName_neg:
+                return true;
+            // Flag-neutral.
+            case kOpcodeName_mov:
+            case kOpcodeName_movzx:
+            case kOpcodeName_movsx:
+            case kOpcodeName_movsxd:
+            case kOpcodeName_lea:
+            case kOpcodeName_push:
+            case kOpcodeName_pop:
+            case kOpcodeName_nop:
+                continue;
+            default:
+                return false;
+        }
+    }
+    return true;  // block/function end: no compiler reads PF across it
+}
+
+// Try to fuse the TEST at instr_array[next_idx] into the run. On success,
+// marks the FCmp/FTst + FStsw nodes kTestFused (clearing kFcomFused so all
+// other paths treat them as plain nodes), stores the AArch64 condition in the
+// FStsw's imm_bits, and returns true — the caller consumes one extra guest
+// instruction.
+static bool try_fuse_fcom_test(Context& ctx, IRInstr* instr_array, int64_t num_instrs,
+                               int64_t next_idx) {
+    if (!(g_rosetta_config && g_rosetta_config->fuse_fcom_test)) return false;
+    if (next_idx >= num_instrs) return false;
+
+    // Locate the FStsw; require it to be the run's only status-word reader
+    // and the last NZCV-relevant node (a later FCMP would clobber the TST's
+    // flags before the run ends), and forbid NZCV users outright (FComI
+    // defines guest NZCV for FCMOV; the fused TST would destroy it).
+    int fstsw = -1;
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        switch (n.op) {
+            case Op::FComI:
+            case Op::FCSel:
+                return false;
+            case Op::FStsw:
+                if (fstsw >= 0) return false;
+                fstsw = i;
+                break;
+            case Op::FCmp:
+            case Op::FTst:
+                if (fstsw >= 0) return false;
+                break;
+            default:
+                break;
+        }
+    }
+    if (fstsw < 0) return false;
+    auto& sw = ctx.nodes[fstsw];
+    // kFcomFused guarantees a live paired FCmp/FTst with no CC clobber in
+    // between; AX (index 0) is the only destination the consumed TEST reads.
+    if (!(sw.flags & kFcomFused)) return false;
+    if (sw.inputs[1] != 0) return false;
+    const int16_t cmp = sw.inputs[0];
+    if (cmp < 0 || cmp >= ctx.num_nodes) return false;
+
+    // Match `test ah, imm8` or `test ax, imm16` immediately after the run.
+    IRInstr* t = &instr_array[next_idx];
+    if (t->opcode() != kOpcodeName_test) return false;
+    if (t->num_operands < 2) return false;
+    const auto& o0 = t->operands[0];
+    const auto& o1 = t->operands[1];
+    if (o0.kind != IROperandKind::Register) return false;
+    // The immediate operand's payload lives at the same offset in either
+    // immediate-like encoding; require a non-register, non-memory kind.
+    if (o1.kind == IROperandKind::Register || o1.kind == IROperandKind::MemRef ||
+        o1.kind == IROperandKind::AbsMem)
+        return false;
+    uint32_t mask;
+    if (o0.reg.size == IROperandSize::S8 && o0.reg.reg.value == kX86RegAH) {
+        mask = (static_cast<uint32_t>(o1.imm.value) & 0xFF) << 8;
+    } else if (o0.reg.size == IROperandSize::S16 && o0.reg.reg.value == kX86RegAX) {
+        mask = static_cast<uint32_t>(o1.imm.value) & 0xFFFF;
+    } else {
+        return false;
+    }
+
+    // Map the CC mask to one AArch64 condition on the FCMP's NZCV.
+    // C0 (0x0100) = lo|vs, C2 (0x0400) = vs, C3 (0x4000) = eq|vs.
+    int cond;
+    switch (mask) {
+        case 0x0100:            // C0        → less | unordered
+        case 0x0500:            // C0|C2     → less | unordered
+            cond = 11;          // LT
+            break;
+        case 0x4100:            // C0|C3     → ≤ | unordered
+        case 0x4500:            // C0|C2|C3  → ≤ | unordered  (= !greater)
+            cond = 13;          // LE
+            break;
+        case 0x0400:            // C2        → unordered
+            cond = 6;           // VS
+            break;
+        default:                // C3-without-C0 masks need Z|V (two conds),
+            return false;       // anything else isn't a CC-bits test — bail
+    }
+
+    if (!no_parity_reader_after(instr_array, num_instrs, next_idx + 1))
+        return false;
+
+    ctx.nodes[cmp].flags = static_cast<uint8_t>(
+        (ctx.nodes[cmp].flags & ~kFcomFused) | kTestFused);
+    sw.flags = static_cast<uint8_t>((sw.flags & ~kFcomFused) | kTestFused);
+    sw.imm_bits = static_cast<uint64_t>(cond);
+    return true;
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_instrs,
-                int64_t start_idx, int run_length) {
+                int64_t start_idx, int run_length, int* tail_consumed) {
     Context ctx;
 
 
@@ -1615,9 +1821,17 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
 
     optimize(ctx);
 
+    // fcom+fnstsw+test fusion: consume the guest TEST after the run and lower
+    // the compare to FCMP + CSET + TST (see try_fuse_fcom_test).
+    const bool test_fused =
+        try_fuse_fcom_test(ctx, instr_array, num_instrs, start_idx + ctx.consumed);
+    if (tail_consumed) *tail_consumed = test_fused ? 1 : 0;
+
     // Guest-flags deadness: scan the guest instructions after the consumed
     // run; if they fully redefine EFLAGS before any possible reader, the
     // FCmp/FTst NZCV save/restore is elided in lowering.
+    // With the test fusion this is true by construction — the scan starts at
+    // the consumed TEST (a full definer), whose role our emitted TST takes.
     ctx.nzcv_dead = nzcv_dead_after_run(instr_array, num_instrs,
                                         start_idx + ctx.consumed) ? 1 : 0;
 
