@@ -302,9 +302,31 @@ void lower(Context& ctx, TranslationResult* result) {
     const int entry_push_count = result->x87_cache.deferred_push_count;
     const int entry_pop_count = result->x87_cache.deferred_pop_count;
 
-    // ── FPR assignment ──────────────────────────────────────────────────────
-    FPRState fprs;
-    fprs.compute_last_uses(ctx);
+    // ── TOP=0 specialization gate ───────────────────────────────────────────
+    // In real code TOP is almost always 0 at run entry (balanced stack
+    // discipline). When enough stack-slot traffic would become static, the
+    // run is emitted twice behind a CBNZ guard: a specialized body where
+    // every ST(i) physical index, tag mask and TOP value is a translate-time
+    // constant (wrap included), and the generic body as fallback.
+    int top0_benefit = 0;
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        // ReadSt at depth > 0: ADD+AND+LDR → LDR imm.
+        if (n.op == Op::ReadSt && n.initial_depth > 0) top0_benefit += 2;
+    }
+    for (int d = 1; d < 8; d++) {
+        // Epilogue store at depth > 0: ADD+AND+STR → STR imm.
+        int16_t val = ctx.slot_val[d];
+        if (val < 0 || val >= ctx.num_nodes) continue;
+        if (ctx.nodes[val].op == Op::ReadSt &&
+            ctx.nodes[val].initial_depth == d + ctx.top_delta)
+            continue;  // epilogue skips this store anyway
+        top0_benefit += 2;
+    }
+    // TOP update becomes MOVZ, tag batch masks become constants.
+    if (ctx.top_delta != 0) top0_benefit += 3;
+    const bool top0_specialize = top0_benefit >= 4;
 
     // ── Base-address cache: materialize planned guest bases ────────────────
     const int addr_n = ctx.addr_cache_n;
@@ -355,7 +377,6 @@ void lower(Context& ctx, TranslationResult* result) {
     // pressure model anyway, and reordering two non-overlapping adjacent
     // accesses is safe. Returns the cached-base index for a pairable operand
     // (LDP/STP range: disp % 8 == 0, disp/8 ∈ [-64, 63]) or -1.
-    bool pair_done[kMaxNodes] = {};
     auto pairable_key = [&](const Node& n) -> int {
         for (int k = 0; k < addr_n; k++) {
             if (!addr_base_key_equal(n.mem_operand, addr_rep[k])) continue;
@@ -381,7 +402,6 @@ void lower(Context& ctx, TranslationResult* result) {
 
     // ── RC caching: hoist LDRH+UBFX when ≥2 RC consumers in a segment ────
     int Wd_rc_cached = -1;
-    bool rc_cache_valid = false;
 
     if (!(g_rosetta_config && g_rosetta_config->fast_round)) {
         int rc_count = 0;
@@ -429,7 +449,19 @@ void lower(Context& ctx, TranslationResult* result) {
         nzcv_skip = ctx.nzcv_dead && !has_nzcv_user && cmp_count >= 1;
         nzcv_hoist = !nzcv_skip && !has_nzcv_user && cmp_count >= 2;
     }
+
+    // ── Run body (node loop + x87-state epilogue) ───────────────────────────
+    // Emitted once normally, or twice when TOP=0 specialization is active:
+    // top_known = 0 makes every stack-slot physical index / tag mask / TOP
+    // value a translate-time constant; top_known = -1 is the generic body.
+    auto emit_body = [&](int top_known) {
+    FPRState fprs;
+    fprs.compute_last_uses(ctx);
+    bool pair_done[kMaxNodes] = {};
+    bool rc_cache_valid = false;
     int Wd_nzcv_saved = -1;
+    const int final_top_known =
+        (top_known >= 0) ? ((top_known + ctx.top_delta) & 7) : -1;
 
     // ── Emit each IR node ───────────────────────────────────────────────────
     for (int i = 0; i < ctx.num_nodes; i++) {
@@ -448,7 +480,14 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::ReadSt: {
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_load_st(buf, Xbase, Wd_top, n.initial_depth, Wd_tmp, Dd, Xst_base);
+            if (top_known >= 0) {
+                // Static physical slot: LDR Dd, [Xbase, #st_off].
+                const int phys = (top_known + n.initial_depth) & 7;
+                emit_fldr_imm(buf, 3, Dd, Xbase,
+                              static_cast<int16_t>((kX87RegFileOff >> 3) + phys));
+            } else {
+                emit_load_st(buf, Xbase, Wd_top, n.initial_depth, Wd_tmp, Dd, Xst_base);
+            }
             break;
         }
         case Op::LoadF64: {
@@ -925,21 +964,36 @@ void lower(Context& ctx, TranslationResult* result) {
                 // in-memory TOP was already stale on entry (carried top_dirty).
                 int16_t td = n.inputs[2];  // top_delta snapshot
                 if (td != 0) {
-                    int Wd_adj = alloc_free_gpr(*result);
-                    if (td < 0)
-                        emit_add_imm(buf, 0, /*is_sub=*/1, 0, 0, -td, Wd_top, Wd_adj);
-                    else
-                        emit_add_imm(buf, 0, /*is_sub=*/0, 0, 0, td, Wd_top, Wd_adj);
-                    emit_and_imm(buf, 0, Wd_adj, 0, 0, 2, Wd_adj);
-                    // BFI Wd_sw, Wd_adj, #11, #3 — patch TOP field
-                    emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
-                                  Wd_adj, Wd_sw);
-                    free_gpr(*result, Wd_adj);
+                    if (top_known >= 0) {
+                        const int k = (top_known + td) & 7;
+                        int Wd_adj = alloc_free_gpr(*result);
+                        emit_movn(buf, 0, /*MOVZ*/2, 0, (uint16_t)k, Wd_adj);
+                        emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
+                                      Wd_adj, Wd_sw);
+                        free_gpr(*result, Wd_adj);
+                    } else {
+                        int Wd_adj = alloc_free_gpr(*result);
+                        if (td < 0)
+                            emit_add_imm(buf, 0, /*is_sub=*/1, 0, 0, -td, Wd_top, Wd_adj);
+                        else
+                            emit_add_imm(buf, 0, /*is_sub=*/0, 0, 0, td, Wd_top, Wd_adj);
+                        emit_and_imm(buf, 0, Wd_adj, 0, 0, 2, Wd_adj);
+                        // BFI Wd_sw, Wd_adj, #11, #3 — patch TOP field
+                        emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
+                                      Wd_adj, Wd_sw);
+                        free_gpr(*result, Wd_adj);
+                    }
                 } else if (entry_top_dirty) {
                     // BFI Wd_sw, Wd_top, #11, #3 — memory TOP is stale;
-                    // Wd_top already holds the correct masked value.
-                    emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
-                                  Wd_top, Wd_sw);
+                    // Wd_top already holds the correct masked value (which is
+                    // the guard constant in the specialized body, so BFI from
+                    // XZR clears the field when top_known == 0).
+                    if (top_known == 0)
+                        emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
+                                      GPR::XZR, Wd_sw);
+                    else
+                        emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
+                                      Wd_top, Wd_sw);
                 }
 
                 // BFI W_ax, Wd_sw, #0, #16 — write status_word into x86 AX
@@ -961,12 +1015,17 @@ void lower(Context& ctx, TranslationResult* result) {
 
     // 1. Update TOP register.
     if (ctx.top_delta != 0) {
-        if (ctx.top_delta < 0) {
-            emit_add_imm(buf, 0, /*is_sub=*/1, 0, 0, -ctx.top_delta, Wd_top, Wd_top);
+        if (top_known >= 0) {
+            // Final TOP is a translate-time constant.
+            emit_movn(buf, 0, /*MOVZ*/2, 0, (uint16_t)final_top_known, Wd_top);
         } else {
-            emit_add_imm(buf, 0, /*is_sub=*/0, 0, 0, ctx.top_delta, Wd_top, Wd_top);
+            if (ctx.top_delta < 0) {
+                emit_add_imm(buf, 0, /*is_sub=*/1, 0, 0, -ctx.top_delta, Wd_top, Wd_top);
+            } else {
+                emit_add_imm(buf, 0, /*is_sub=*/0, 0, 0, ctx.top_delta, Wd_top, Wd_top);
+            }
+            emit_and_imm(buf, 0, Wd_top, 0, 0, 2, Wd_top);
         }
-        emit_and_imm(buf, 0, Wd_top, 0, 0, 2, Wd_top);
     }
 
     // 2. Store modified stack values.
@@ -982,7 +1041,13 @@ void lower(Context& ctx, TranslationResult* result) {
             continue;
         int Dd = fprs.get(val);
         if (Dd < 0) continue;   // dead or already freed
-        emit_store_st(buf, Xbase, Wd_top, d, Wd_tmp, Dd, Xst_base);
+        if (top_known >= 0) {
+            const int phys = (final_top_known + d) & 7;
+            emit_fstr_imm(buf, 3, Dd, Xbase,
+                          static_cast<int16_t>((kX87RegFileOff >> 3) + phys));
+        } else {
+            emit_store_st(buf, Xbase, Wd_top, d, Wd_tmp, Dd, Xst_base);
+        }
     }
 
     // 3. Write TOP to status_word if changed, or if it was already stale on
@@ -1005,12 +1070,37 @@ void lower(Context& ctx, TranslationResult* result) {
         if (set_valid > 0 || set_empty > 0) {
             int Wd_tmp2 = alloc_free_gpr(*result);
             int Wd_tagw = alloc_free_gpr(*result);
-            if (set_empty > 0)
-                emit_x87_tag_set_empty_batch(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2,
-                                              Wd_tagw, set_empty);
-            if (set_valid > 0)
-                emit_x87_tag_set_valid_batch(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2,
-                                              Wd_tagw, set_valid);
+            if (top_known >= 0) {
+                // Static slot positions → constant tag masks (wrap folded at
+                // translate time): LDRH / MOVZ+ORR / MOVZ+BIC / STRH.
+                emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1,
+                                 kX87TagWordImm12, Xbase, Wd_tagw);
+                if (set_empty > 0) {
+                    uint16_t mask = 0;
+                    for (int k = 1; k <= set_empty; k++)
+                        mask |= (uint16_t)(0x3u << (((final_top_known - k) & 7) * 2));
+                    emit_movn(buf, 0, /*MOVZ*/2, 0, mask, Wd_tmp2);
+                    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, 0, Wd_tmp2, 0,
+                                             Wd_tagw, Wd_tagw);
+                }
+                if (set_valid > 0) {
+                    uint16_t mask = 0;
+                    for (int k = 0; k < set_valid; k++)
+                        mask |= (uint16_t)(0x3u << (((final_top_known + k) & 7) * 2));
+                    emit_movn(buf, 0, /*MOVZ*/2, 0, mask, Wd_tmp2);
+                    emit_logical_shifted_reg(buf, 0, /*AND*/0, /*N=BIC*/1, 0, Wd_tmp2,
+                                             0, Wd_tagw, Wd_tagw);
+                }
+                emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0,
+                                 kX87TagWordImm12, Xbase, Wd_tagw);
+            } else {
+                if (set_empty > 0)
+                    emit_x87_tag_set_empty_batch(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2,
+                                                  Wd_tagw, set_empty);
+                if (set_valid > 0)
+                    emit_x87_tag_set_valid_batch(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2,
+                                                  Wd_tagw, set_valid);
+            }
             free_gpr(*result, Wd_tagw);
             free_gpr(*result, Wd_tmp2);
         }
@@ -1022,6 +1112,34 @@ void lower(Context& ctx, TranslationResult* result) {
             free_fpr(*result, fprs.node_fpr[i]);
             fprs.node_fpr[i] = -1;
         }
+    }
+    };  // emit_body
+
+    // ── Emit the run: specialized (TOP==0) + generic behind a guard, or just
+    //    the generic body. Branch offsets are patched after emission (the
+    //    buffer may grow/move, so patch through buf.data at patch time).
+    if (!top0_specialize) {
+        emit_body(-1);
+    } else {
+        const uint32_t saved_gpr_mask = result->free_gpr_mask;
+        const uint32_t saved_fpr_mask = result->free_fpr_mask;
+
+        const uint64_t guard_off = buf.end;
+        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/1, Wd_top, /*imm19=*/0);  // CBNZ → generic
+        emit_body(/*top_known=*/0);
+        const uint64_t skip_off = buf.end;
+        emit_b(buf, 0);                                                   // B → done
+        // Patch the CBNZ to land on the generic body.
+        buf.data[guard_off / 4] |=
+            (((uint32_t)((buf.end - guard_off) / 4) & 0x7FFFF) << 5);
+
+        // The specialized body is balanced, but restore allocation state
+        // explicitly so the generic body starts from the identical pool.
+        result->free_gpr_mask = saved_gpr_mask;
+        result->free_fpr_mask = saved_fpr_mask;
+        emit_body(/*top_known=*/-1);
+        // Patch the skip branch to land after the generic body.
+        buf.data[skip_off / 4] |= ((uint32_t)((buf.end - skip_off) / 4) & 0x3FFFFFF);
     }
 
     // 6. Clean up cache deferred state (we handled everything inline).
