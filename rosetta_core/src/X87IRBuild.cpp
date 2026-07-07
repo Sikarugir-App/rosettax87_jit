@@ -1,10 +1,81 @@
 #include "rosetta_core/X87IR.h"
 
+#include <cstring>
+
 #include "rosetta_core/IRInstr.h"
 #include "rosetta_core/IROperand.h"
 #include "rosetta_core/Opcode.h"
 
+#if defined(ROSETTA_RUNTIME)
+// clang-format off
+#include "rosetta_core/RuntimeLibC.h"
+// clang-format on
+#endif
+
 namespace X87IR {
+
+// ── Constant-load promotion ─────────────────────────────────────────────────
+//
+// 32-bit guests reference FP literals through absolute addresses
+// (fld [0x4A5B60]). When such an address lies in a read-only mapping, its
+// value cannot change at runtime, so the load can be promoted to a ConstF64
+// node at translation time: no runtime load, constants participate in dedup /
+// FDiv-reciprocal / FMOV-imm8 lowering. Only sound in JIT mode (the guest
+// address space is this process's address space); the caller gates on that.
+
+// Absolute-address operands: AbsMem, or MemRef with neither base nor index.
+static bool const_promote_addr(const IROperand* op, uint64_t* addr_out) {
+    if (op->kind == IROperandKind::AbsMem) {
+        uint64_t a = static_cast<uint64_t>(op->abs_mem.value);
+        if (op->abs_mem.addr_size == IROperandSize::S32) a &= 0xFFFFFFFFu;
+        *addr_out = a;
+        return a != 0;
+    }
+    if (op->kind == IROperandKind::MemRef && op->mem.seg_override == 0 &&
+        (op->mem.mem_flags & 3) == 0) {
+        uint64_t a = static_cast<uint64_t>(op->mem.disp);
+        if (op->mem.addr_size == IROperandSize::S32) a &= 0xFFFFFFFFu;
+        *addr_out = a;
+        return a != 0;
+    }
+    return false;
+}
+
+#if defined(ROSETTA_RUNTIME)
+// True if [addr, addr+bytes) lies in a mapped, readable, non-writable region.
+// Queried via proc_info(PROC_PIDREGIONINFO); the last positive region is
+// cached (translation is single-threaded).
+static bool range_is_readonly(uint64_t addr, uint64_t bytes) {
+    static uint64_t cached_lo = 1, cached_hi = 0;  // empty range
+    if (addr >= cached_lo && addr + bytes <= cached_hi) return true;
+
+    struct {
+        uint32_t protection, max_protection, inheritance, flags;
+        uint64_t offset;
+        uint32_t behavior, user_wired_count, user_tag, pages_resident,
+                 pages_shared_now_private, pages_swapped_out, pages_dirtied,
+                 ref_count, shadow_depth, share_mode, private_pages_resident,
+                 shared_pages_resident, obj_id, depth;
+        uint64_t address, size;
+    } ri;
+    static_assert(sizeof(ri) == 96, "proc_regioninfo layout");
+
+    const int n = rt_proc_pidinfo(rt_getpid(), /*PROC_PIDREGIONINFO*/ 7, addr, &ri,
+                                  (int)sizeof(ri));
+    if (n < (int)sizeof(ri)) return false;
+    // The kernel returns the region containing addr — or the next one if
+    // addr is unmapped — so containment must be checked explicitly.
+    if (addr < ri.address || addr + bytes > ri.address + ri.size) return false;
+    if ((ri.protection & 0x2 /*VM_PROT_WRITE*/) != 0) return false;
+    if ((ri.protection & 0x1 /*VM_PROT_READ*/) == 0) return false;
+    cached_lo = ri.address;
+    cached_hi = ri.address + ri.size;
+    return true;
+}
+#else
+// Non-runtime builds (aotinvoke) don't translate a live guest address space.
+static bool range_is_readonly(uint64_t, uint64_t) { return false; }
+#endif
 
 // ── Memory CSE ──────────────────────────────────────────────────────────────
 
@@ -55,6 +126,43 @@ static void mem_cse_insert(Context& ctx, IROperand* op, Op kind, int16_t val) {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+static int16_t build_const(Context& ctx, uint64_t bits);
+
+// Promote an fp load from a read-only absolute address to a constant node.
+// Returns the node ID, or -1 if not promotable.
+static int16_t try_const_promote(Context& ctx, const IROperand* op, Op load_op) {
+    if (!ctx.const_promote) return -1;
+    uint64_t addr;
+    if (!const_promote_addr(op, &addr)) return -1;
+    const uint64_t width = (load_op == Op::LoadF32) ? 4 : 8;
+    if (!range_is_readonly(addr, width)) return -1;
+
+    uint64_t bits;
+    if (load_op == Op::LoadF32) {
+        float f;
+        memcpy(&f, reinterpret_cast<const void*>(addr), 4);
+        const double d = static_cast<double>(f);  // exact widening
+        memcpy(&bits, &d, 8);
+    } else {
+        memcpy(&bits, reinterpret_cast<const void*>(addr), 8);
+    }
+
+    // +0.0 / +1.0 get the cheaper MOVI / FMOV-one nodes (and their dedup).
+    if (bits == 0) {
+        if (ctx.const_zero_node >= 0) return ctx.const_zero_node;
+        auto id = ctx.add_node(Op::ConstZero);
+        if (id >= 0) ctx.const_zero_node = id;
+        return id;
+    }
+    if (bits == 0x3FF0000000000000ULL) {
+        if (ctx.const_one_node >= 0) return ctx.const_one_node;
+        auto id = ctx.add_node(Op::ConstOne);
+        if (id >= 0) ctx.const_one_node = id;
+        return id;
+    }
+    return build_const(ctx, bits);
+}
+
 // Build a memory load node. Returns node ID or -1 on bail (e.g. m80).
 // Identical operands within the run reuse the prior load's value (CSE).
 static int16_t build_fp_load(Context& ctx, IROperand* op) {
@@ -64,6 +172,8 @@ static int16_t build_fp_load(Context& ctx, IROperand* op) {
         case IROperandSize::S64: load_op = Op::LoadF64; break;
         default: return -1;  // m80 → bail
     }
+    auto promoted = try_const_promote(ctx, op, load_op);
+    if (promoted >= 0) return promoted;
     auto hit = mem_cse_lookup(ctx, op, load_op);
     if (hit >= 0) return hit;
     auto id = ctx.add_node(load_op);
@@ -283,8 +393,9 @@ static bool build_fcmov(Context& ctx, IRInstr* instr, int aarch64_cond) {
 // ── Main build loop ─────────────────────────────────────────────────────────
 
 bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start_idx,
-           int run_length, const int8_t* perm) {
+           int run_length, const int8_t* perm, bool const_promote) {
     ctx.init();
+    ctx.const_promote = const_promote ? 1 : 0;
 
     // Fold a carried-in deferred-FXCH permutation: logical depth d initially
     // lives at physical depth perm[d].  Swapped slots are force-resolved so

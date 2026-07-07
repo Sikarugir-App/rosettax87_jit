@@ -129,6 +129,9 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_EXTENDED_FPR_SCRATCH"))
         cfg.extended_fpr_scratch = (*v == '1') ? 1 : 0;
 
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_CONST_PROMOTE"))
+        cfg.disable_const_promote = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')
             cfg.disabled_ops_mask = ~0ULL;

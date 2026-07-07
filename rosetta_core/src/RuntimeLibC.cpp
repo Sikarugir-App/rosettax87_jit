@@ -392,6 +392,20 @@ rt_kern_return_t rt_vm_protect(rt_mach_port_t task, rt_vm_address_t addr, rt_vm_
     return (rt_kern_return_t)_mach_trap(-14, task, addr, size, set_max, prot);
 }
 
+// getpid = BSD syscall 20
+int rt_getpid(void) {
+    return (int)_syscall3(20, 0, 0, 0);
+}
+
+// proc_info = BSD syscall 336
+// proc_info(callnum, pid, flavor, arg, buffer, buffersize)
+// callnum 2 = PROC_INFO_CALL_PIDINFO. Returns bytes written or -1.
+int rt_proc_pidinfo(int pid, unsigned int flavor, unsigned long long arg, void* buffer,
+                    int buffersize) {
+    return (int)_syscall6(336, /*PROC_INFO_CALL_PIDINFO*/ 2, pid, (long)flavor, (long)arg,
+                          (long)buffer, buffersize);
+}
+
 // ── Cache / JIT ───────────────────────────────────────────────────────────────
 
 void rt_sys_dcache_flush(void* addr, size_t len) {

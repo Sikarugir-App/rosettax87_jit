@@ -45,6 +45,13 @@ rt_mach_port_t rt_mach_task_self(void);
 rt_kern_return_t rt_vm_protect(rt_mach_port_t task, rt_vm_address_t addr, rt_vm_size_t size,
                                int set_max, rt_vm_prot_t prot);
 
+// Process info
+int rt_getpid(void);
+// proc_info(PROC_INFO_CALL_PIDINFO, pid, flavor, arg, buffer, buffersize).
+// Returns bytes written, or negative errno.
+int rt_proc_pidinfo(int pid, unsigned int flavor, unsigned long long arg, void* buffer,
+                    int buffersize);
+
 // Cache / JIT
 void rt_sys_dcache_flush(void* addr, size_t len);
 void rt_sys_icache_invalidate(void* addr, size_t len);

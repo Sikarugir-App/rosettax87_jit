@@ -200,6 +200,13 @@ auto emit_fmov_d_one(AssemblerBuffer& buf, int Dd) -> void;
 // No GPR intermediate needed.
 auto emit_ldr_literal_f64(AssemblerBuffer& buf, int Dd, uint64_t constant) -> void;
 
+// True if `bits` is representable as an FMOV (scalar, immediate) f64 imm8
+// (±[1.0, 31.0/16] × 2^[-3,4] family); fills *imm8_out on success.
+bool f64_fmov_imm8(uint64_t bits, uint8_t* imm8_out);
+
+// FMOV Dd, #imm8 — single instruction, no GPR, no literal pool.
+auto emit_fmov_d_imm8(AssemblerBuffer& buf, int Dd, uint8_t imm8) -> void;
+
 // CSET Wd, cond — set Wd to 1 if condition holds, else 0
 // Encodes as CSINC Rd, XZR, XZR, invert(cond)
 // AArch64 cond codes: EQ=0 NE=1 CS=2 CC=3 MI=4 PL=5 VS=6 VC=7

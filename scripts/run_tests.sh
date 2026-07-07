@@ -66,6 +66,7 @@ ALL_TESTS=(
     test_mem_cse
     test_ir_algebra
     test_addr_fold
+    test_const_promote
 )
 
 RED='\033[0;31m'

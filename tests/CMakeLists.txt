@@ -10,6 +10,21 @@ function(add_x86_sample name)
   add_custom_target(${name}_x86_64 ALL DEPENDS "${output}")
 endfunction()
 
+
+# Variant with a shrunken __PAGEZERO so the test can mmap fixed pages below
+# 2 GB (needed to exercise absolute-address ([disp32]) x87 operands).
+function(add_x86_sample_lowzero name)
+  set(output "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${name}")
+  add_custom_command(
+    OUTPUT "${output}"
+    COMMAND /bin/zsh -lc "mkdir -p ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} && /usr/bin/clang -arch x86_64 -O0 -g -Wl,-pagezero_size,0x4000 -o ${output} ${CMAKE_CURRENT_SOURCE_DIR}/${name}.c"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${name}.c"
+    COMMENT "Building x86_64 ${name} with clang (low pagezero)"
+    VERBATIM
+  )
+  add_custom_target(${name}_x86_64 ALL DEPENDS "${output}")
+endfunction()
+
 add_x86_sample(test_fldconst)
 add_x86_sample(test_fld)
 add_x86_sample(test_fld_m80fp)
@@ -53,3 +68,4 @@ add_x86_sample(test_ir_deferred)
 add_x86_sample(test_mem_cse)
 add_x86_sample(test_ir_algebra)
 add_x86_sample(test_addr_fold)
+add_x86_sample_lowzero(test_const_promote)

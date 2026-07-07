@@ -31,6 +31,64 @@ static void pass_dead_compares(Context& ctx) {
     }
 }
 
+// ── Pass 0.5: Constant arithmetic ───────────────────────────────────────────
+//
+// With constant-load promotion, FP literals surface as Const* nodes:
+//   FDiv(x, ConstF64 = ±2^k) → FMul(x, ±2^-k)  — exact (reciprocal of a
+//     normal power of two is a normal power of two); FDIV is ~3-4× the
+//     latency of FMUL. Requires a single-use divisor (bits are rewritten
+//     in place).
+//   FCmp(x, ±0.0 const) → FTst(x)  — FCMP #0.0 compares -0 == +0, matching
+//     FCOM semantics; drops the constant materialization.
+// Runs before pass_dse so orphaned constants are reaped.
+
+static void pass_const_arith(Context& ctx) {
+    int16_t use_count[kMaxNodes] = {};
+    for (int d = 0; d < 8; d++) {
+        if (ctx.slot_val[d] >= 0 && ctx.slot_val[d] < ctx.num_nodes)
+            use_count[ctx.slot_val[d]]++;
+    }
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        for (int j = 0; j < 3; j++) {
+            if (n.inputs[j] >= 0) use_count[n.inputs[j]]++;
+        }
+    }
+
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+
+        if (n.op == Op::FDiv) {
+            int16_t c = n.inputs[1];
+            if (c < 0 || c >= ctx.num_nodes) continue;
+            auto& cn = ctx.nodes[c];
+            if (cn.op != Op::ConstF64 || (cn.flags & kDead) || use_count[c] != 1)
+                continue;
+            const uint64_t b = cn.imm_bits;
+            const uint64_t exp = (b >> 52) & 0x7FF;
+            // ±2^k with both value and reciprocal normal.
+            if ((b & 0x000FFFFFFFFFFFFFULL) == 0 && exp >= 1 && exp <= 2045) {
+                cn.imm_bits = (b & 0x8000000000000000ULL) | ((2046 - exp) << 52);
+                n.op = Op::FMul;
+            }
+        } else if (n.op == Op::FCmp) {
+            int16_t c = n.inputs[1];
+            if (c < 0 || c >= ctx.num_nodes) continue;
+            auto& cn = ctx.nodes[c];
+            if (cn.flags & kDead) continue;
+            const bool is_zero = cn.op == Op::ConstZero ||
+                                 (cn.op == Op::ConstF64 && (cn.imm_bits << 1) == 0);
+            if (!is_zero) continue;
+            n.op = Op::FTst;
+            n.inputs[1] = -1;
+            if (--use_count[c] == 0)
+                cn.flags |= kDead;
+        }
+    }
+}
+
 // ── Pass 1: Dead Store Elimination ──────────────────────────────────────────
 //
 // Walk backward. A value node is dead if it has no live consumers (no other
@@ -289,6 +347,7 @@ static void pass_fcom_fstsw_fusion(Context& ctx) {
 
 void optimize(Context& ctx) {
     pass_dead_compares(ctx);
+    pass_const_arith(ctx);
     pass_dse(ctx);
     pass_fneg_fold(ctx);
     pass_fma(ctx);

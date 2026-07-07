@@ -10,6 +10,19 @@ function(add_x86_benchmark name)
   add_custom_target(${name}_x86_64 ALL DEPENDS "${output}")
 endfunction()
 
+
+function(add_x86_benchmark_lowzero name)
+  set(output "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${name}")
+  add_custom_command(
+    OUTPUT "${output}"
+    COMMAND /bin/zsh -lc "mkdir -p ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} && /usr/bin/clang -arch x86_64 -O2 -Wl,-pagezero_size,0x4000 -o ${output} ${CMAKE_CURRENT_SOURCE_DIR}/${name}.c"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${name}.c"
+    COMMENT "Building x86_64 ${name} with clang -O2 (low pagezero)"
+    VERBATIM
+  )
+  add_custom_target(${name}_x86_64 ALL DEPENDS "${output}")
+endfunction()
+
 add_x86_benchmark(bench_constants)
 add_x86_benchmark(bench_load)
 add_x86_benchmark(bench_add)
@@ -39,4 +52,5 @@ add_x86_benchmark(bench_tag_batch)
 add_x86_benchmark(bench_fistp_multi)
 add_x86_benchmark(bench_mem_cse)
 add_x86_benchmark(bench_addr_fold)
+add_x86_benchmark_lowzero(bench_const_promote)
 add_subdirectory(macro)

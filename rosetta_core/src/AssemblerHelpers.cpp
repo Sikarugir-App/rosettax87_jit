@@ -549,6 +549,24 @@ auto emit_fmov_d_one(AssemblerBuffer& buf, int Dd) -> void {
     buf.emit(0x1E6E1000u | (uint32_t)(Dd & 0x1F));
 }
 
+bool f64_fmov_imm8(uint64_t bits, uint8_t* imm8_out) {
+    // FMOV (scalar, immediate) f64 expansion of imm8 = S:b6:b5..b0 is
+    //   bit63=S | bit62=NOT(b6) | bits61..54=b6×8 | bits53..48=b5..b0 | 0×48.
+    const uint8_t imm8 =
+        (uint8_t)(((bits >> 56) & 0x80) | (((bits >> 54) & 1) << 6) | ((bits >> 48) & 0x3F));
+    const uint64_t b6 = (imm8 >> 6) & 1;
+    const uint64_t rec = ((uint64_t)(imm8 >> 7) << 63) | ((b6 ^ 1ULL) << 62) |
+                         (b6 ? (0xFFULL << 54) : 0) | ((uint64_t)(imm8 & 0x3F) << 48);
+    if (rec != bits) return false;
+    *imm8_out = imm8;
+    return true;
+}
+
+auto emit_fmov_d_imm8(AssemblerBuffer& buf, int Dd, uint8_t imm8) -> void {
+    // FMOV Dd, #imm8 (scalar immediate, double) — same base as emit_fmov_d_one.
+    buf.emit(0x1E601000u | ((uint32_t)imm8 << 13) | (uint32_t)(Dd & 0x1F));
+}
+
 auto emit_ldr_literal_f64(AssemblerBuffer& buf, int Dd, uint64_t constant) -> void {
     // OPT-H: LDR Dd, [PC, #8] — load from 2 instructions ahead (the .quad)
     // Encoding (LDR literal, SIMD&FP):

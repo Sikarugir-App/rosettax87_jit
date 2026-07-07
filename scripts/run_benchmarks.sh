@@ -48,6 +48,7 @@ ALL_BENCHMARKS=(
     bench_fistp_multi
     bench_mem_cse
     bench_addr_fold
+    bench_const_promote
 )
 
 RED='\033[0;31m'

@@ -143,6 +143,10 @@ struct Context {
     // save/restore. Set by compile_run from the post-run instruction stream.
     int8_t  nzcv_dead;
 
+    // Allow promoting loads from read-only absolute addresses to constants
+    // (set by build() from its parameter; JIT mode only).
+    int8_t  const_promote;
+
     void init() {
         num_nodes = 0;
         top_delta = 0;
@@ -153,6 +157,7 @@ struct Context {
         addr_cache_rep[1] = -1;
         addr_cache_n = 0;
         nzcv_dead = 0;
+        const_promote = 0;
         const_zero_node = -1;
         const_one_node = -1;
         const_f64_node = -1;
@@ -229,7 +234,7 @@ struct Context {
 // entries are force-resolved so lowering materializes the swap (identity
 // afterward); the reads are DSE-able if the run overwrites those slots.
 bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start_idx,
-           int run_length, const int8_t* perm = nullptr);
+           int run_length, const int8_t* perm = nullptr, bool const_promote = false);
 
 // Run optimization passes on the IR (DSE, FMA detection, FCOM+FSTSW fusion).
 void optimize(Context& ctx);

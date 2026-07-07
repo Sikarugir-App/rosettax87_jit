@@ -536,7 +536,11 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::ConstF64: {
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_ldr_literal_f64(buf, Dd, n.imm_bits);
+            uint8_t imm8;
+            if (f64_fmov_imm8(n.imm_bits, &imm8))
+                emit_fmov_d_imm8(buf, Dd, imm8);
+            else
+                emit_ldr_literal_f64(buf, Dd, n.imm_bits);
             break;
         }
 
@@ -1343,7 +1347,16 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
     const auto& cache = result->x87_cache;
     const int8_t* perm = cache.perm_dirty ? cache.perm : nullptr;
 
-    if (!build(ctx, instr_array, num_instrs, start_idx, run_length, perm))
+    // Constant-load promotion reads guest memory at translation time — only
+    // sound in JIT mode, where the guest address space is this process.
+    // Constant-load promotion reads guest memory at translation time. The
+    // page-protection probe is only compiled into the ROSETTA_RUNTIME build,
+    // which is always injected into a live guest process; elsewhere
+    // range_is_readonly() is stubbed to false, so the flag is inert.
+    const bool const_promote =
+        !(g_rosetta_config && g_rosetta_config->disable_const_promote);
+
+    if (!build(ctx, instr_array, num_instrs, start_idx, run_length, perm, const_promote))
         return 0;
 
     optimize(ctx);
