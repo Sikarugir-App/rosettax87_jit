@@ -99,6 +99,11 @@ auto emit_ldr_str_imm_ext(AssemblerBuffer& buf, int data_size, int write_back, i
 auto emit_fldur_fstur(AssemblerBuffer& buf, int size, int is_load, int16_t imm9, int Rn,
                       int Vt) -> void;
 
+// LDP / STP (SIMD&FP, D registers) — signed 7-bit offset scaled by 8.
+// Vt1 accesses [Rn + imm7*8], Vt2 accesses [Rn + imm7*8 + 8].
+auto emit_fldp_fstp_d(AssemblerBuffer& buf, int is_load, int16_t imm7_scaled, int Rn, int Vt1,
+                      int Vt2) -> void;
+
 // LDR GPR immediate — thin wrapper: is_fp=0, opc=1
 auto emit_ldr_imm(AssemblerBuffer& buf, int size, int Rt, int Rn, int16_t imm12) -> void;
 

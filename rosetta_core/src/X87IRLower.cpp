@@ -347,6 +347,38 @@ void lower(Context& ctx, TranslationResult* result) {
         return false;
     };
 
+    // ── LDP/STP pairing ─────────────────────────────────────────────────────
+    // If node i (LoadF64/StoreF64) and the immediately-next live node are the
+    // same op through the same cached base with displacements 8 apart, emit
+    // one LDP/STP and skip the partner. Adjacency keeps this model-neutral:
+    // both FPRs are simultaneously live at the partner node in the existing
+    // pressure model anyway, and reordering two non-overlapping adjacent
+    // accesses is safe. Returns the cached-base index for a pairable operand
+    // (LDP/STP range: disp % 8 == 0, disp/8 ∈ [-64, 63]) or -1.
+    bool pair_done[kMaxNodes] = {};
+    auto pairable_key = [&](const Node& n) -> int {
+        for (int k = 0; k < addr_n; k++) {
+            if (!addr_base_key_equal(n.mem_operand, addr_rep[k])) continue;
+            const int64_t disp = n.mem_operand->mem.disp;
+            if (disp % 8 == 0 && disp >= -512 && disp <= 504) return k;
+            return -1;
+        }
+        return -1;
+    };
+    // Returns the partner node ID for node i, or -1.
+    auto find_pair = [&](int i) -> int {
+        const auto& n = ctx.nodes[i];
+        int j = i + 1;
+        while (j < ctx.num_nodes && (ctx.nodes[j].flags & kDead)) j++;
+        if (j >= ctx.num_nodes || ctx.nodes[j].op != n.op) return -1;
+        const int k1 = pairable_key(n);
+        if (k1 < 0 || k1 != pairable_key(ctx.nodes[j])) return -1;
+        const int64_t d1 = n.mem_operand->mem.disp;
+        const int64_t d2 = ctx.nodes[j].mem_operand->mem.disp;
+        if (d2 != d1 + 8 && d2 != d1 - 8) return -1;
+        return j;
+    };
+
     // ── RC caching: hoist LDRH+UBFX when ≥2 RC consumers in a segment ────
     int Wd_rc_cached = -1;
     bool rc_cache_valid = false;
@@ -403,6 +435,12 @@ void lower(Context& ctx, TranslationResult* result) {
     for (int i = 0; i < ctx.num_nodes; i++) {
         auto& n = ctx.nodes[i];
         if (n.flags & kDead) continue;
+        if (pair_done[i]) {
+            // Access already emitted as half of an LDP/STP; only the FPR
+            // lifetime bookkeeping remains.
+            fprs.free_dead_inputs(*result, n, i);
+            continue;
+        }
 
         switch (n.op) {
 
@@ -416,6 +454,19 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::LoadF64: {
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
+            int j = find_pair(i);
+            if (j >= 0) {
+                int Dd2 = alloc_free_fpr(*result);
+                fprs.node_fpr[j] = static_cast<int8_t>(Dd2);
+                pair_done[j] = true;
+                const int k = pairable_key(n);
+                const int64_t d1 = n.mem_operand->mem.disp;
+                const int64_t d2 = ctx.nodes[j].mem_operand->mem.disp;
+                const int64_t lo = d1 < d2 ? d1 : d2;
+                emit_fldp_fstp_d(buf, /*is_load=*/1, static_cast<int16_t>(lo / 8),
+                                 addr_reg[k], d1 < d2 ? Dd : Dd2, d1 < d2 ? Dd2 : Dd);
+                break;
+            }
             if (!emit_cached_access(n, 3, /*is_load=*/1, Dd)) {
                 int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
                 emit_fldr_imm(buf, 3, Dd, addr, 0);
@@ -631,6 +682,21 @@ void lower(Context& ctx, TranslationResult* result) {
         // ── Memory stores ───────────────────────────────────────────────
         case Op::StoreF64: {
             int Dd_val = fprs.get(n.inputs[0]);
+            int j = find_pair(i);
+            if (j >= 0) {
+                // Both values are already computed (the partner's input must
+                // precede this node — everything between i and j is dead).
+                int Dd_val2 = fprs.get(ctx.nodes[j].inputs[0]);
+                pair_done[j] = true;
+                const int k = pairable_key(n);
+                const int64_t d1 = n.mem_operand->mem.disp;
+                const int64_t d2 = ctx.nodes[j].mem_operand->mem.disp;
+                const int64_t lo = d1 < d2 ? d1 : d2;
+                emit_fldp_fstp_d(buf, /*is_load=*/0, static_cast<int16_t>(lo / 8),
+                                 addr_reg[k], d1 < d2 ? Dd_val : Dd_val2,
+                                 d1 < d2 ? Dd_val2 : Dd_val);
+                break;
+            }
             if (!emit_cached_access(n, 3, /*is_load=*/0, Dd_val)) {
                 int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
                 emit_fstr_imm(buf, 3, Dd_val, addr, 0);

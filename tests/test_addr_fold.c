@@ -142,6 +142,48 @@ static double addr_cache_with_frndint(const double *p) {
     return out;
 }
 
+/* ==== adjacent same-base loads → LDP (ascending disps) ==== */
+static void ldp_ascending(const double *p, double *o0, double *o1) {
+    __asm__ volatile(
+        "fldl (%2)\n\t"
+        "fldl 8(%2)\n\t"           /* pairs with the previous load */
+        "fstpl %1\n\t"             /* ST(0) = p[1] */
+        "fstpl %0\n"               /* then  p[0] */
+        : "=m"(*o0), "=m"(*o1) : "r"(p));
+}
+
+/* ==== adjacent same-base loads → LDP (descending disps) ==== */
+static void ldp_descending(const double *p, double *o0, double *o1) {
+    __asm__ volatile(
+        "fldl 8(%2)\n\t"
+        "fldl (%2)\n\t"            /* Δ = -8: LDP anchored at the lower disp */
+        "fstpl %0\n\t"             /* ST(0) = p[0] */
+        "fstpl %1\n"               /* then  p[1] */
+        : "=m"(*o0), "=m"(*o1) : "r"(p));
+}
+
+/* ==== adjacent same-base stores of distinct values → STP ==== */
+static void stp_pair(double *p) {
+    __asm__ volatile(
+        "fld1\n\t"                 /* 1.0 */
+        "fldz\n\t"                 /* 0.0 on top */
+        "fstpl 8(%0)\n\t"          /* p[1] = 0.0 */
+        "fstpl (%0)\n"             /* p[0] = 1.0 — Δ = -8, values must not swap */
+        : : "r"(p) : "memory");
+}
+
+/* ==== disps 16 apart: must NOT pair, plain folded accesses ==== */
+static double no_pair_gap(const double *p) {
+    double out;
+    __asm__ volatile(
+        "fldl (%1)\n\t"
+        "fldl 16(%1)\n\t"
+        "faddp\n\t"
+        "fstpl %0\n"
+        : "=m"(out) : "r"(p));
+    return out;
+}
+
 /* ==== many distinct bases: only 2 cached, rest fall back ==== */
 static double three_bases(const double *p, const double *q, const double *r) {
     double out;
@@ -215,6 +257,28 @@ int main(void) {
     {
         double a[2] = {1.25, 2.5};
         check("addr cache + frndint", addr_cache_with_frndint(a), 4.0);  /* 3.75 → 4 */
+    }
+    {
+        double p[2] = {11.0, 22.0}, o0 = 0, o1 = 0;
+        ldp_ascending(p, &o0, &o1);
+        check("ldp ascending: p[0]", o0, 11.0);
+        check("ldp ascending: p[1]", o1, 22.0);
+    }
+    {
+        double p[2] = {33.0, 44.0}, o0 = 0, o1 = 0;
+        ldp_descending(p, &o0, &o1);
+        check("ldp descending: p[0]", o0, 33.0);
+        check("ldp descending: p[1]", o1, 44.0);
+    }
+    {
+        double p[2] = {9.0, 9.0};
+        stp_pair(p);
+        check("stp pair: p[0]", p[0], 1.0);
+        check("stp pair: p[1]", p[1], 0.0);
+    }
+    {
+        double p[3] = {5.0, 99.0, 7.0};
+        check("gap of 16: no pair", no_pair_gap(p), 12.0);
     }
 
     printf("\n%d failure(s)\n", failures);
