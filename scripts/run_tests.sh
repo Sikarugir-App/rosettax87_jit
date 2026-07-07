@@ -67,6 +67,7 @@ ALL_TESTS=(
     test_ir_algebra
     test_addr_fold
     test_const_promote
+    test_f32_raw
 )
 
 RED='\033[0;31m'

@@ -48,6 +48,7 @@ ALL_BENCHMARKS=(
     bench_fistp_multi
     bench_mem_cse
     bench_addr_fold
+    bench_f32
     bench_const_promote
 )
 

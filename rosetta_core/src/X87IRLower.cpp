@@ -186,6 +186,116 @@ static bool addr_uses_rax(const IROperand* op) {
     return false;
 }
 
+// ── LDP/STP pair planning ───────────────────────────────────────────────────
+//
+// Pair two f64/f32 accesses through the same guest base into one LDP/STP.
+// Load pairs are emitted at the earlier node (the partner load is hoisted);
+// store pairs at the later node (the earlier store is sunk), so both values
+// exist at emission. The scan may cross a bounded number of intervening live
+// nodes that cannot alias or reorder unsafely: pure value nodes always, plus
+// other guest loads when the lead is a load (read-read reordering is safe).
+// This catches the dominant game patterns where a widen/narrow FCVT or a
+// multiply sits between the two halves of a vector access
+// (fld a; fmul b; fld a+4; fmul b+4).
+//
+// pair_with[e] = partner node ID, stored at the emission node e;
+// pair_skip[s] = true for the node whose own emission is suppressed.
+// `reps`/`nreps`: the planned cached-base representatives — pairs only form
+// through a cached base. peak_live_fprs passes reps == nullptr, which admits
+// any base-cacheable operand: a superset of what lower() forms, keeping the
+// pressure model conservative.
+
+static constexpr int kPairMaxSkip = 4;
+
+static bool pair_class(Op op, bool* is_load, int* scale) {
+    switch (op) {
+        case Op::LoadF64:     *is_load = true;  *scale = 8; return true;
+        case Op::LoadF32Raw:  *is_load = true;  *scale = 4; return true;
+        case Op::StoreF64:    *is_load = false; *scale = 8; return true;
+        case Op::StoreF32Raw: *is_load = false; *scale = 4; return true;
+        default: return false;
+    }
+}
+
+static bool pair_node_skippable(Op op, bool lead_is_load) {
+    switch (op) {
+        // Pure value nodes — no guest-memory access.
+        case Op::ReadSt:
+        case Op::ConstZero: case Op::ConstOne: case Op::ConstF64:
+        case Op::CvtF32ToF64: case Op::CvtF64ToF32:
+        case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
+        case Op::FNMul: case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
+        case Op::FNeg: case Op::FAbs: case Op::FSqrt:
+        case Op::FCSel:
+            return true;
+        // Guest loads: a load may be hoisted past them, a store may not be
+        // sunk past them (the load could read the stored location).
+        case Op::LoadF64: case Op::LoadF32Raw:
+        case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
+            return lead_is_load;
+        default:
+            return false;
+    }
+}
+
+// LDP/STP signed imm7 range, scaled.
+static bool pair_disp_ok(int64_t disp, int scale) {
+    return disp % scale == 0 && disp >= -64 * scale && disp <= 63 * scale;
+}
+
+static void compute_pairs(const Context& ctx, IROperand* const* reps, int nreps,
+                          int16_t* pair_with, bool* pair_skip) {
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        pair_with[i] = -1;
+        pair_skip[i] = false;
+    }
+
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        if (pair_skip[i] || pair_with[i] >= 0) continue;
+        bool is_load;
+        int scale;
+        if (!pair_class(n.op, &is_load, &scale)) continue;
+        const IROperand* mo = n.mem_operand;
+        if (!addr_operand_base_cacheable(mo)) continue;
+        if (reps) {
+            int k = 0;
+            for (; k < nreps; k++)
+                if (addr_base_key_equal(mo, reps[k])) break;
+            if (k == nreps) continue;
+        }
+        const int64_t d1 = mo->mem.disp;
+        if (!pair_disp_ok(d1, scale)) continue;
+
+        int skipped = 0;
+        for (int j = i + 1; j < ctx.num_nodes; j++) {
+            const auto& m = ctx.nodes[j];
+            if (m.flags & kDead) continue;
+            if (m.op == n.op && !pair_skip[j] && pair_with[j] < 0 &&
+                addr_operand_base_cacheable(m.mem_operand) &&
+                addr_base_key_equal(mo, m.mem_operand)) {
+                const int64_t d2 = m.mem_operand->mem.disp;
+                if (pair_disp_ok(d2, scale) &&
+                    (d2 == d1 + scale || d2 == d1 - scale)) {
+                    if (is_load) {
+                        pair_with[i] = static_cast<int16_t>(j);
+                        pair_skip[j] = true;
+                    } else {
+                        pair_with[j] = static_cast<int16_t>(i);
+                        pair_skip[i] = true;
+                    }
+                    break;
+                }
+                // Same-op access that isn't the partner: fall through to the
+                // skippability check (loads may cross loads; stores stop).
+            }
+            if (!pair_node_skippable(m.op, is_load)) break;
+            if (++skipped > kPairMaxSkip) break;
+        }
+    }
+}
+
 // Pick up to 2 base keys with ≥2 foldable f32/f64 accesses each; store the
 // representative node IDs in ctx.addr_cache_rep.  Returns the planned count.
 // The caller (compile_run) degrades the plan to fit the GPR pool — each
@@ -202,9 +312,9 @@ static int plan_addr_cache(Context& ctx) {
         // paths also allocate more transient GPRs than the pressure model
         // attributes to a Load/Store node).
         switch (n.op) {
-            case Op::LoadF64: case Op::LoadF32:
+            case Op::LoadF64: case Op::LoadF32Raw:
             case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
-            case Op::StoreF64: case Op::StoreF32:
+            case Op::StoreF64: case Op::StoreF32Raw:
             case Op::StoreI16: case Op::StoreI32: case Op::StoreI64:
             case Op::StoreCW: case Op::LoadCW:
                 if (n.mem_operand->kind == IROperandKind::MemRef &&
@@ -224,7 +334,7 @@ static int plan_addr_cache(Context& ctx) {
         bool is_f64;
         switch (n.op) {
             case Op::LoadF64: case Op::StoreF64: is_f64 = true; break;
-            case Op::LoadF32: case Op::StoreF32: is_f64 = false; break;
+            case Op::LoadF32Raw: case Op::StoreF32Raw: is_f64 = false; break;
             default: continue;
         }
         const IROperand* mo = n.mem_operand;
@@ -370,34 +480,31 @@ void lower(Context& ctx, TranslationResult* result) {
     };
 
     // ── LDP/STP pairing ─────────────────────────────────────────────────────
-    // If node i (LoadF64/StoreF64) and the immediately-next live node are the
-    // same op through the same cached base with displacements 8 apart, emit
-    // one LDP/STP and skip the partner. Adjacency keeps this model-neutral:
-    // both FPRs are simultaneously live at the partner node in the existing
-    // pressure model anyway, and reordering two non-overlapping adjacent
-    // accesses is safe. Returns the cached-base index for a pairable operand
-    // (LDP/STP range: disp % 8 == 0, disp/8 ∈ [-64, 63]) or -1.
-    auto pairable_key = [&](const Node& n) -> int {
-        for (int k = 0; k < addr_n; k++) {
-            if (!addr_base_key_equal(n.mem_operand, addr_rep[k])) continue;
-            const int64_t disp = n.mem_operand->mem.disp;
-            if (disp % 8 == 0 && disp >= -512 && disp <= 504) return k;
-            return -1;
-        }
-        return -1;
-    };
-    // Returns the partner node ID for node i, or -1.
-    auto find_pair = [&](int i) -> int {
-        const auto& n = ctx.nodes[i];
-        int j = i + 1;
-        while (j < ctx.num_nodes && (ctx.nodes[j].flags & kDead)) j++;
-        if (j >= ctx.num_nodes || ctx.nodes[j].op != n.op) return -1;
-        const int k1 = pairable_key(n);
-        if (k1 < 0 || k1 != pairable_key(ctx.nodes[j])) return -1;
-        const int64_t d1 = n.mem_operand->mem.disp;
-        const int64_t d2 = ctx.nodes[j].mem_operand->mem.disp;
-        if (d2 != d1 + 8 && d2 != d1 - 8) return -1;
-        return j;
+    // Precomputed plan (see compute_pairs): pair_with[e] holds the partner at
+    // the emission node, pair_skip[s] suppresses the partner's own emission.
+    // With addr_n == 0 no operand matches a rep, so no pairs form.
+    int16_t pair_with[kMaxNodes];
+    bool pair_skip[kMaxNodes];
+    compute_pairs(ctx, addr_rep, addr_n, pair_with, pair_skip);
+
+    // Emit one LDP/STP for nodes a (whose FPR is Va) and b (Vb) — same op,
+    // same cached base, displacements one element apart.
+    auto emit_pair_access = [&](const Node& a, const Node& b, int size,
+                                int is_load, int Va, int Vb) {
+        int k = 0;
+        for (; k < addr_n; k++)
+            if (addr_base_key_equal(a.mem_operand, addr_rep[k])) break;
+        const int64_t d1 = a.mem_operand->mem.disp;
+        const int64_t d2 = b.mem_operand->mem.disp;
+        const int64_t lo = d1 < d2 ? d1 : d2;
+        const int Vt1 = d1 < d2 ? Va : Vb;
+        const int Vt2 = d1 < d2 ? Vb : Va;
+        if (size == 3)
+            emit_fldp_fstp_d(buf, is_load, static_cast<int16_t>(lo / 8),
+                             addr_reg[k], Vt1, Vt2);
+        else
+            emit_fldp_fstp_s(buf, is_load, static_cast<int16_t>(lo / 4),
+                             addr_reg[k], Vt1, Vt2);
     };
 
     // ── RC caching: hoist LDRH+UBFX when ≥2 RC consumers in a segment ────
@@ -457,7 +564,16 @@ void lower(Context& ctx, TranslationResult* result) {
     auto emit_body = [&](int top_known) {
     FPRState fprs;
     fprs.compute_last_uses(ctx);
-    bool pair_done[kMaxNodes] = {};
+    // Store pairs: the earlier (sunk) store's value must stay live until the
+    // STP at the emission node.
+    for (int e = 0; e < ctx.num_nodes; e++) {
+        if (pair_with[e] < 0) continue;
+        const auto& en = ctx.nodes[e];
+        if (en.op != Op::StoreF64 && en.op != Op::StoreF32Raw) continue;
+        int16_t in_s = ctx.nodes[pair_with[e]].inputs[0];
+        if (in_s >= 0 && fprs.last_use[in_s] < e)
+            fprs.last_use[in_s] = static_cast<int16_t>(e);
+    }
     bool rc_cache_valid = false;
     int Wd_nzcv_saved = -1;
     const int final_top_known =
@@ -467,9 +583,10 @@ void lower(Context& ctx, TranslationResult* result) {
     for (int i = 0; i < ctx.num_nodes; i++) {
         auto& n = ctx.nodes[i];
         if (n.flags & kDead) continue;
-        if (pair_done[i]) {
-            // Access already emitted as half of an LDP/STP; only the FPR
-            // lifetime bookkeeping remains.
+        if (pair_skip[i]) {
+            // Access emitted (or to be emitted) as half of an LDP/STP; only
+            // the FPR lifetime bookkeeping remains. A sunk store's input has
+            // its last_use extended to the emission node, so it survives.
             fprs.free_dead_inputs(*result, n, i);
             continue;
         }
@@ -490,38 +607,24 @@ void lower(Context& ctx, TranslationResult* result) {
             }
             break;
         }
-        case Op::LoadF64: {
+        case Op::LoadF64:
+        case Op::LoadF32Raw: {
+            const int size = (n.op == Op::LoadF64) ? 3 : 2;
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            int j = find_pair(i);
+            const int j = pair_with[i];
             if (j >= 0) {
+                // Load pair: hoist the partner load into one LDP.
                 int Dd2 = alloc_free_fpr(*result);
                 fprs.node_fpr[j] = static_cast<int8_t>(Dd2);
-                pair_done[j] = true;
-                const int k = pairable_key(n);
-                const int64_t d1 = n.mem_operand->mem.disp;
-                const int64_t d2 = ctx.nodes[j].mem_operand->mem.disp;
-                const int64_t lo = d1 < d2 ? d1 : d2;
-                emit_fldp_fstp_d(buf, /*is_load=*/1, static_cast<int16_t>(lo / 8),
-                                 addr_reg[k], d1 < d2 ? Dd : Dd2, d1 < d2 ? Dd2 : Dd);
+                emit_pair_access(n, ctx.nodes[j], size, /*is_load=*/1, Dd, Dd2);
                 break;
             }
-            if (!emit_cached_access(n, 3, /*is_load=*/1, Dd)) {
+            if (!emit_cached_access(n, size, /*is_load=*/1, Dd)) {
                 int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-                emit_fldr_imm(buf, 3, Dd, addr, 0);
+                emit_fldr_imm(buf, size, Dd, addr, 0);
                 free_gpr(*result, addr);
             }
-            break;
-        }
-        case Op::LoadF32: {
-            int Dd = alloc_free_fpr(*result);
-            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            if (!emit_cached_access(n, 2, /*is_load=*/1, Dd)) {
-                int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-                emit_fldr_imm(buf, 2, Dd, addr, 0);
-                free_gpr(*result, addr);
-            }
-            emit_fcvt_s_to_d(buf, Dd, Dd);
             break;
         }
         case Op::LoadI16: {
@@ -722,41 +825,51 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
 
-        // ── Memory stores ───────────────────────────────────────────────
-        case Op::StoreF64: {
-            int Dd_val = fprs.get(n.inputs[0]);
-            int j = find_pair(i);
-            if (j >= 0) {
-                // Both values are already computed (the partner's input must
-                // precede this node — everything between i and j is dead).
-                int Dd_val2 = fprs.get(ctx.nodes[j].inputs[0]);
-                pair_done[j] = true;
-                const int k = pairable_key(n);
-                const int64_t d1 = n.mem_operand->mem.disp;
-                const int64_t d2 = ctx.nodes[j].mem_operand->mem.disp;
-                const int64_t lo = d1 < d2 ? d1 : d2;
-                emit_fldp_fstp_d(buf, /*is_load=*/0, static_cast<int16_t>(lo / 8),
-                                 addr_reg[k], d1 < d2 ? Dd_val : Dd_val2,
-                                 d1 < d2 ? Dd_val2 : Dd_val);
-                break;
-            }
-            if (!emit_cached_access(n, 3, /*is_load=*/0, Dd_val)) {
-                int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-                emit_fstr_imm(buf, 3, Dd_val, addr, 0);
-                free_gpr(*result, addr);
-            }
+        // ── f32 ↔ f64 conversion ────────────────────────────────────────
+        case Op::CvtF32ToF64: {
+            int Dn = fprs.get(n.inputs[0]);
+            int Dd = fprs.try_reuse_input(ctx, i);
+            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
+            emit_fcvt_s_to_d(buf, Dd, Dn);
             break;
         }
-        case Op::StoreF32: {
-            // Narrow f64 → f32, then store.
-            int Ds_tmp = alloc_free_fpr(*result);
-            emit_fcvt_d_to_s(buf, Ds_tmp, fprs.get(n.inputs[0]));
-            if (!emit_cached_access(n, 2, /*is_load=*/0, Ds_tmp)) {
+        case Op::CvtF64ToF32: {
+            int Dn = fprs.get(n.inputs[0]);
+            int Dd = fprs.try_reuse_input(ctx, i);
+            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
+            emit_fcvt_d_to_s(buf, Dd, Dn);
+            break;
+        }
+
+        // ── Memory stores ───────────────────────────────────────────────
+        case Op::StoreF64:
+        case Op::StoreF32Raw: {
+            const int size = (n.op == Op::StoreF64) ? 3 : 2;
+            int Dd_val = fprs.get(n.inputs[0]);
+            const int s = pair_with[i];
+            if (s >= 0) {
+                // Store pair: the earlier store (s) was sunk here; both
+                // values are computed by now.
+                const int16_t in_s = ctx.nodes[s].inputs[0];
+                int Dd_val2 = fprs.get(in_s);
+                emit_pair_access(n, ctx.nodes[s], size, /*is_load=*/0,
+                                 Dd_val, Dd_val2);
+                // Free the partner's value if this STP is its (extended)
+                // last use — free_dead_inputs only covers this node's input.
+                if (in_s != n.inputs[0] && fprs.last_use[in_s] == i &&
+                    fprs.node_fpr[in_s] >= 0) {
+                    free_fpr(*result, fprs.node_fpr[in_s]);
+                    fprs.node_fpr[in_s] = -1;
+                }
+                break;
+            }
+            if (!emit_cached_access(n, size, /*is_load=*/0, Dd_val)) {
                 int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-                emit_fstr_imm(buf, 2, Ds_tmp, addr, 0);
+                emit_fstr_imm(buf, size, Dd_val, addr, 0);
                 free_gpr(*result, addr);
             }
-            free_fpr(*result, Ds_tmp);
             break;
         }
 
@@ -1178,8 +1291,8 @@ void lower(Context& ctx, TranslationResult* result) {
 //   - Wd_rc_cached (pool 3) when RC caching is active = +1
 //
 // Per-node transient GPR demand (mirrors the lowering code exactly):
-//   - ReadSt, Const*, FAdd/FSub/FMul/FDiv, FMA*, FNeg/FAbs/FSqrt, FCSel: 0
-//   - LoadF64, LoadF32, StoreF64, StoreF32: 1 (addr from compute_operand_address)
+//   - ReadSt, Const*, FAdd/FSub/FMul/FDiv, FMA*, FNeg/FAbs/FSqrt, FCSel, Cvt*: 0
+//   - LoadF64, LoadF32Raw, StoreF64, StoreF32Raw: 1 (addr from compute_operand_address)
 //   - LoadI16/I32/I64: 2 (addr + Wd_val)
 //   - StoreI16/I32/I64: 2 (Wd_int + addr)
 //   - FRndInt without RC cache: 1 (Wd_rc via alloc_gpr(3))
@@ -1252,6 +1365,7 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
         // No transient GPRs
         case Op::ReadSt:
         case Op::ConstZero: case Op::ConstOne: case Op::ConstF64:
+        case Op::CvtF32ToF64: case Op::CvtF64ToF32:
         case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
         case Op::FNMul:
         case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
@@ -1260,8 +1374,8 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
             break;
 
         // 1 GPR: addr from compute_operand_address
-        case Op::LoadF64: case Op::LoadF32:
-        case Op::StoreF64: case Op::StoreF32:
+        case Op::LoadF64: case Op::LoadF32Raw:
+        case Op::StoreF64: case Op::StoreF32Raw:
             transient = 1;
             break;
 
@@ -1358,8 +1472,10 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
 //     *during* a node is: (currently live) + 1 for the new output, before dead
 //     inputs are freed.  try_reuse_input() avoids the +1 by recycling a dying
 //     input's FPR; we model it with the same claim order as lower().
-//   - StoreF32 allocates one extra transient FPR (Ds_tmp) that is freed before
-//     the node ends.  Model as a +1 spike.
+//   - LDP/STP pairs shift liveness: a load pair allocates the partner's FPR at
+//     the lead node; a store pair extends the sunk store's input to the
+//     emission node.  Pairs are mirrored with reps == nullptr (any cacheable
+//     base), a superset of what lower() forms — over- never under-estimating.
 //   - StoreI*, FCmp, FTst, FStsw produce no FPR output and need no extra FPRs.
 //   - Dead (kDead) nodes are skipped.
 int peak_live_fprs(const Context& ctx) {
@@ -1379,6 +1495,20 @@ int peak_live_fprs(const Context& ctx) {
             last_use[val] = static_cast<int16_t>(ctx.num_nodes);
     }
 
+    // Mirror the LDP/STP pair plan conservatively (reps == nullptr: any
+    // base-cacheable operand may pair — a superset of lower()'s pairs).
+    int16_t pair_with[kMaxNodes];
+    bool pair_skip[kMaxNodes];
+    compute_pairs(ctx, nullptr, 0, pair_with, pair_skip);
+    for (int e = 0; e < ctx.num_nodes; e++) {
+        if (pair_with[e] < 0) continue;
+        const auto& en = ctx.nodes[e];
+        if (en.op != Op::StoreF64 && en.op != Op::StoreF32Raw) continue;
+        int16_t in_s = ctx.nodes[pair_with[e]].inputs[0];
+        if (in_s >= 0 && last_use[in_s] < e)
+            last_use[in_s] = static_cast<int16_t>(e);
+    }
+
     // Step 2: simulate FPR allocation order, tracking live count.
     // A node holds an FPR from instruction i (inclusive) to last_use[i]
     // (exclusive — freed at the end of the last-use instruction).
@@ -1393,59 +1523,65 @@ int peak_live_fprs(const Context& ctx) {
         const auto& n = ctx.nodes[i];
         if (n.flags & kDead) continue;
 
-        // Allocate FPR for nodes that produce an FPR-bearing value.
-        // Ops that call try_reuse_input() in lower() can recycle a dying
-        // input's FPR for their output (net-zero live change); model that
-        // with the exact same claim order (inputs[0..2], first dying wins).
-        bool produces_fpr = false;
-        bool can_reuse = false;
-        switch (n.op) {
-        case Op::ReadSt:
-        case Op::LoadF64: case Op::LoadF32:
-        case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
-        case Op::ConstZero: case Op::ConstOne: case Op::ConstF64:
-            produces_fpr = true;
-            break;
-        case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
-        case Op::FNMul:
-        case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
-        case Op::FNeg: case Op::FAbs: case Op::FSqrt: case Op::FRndInt:
-        case Op::FCSel:
-            produces_fpr = true;
-            can_reuse = true;
-            break;
-        default:
-            break;
-        }
+        if (!pair_skip[i]) {
+            // Allocate FPR for nodes that produce an FPR-bearing value.
+            // Ops that call try_reuse_input() in lower() can recycle a dying
+            // input's FPR for their output (net-zero live change); model that
+            // with the exact same claim order (inputs[0..2], first dying wins).
+            bool produces_fpr = false;
+            bool can_reuse = false;
+            switch (n.op) {
+            case Op::ReadSt:
+            case Op::LoadF64: case Op::LoadF32Raw:
+            case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
+            case Op::ConstZero: case Op::ConstOne: case Op::ConstF64:
+                produces_fpr = true;
+                break;
+            case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
+            case Op::FNMul:
+            case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
+            case Op::FNeg: case Op::FAbs: case Op::FSqrt: case Op::FRndInt:
+            case Op::FCSel:
+            case Op::CvtF32ToF64: case Op::CvtF64ToF32:
+                produces_fpr = true;
+                can_reuse = true;
+                break;
+            default:
+                break;
+            }
 
-        if (produces_fpr) {
-            bool reused = false;
-            if (can_reuse) {
-                for (int j = 0; j < 3; j++) {
-                    int16_t in = n.inputs[j];
-                    if (in >= 0 && last_use[in] == i && holding[in]) {
-                        holding[in] = false;  // FPR claimed by this node's output
-                        reused = true;
-                        break;
+            if (produces_fpr) {
+                bool reused = false;
+                if (can_reuse) {
+                    for (int j = 0; j < 3; j++) {
+                        int16_t in = n.inputs[j];
+                        if (in >= 0 && last_use[in] == i && holding[in]) {
+                            holding[in] = false;  // FPR claimed by this node's output
+                            reused = true;
+                            break;
+                        }
                     }
                 }
+                if (!reused) live++;
+                holding[i] = true;
+                if (live > peak) peak = live;
             }
-            if (!reused) live++;
-            holding[i] = true;
-            if (live > peak) peak = live;
+
+            // Load pair lead: the hoisted partner's FPR is allocated here too.
+            const int j = pair_with[i];
+            if (j >= 0 && (n.op == Op::LoadF64 || n.op == Op::LoadF32Raw)) {
+                live++;
+                holding[j] = true;
+                if (live > peak) peak = live;
+            }
         }
 
-        // StoreF32 allocates a transient Ds_tmp (fcvt d→s narrowing) that is
-        // freed before the node finishes.  Model as a +1 spike on top of the
-        // current live count.
-        if (n.op == Op::StoreF32 && live + 1 > peak)
-            peak = live + 1;
-
-        // Free inputs whose last use is this node.
-        for (int j = 0; j < 3; j++) {
-            int16_t in = n.inputs[j];
-            if (in >= 0 && last_use[in] == i && holding[in]) {
-                holding[in] = false;
+        // Free every held value whose (possibly pair-extended) last use is
+        // this node — covers this node's inputs and, at a store-pair emission
+        // node, the sunk partner's input (matching lower()'s explicit free).
+        for (int h = 0; h < ctx.num_nodes; h++) {
+            if (holding[h] && last_use[h] == i) {
+                holding[h] = false;
                 live--;
             }
         }

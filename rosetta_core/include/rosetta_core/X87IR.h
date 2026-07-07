@@ -17,13 +17,19 @@ enum class Op : uint8_t {
     // Pure values (no side effects)
     ReadSt,         // load initial stack slot (initial_depth in payload)
     LoadF64,        // load f64 from memory
-    LoadF32,        // load f32 from memory, widen to f64
+    LoadF32Raw,     // load raw f32 bits from memory into an S register
     LoadI16,        // load i16, sign-extend, convert to f64
     LoadI32,        // load i32, convert to f64
     LoadI64,        // load i64, convert to f64
     ConstZero,      // 0.0
     ConstOne,       // 1.0
     ConstF64,       // arbitrary f64 constant (imm_bits in payload)
+
+    // f32 <-> f64 conversion (pure unary). Raw-f32 values are produced only
+    // by LoadF32Raw/CvtF64ToF32 and consumed only by CvtF32ToF64/StoreF32Raw;
+    // stack slots always hold f64-typed nodes.
+    CvtF32ToF64,    // FCVT Dd, Sn — widen (exact)
+    CvtF64ToF32,    // FCVT Sd, Dn — narrow (rounds)
 
     // Binary arithmetic
     FAdd, FSub, FMul, FDiv,
@@ -45,7 +51,7 @@ enum class Op : uint8_t {
 
     // Memory stores (side effects — emitted in program order)
     StoreF64,       // store as f64 to memory
-    StoreF32,       // narrow to f32, store
+    StoreF32Raw,    // store raw f32 bits (input must be a raw-f32 node)
     StoreI16,       // convert f64 to signed i16, store
     StoreI32,       // convert f64 to signed i32, store
     StoreI64,       // convert f64 to signed i64, store
@@ -116,6 +122,12 @@ struct Context {
     int8_t     mem_cse_count;
     int8_t     mem_cse_next;               // rotating overwrite cursor when full
 
+    // Narrow dedup: most recent CvtF64ToF32 node and its input, so repeated
+    // f32 stores of one value (fst/fstp chains) share a single FCVT.
+    // Pure value — never invalidated within a run.
+    int16_t  last_narrow_input;
+    int16_t  last_narrow_node;
+
     // Const dedup: reuse prior ConstZero/ConstOne/ConstF64 nodes.
     // Consts are pure values — never invalidated within a run.
     int16_t  const_zero_node;
@@ -158,6 +170,8 @@ struct Context {
         addr_cache_n = 0;
         nzcv_dead = 0;
         const_promote = 0;
+        last_narrow_input = -1;
+        last_narrow_node = -1;
         const_zero_node = -1;
         const_one_node = -1;
         const_f64_node = -1;
@@ -240,9 +254,8 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
 void optimize(Context& ctx);
 
 // Compute the peak number of simultaneously live FPR-bearing nodes that the
-// lowering pass will require, accounting for transient temporaries (e.g. the
-// +1 FPR spike during StoreF32 narrowing).  Used to gate lowering against the
-// available scratch FPR pool.
+// lowering pass will require, including LDP/STP pair-induced liveness shifts.
+// Used to gate lowering against the available scratch FPR pool.
 int peak_live_fprs(const Context& ctx);
 
 // Lower IR to AArch64 instructions, writing into result->insn_buf.

@@ -325,6 +325,20 @@ auto emit_fldp_fstp_d(AssemblerBuffer& buf, int is_load, int16_t imm7_scaled, in
     buf.emit(insn);
 }
 
+auto emit_fldp_fstp_s(AssemblerBuffer& buf, int is_load, int16_t imm7_scaled, int Rn, int Vt1,
+                      int Vt2) -> void {
+    // LDP/STP (SIMD&FP, 32-bit S registers, signed offset, no writeback).
+    // Encoding: 00 101 1 010 L imm7 Rt2 Rn Rt  →  STP=0x2D000000, LDP=0x2D400000
+    // imm7_scaled = byte_offset / 4, range [-64, 63].
+    uint32_t insn = 0x2D000000u;
+    insn |= (uint32_t)(is_load & 1) << 22;
+    insn |= ((uint32_t)imm7_scaled & 0x7F) << 15;
+    insn |= (uint32_t)(Vt2 & 0x1F) << 10;
+    insn |= (uint32_t)(Rn & 0x1F) << 5;
+    insn |= (uint32_t)(Vt1 & 0x1F);
+    buf.emit(insn);
+}
+
 auto emit_fldr_reg(AssemblerBuffer& buf, int size, int Dt, int Rn, int Rm, int shift) -> void {
     emit_ldr_str_reg(buf, size, /*is_fp=*/1, /*opc=*/1, Rm, shift, Rn, Dt);
 }

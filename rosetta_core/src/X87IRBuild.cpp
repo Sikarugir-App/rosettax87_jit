@@ -134,11 +134,11 @@ static int16_t try_const_promote(Context& ctx, const IROperand* op, Op load_op) 
     if (!ctx.const_promote) return -1;
     uint64_t addr;
     if (!const_promote_addr(op, &addr)) return -1;
-    const uint64_t width = (load_op == Op::LoadF32) ? 4 : 8;
+    const uint64_t width = (load_op == Op::LoadF32Raw) ? 4 : 8;
     if (!range_is_readonly(addr, width)) return -1;
 
     uint64_t bits;
-    if (load_op == Op::LoadF32) {
+    if (load_op == Op::LoadF32Raw) {
         float f;
         memcpy(&f, reinterpret_cast<const void*>(addr), 4);
         const double d = static_cast<double>(f);  // exact widening
@@ -163,15 +163,15 @@ static int16_t try_const_promote(Context& ctx, const IROperand* op, Op load_op) 
     return build_const(ctx, bits);
 }
 
-// Build a memory load node. Returns node ID or -1 on bail (e.g. m80).
-// Identical operands within the run reuse the prior load's value (CSE).
+// Build a memory load node. Returns node ID (always f64-typed) or -1 on bail
+// (e.g. m80). Identical operands within the run reuse the prior load's value
+// (CSE). f32 loads decompose into a raw S-register load + explicit widen so
+// the raw access can pair/forward; the CSE entry (kind LoadF32Raw) caches the
+// widened view.
 static int16_t build_fp_load(Context& ctx, IROperand* op) {
-    Op load_op;
-    switch (op->mem.size) {
-        case IROperandSize::S32: load_op = Op::LoadF32; break;
-        case IROperandSize::S64: load_op = Op::LoadF64; break;
-        default: return -1;  // m80 → bail
-    }
+    const bool is_f32 = op->mem.size == IROperandSize::S32;
+    if (!is_f32 && op->mem.size != IROperandSize::S64) return -1;  // m80 → bail
+    const Op load_op = is_f32 ? Op::LoadF32Raw : Op::LoadF64;
     auto promoted = try_const_promote(ctx, op, load_op);
     if (promoted >= 0) return promoted;
     auto hit = mem_cse_lookup(ctx, op, load_op);
@@ -179,6 +179,10 @@ static int16_t build_fp_load(Context& ctx, IROperand* op) {
     auto id = ctx.add_node(load_op);
     if (id < 0) return -1;
     ctx.nodes[id].mem_operand = op;
+    if (is_f32) {
+        id = ctx.add_node(Op::CvtF32ToF64, id);
+        if (id < 0) return -1;
+    }
     mem_cse_insert(ctx, op, load_op, id);
     return id;
 }
@@ -215,21 +219,45 @@ static int16_t build_const(Context& ctx, uint64_t bits) {
 
 // Emit a memory store side-effect node.
 static bool build_fp_store(Context& ctx, IROperand* op, int16_t val_node) {
-    Op store_op;
-    switch (op->mem.size) {
-        case IROperandSize::S32: store_op = Op::StoreF32; break;
-        case IROperandSize::S64: store_op = Op::StoreF64; break;
-        default: return false;  // m80 → bail
+    const bool is_f32 = op->mem.size == IROperandSize::S32;
+    if (!is_f32 && op->mem.size != IROperandSize::S64) return false;  // m80 → bail
+
+    int16_t store_val = val_node;
+    if (is_f32) {
+        if (ctx.nodes[val_node].op == Op::CvtF32ToF64) {
+            // Copy elision: narrow(widen(x)) == x — store the raw f32 bits
+            // directly; DSE reaps the widen if this was its only use.
+            store_val = ctx.nodes[val_node].inputs[0];
+        } else if (ctx.last_narrow_input == val_node) {
+            // Repeated f32 stores of one value share a single FCVT.
+            store_val = ctx.last_narrow_node;
+        } else {
+            store_val = ctx.add_node(Op::CvtF64ToF32, val_node);
+            if (store_val < 0) return false;
+            ctx.last_narrow_input = val_node;
+            ctx.last_narrow_node = store_val;
+        }
     }
-    auto id = ctx.add_node(store_op, val_node);
+
+    const Op store_op = is_f32 ? Op::StoreF32Raw : Op::StoreF64;
+    auto id = ctx.add_node(store_op, store_val);
     if (id < 0) return false;
     ctx.nodes[id].mem_operand = op;
     // The store may alias any cached load. Then forward the stored value to
-    // later loads of the same operand — f64 only: a store/load round-trip is
-    // bit-exact for f64, but F32 narrows (a reload widens the rounded value).
+    // later loads of the same operand. f64 round-trips are bit-exact; for f32
+    // a reload returns widen(narrow(val)), so forward the f64 view of the
+    // *narrowed* value — the original widen node when the stored value came
+    // from one, else a fresh widen of the narrowed bits (DSE reaps it if no
+    // later load reads it).
     ctx.mem_cse_clear();
-    if (store_op == Op::StoreF64)
+    if (store_op == Op::StoreF64) {
         mem_cse_insert(ctx, op, Op::LoadF64, val_node);
+    } else {
+        int16_t fwd = (ctx.nodes[val_node].op == Op::CvtF32ToF64)
+                          ? val_node
+                          : ctx.add_node(Op::CvtF32ToF64, store_val);
+        if (fwd >= 0) mem_cse_insert(ctx, op, Op::LoadF32Raw, fwd);
+    }
     return true;
 }
 
