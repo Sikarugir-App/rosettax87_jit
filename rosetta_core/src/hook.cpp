@@ -83,6 +83,13 @@ int hook_install(void* target, void* hook_fn, void** trampoline) {
 
     flush_cache(tramp, PATCH_SIZE + 16);
 
+#if defined(ROSETTA_RUNTIME)
+    if (make_page_executable(tramp) != 0) {
+        munmap(tramp, AARCH64_PAGE_SIZE);
+        return -1;
+    }
+#endif
+
     // ------------------------------------------------------------------
     // 3. Make the target page writable (COW) and patch it.
     // ------------------------------------------------------------------

@@ -31,6 +31,7 @@ auto OffsetFinder::setDefaultOffsets() -> void {
 
     offsetTransactionResultSize_ = 0x0BA44;
     offsetTranslateInsn_ = 0x01A654;
+    offsetClassifyArmPc_ = 0x0B6FC;  // classify_arm_pc RVA in libRosettaRuntime (macOS 26 default)
 }
 
 auto OffsetFinder::determineOffsets() -> bool {
@@ -44,6 +45,14 @@ auto OffsetFinder::determineOffsets() -> bool {
         0xE4, 0x2B, 0x00, 0xF9};  // ADRP + STRB pattern for g_disable_aot global variable
     // For svc_call we need to check where this bitpattern starts in the code and also where it ends
     // (we can just add 0xC to the start to get the end)
+
+    // Matches the two LDRs at a classify_arm_pc call site:
+    //   LDR X2, [X26,#0x110]  (42 8B 40 F9)  <-- pattern byte 0
+    //   LDR W1, [X25,#0x194]  (21 97 41 B9)  <-- pattern byte 4
+    //   ADD X0, SP, #...                      (+0x08)
+    //   BL  classify_arm_pc                   (+0x0C)  <-- BL target we decode below
+    const std::vector<unsigned char> classifyArmPc = {0x42, 0x8B, 0x40, 0xF9,
+                                                      0x21, 0x97, 0x41, 0xB9};
 
     // Load rosetta runtime into an ifstream
     std::ifstream file{"/usr/libexec/rosetta/runtime", std::ios::binary};
@@ -75,7 +84,7 @@ auto OffsetFinder::determineOffsets() -> bool {
 
     // Do the search and store the results
     std::vector<std::uint64_t> results;
-    for (const auto offset : {exportsFetch, svcCall, disableAot}) {
+    for (const auto offset : {exportsFetch, svcCall, disableAot, classifyArmPc}) {
         const std::boyer_moore_searcher searcher(offset.begin(), offset.end());
         const auto it = std::search(buffer.begin(), buffer.end(), searcher);
         if (it == buffer.end()) {
@@ -87,7 +96,8 @@ auto OffsetFinder::determineOffsets() -> bool {
     }
 
     // If we've stored -1 in any offset, error out and fall back to non-accelerated x87 handles.
-    if ((int)results[0] <= -1 || (int)results[1] <= -1 || (int)results[2] <= -1) {
+    if ((int)results[0] <= -1 || (int)results[1] <= -1 || (int)results[2] <= -1 ||
+        (int)results[3] <= -1) {
         fprintf(stderr,
                 "Problem searching rosetta runtime to determine offsets automatically.\nFalling "
                 "back to macOS 26 defaults (This WILL crash your app if they are not correct!)\n");
@@ -128,6 +138,19 @@ __text:00000000000147B4 08 F1 4F 39                 LDRB            W8, [X8,#dis
     uintptr_t disable_aot_offset = adrp_page + ldrb_imm12;
 
     offsetDisableAot_ = disable_aot_offset;
+
+    // Decode the BL target at the classify_arm_pc call site to get the function's RVA.
+    // The BL is at pattern_match + 0x0C (two LDRs + one ADD, each 4 bytes).
+    uint64_t bl_offset = results[3] + 0x0C;
+    uint32_t bl_instruction = reinterpret_cast<uint32_t*>(&buffer.data()[bl_offset])[0];
+
+    // Decode BL: signed imm26 (bits [25:0]), scaled by 4, PC-relative to the BL itself.
+    int32_t imm26 = bl_instruction & 0x03FFFFFF;
+    if (imm26 & (1 << 25))
+        imm26 |= ~0x03FFFFFF;  // sign-extend from 26 bits
+    int64_t bl_disp = (int64_t)imm26 << 2;
+
+    offsetClassifyArmPc_ = bl_offset + bl_disp;
 
     return true;
 }

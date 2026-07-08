@@ -609,9 +609,10 @@ int main(int argc, char* argv[]) {
     // Search the rosetta runtime binary for offsets.
     if (offsetFinder.determineOffsets()) {
         LOG("Found rosetta runtime offsets successfully!\n");
-        LOG("offset_exports_fetch=%llx offset_svc_call_entry=%llx offset_svc_call_ret=%llx\n",
+        LOG("offset_exports_fetch=%llx offset_svc_call_entry=%llx offset_svc_call_ret=%llx "
+            "offset_classify_arm_pc=%llx\n",
             offsetFinder.offsetExportsFetch_, offsetFinder.offsetSvcCallEntry_,
-            offsetFinder.offsetSvcCallRet_);
+            offsetFinder.offsetSvcCallRet_, offsetFinder.offsetClassifyArmPc_);
     }
     if (offsetFinder.determineRuntimeOffsets()) {
         LOG("Found additional rosetta runtime offsets successfully!\n");
@@ -825,7 +826,12 @@ int main(int argc, char* argv[]) {
     Offsets machoOffsets = {
         .init_library_rva = offsetFinder.offsetInitLibrary_,
         .translate_insn_addr = offsetFinder.offsetTranslateInsn_,
-        .transaction_result_size_addr = offsetFinder.offsetTransactionResultSize_};
+        .transaction_result_size_addr = offsetFinder.offsetTransactionResultSize_,
+        .runtime_base = runtimeBase,
+        .rosettax87_base = machoBase,
+        .rosettax87_size = machoLoader.imageSize(),
+        .classify_arm_pc_rva = offsetFinder.offsetClassifyArmPc_,
+    };
 
     dbg.writeMemory(machoOffsetsAddress, &machoOffsets, sizeof(machoOffsets));
 

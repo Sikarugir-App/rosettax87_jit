@@ -18,6 +18,10 @@ struct Offsets {
                                 // address
     uint64_t translate_insn_addr;
     uint64_t transaction_result_size_addr;
+    uint64_t runtime_base;
+    uint64_t rosettax87_base;
+    uint64_t rosettax87_size;
+    uint64_t classify_arm_pc_rva;  // classify_arm_pc offset within libRosettaRuntime
 };
 
-static_assert(sizeof(Offsets) == 0x18, "Invalid size for Offsets");
+static_assert(sizeof(Offsets) == 0x38, "Invalid size for Offsets");

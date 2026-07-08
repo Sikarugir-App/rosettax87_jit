@@ -1,7 +1,9 @@
 // clang-format off
 #include "X87.h"
 
+#include <csignal>
 #include <cstring>
+#include <sys/syscall.h>
 
 #include "Export.h"
 #include "Offsets.h"
@@ -23,6 +25,9 @@
 #include "rosetta_core/CoreConfig.h"
 #include "rosetta_core/Opcode.h"
 #include "rosetta_core/RosettaCore.h"
+// Capture the real `struct sigaction` type before RuntimeLibC.h's
+// `#define sigaction rt_sigaction` alias, which would otherwise rewrite the tag.
+using rt_sigaction_t = struct sigaction;
 #include "rosetta_core/RuntimeLibC.h"
 #include "RuntimeConfig.h"
 // clang-format on
@@ -61,10 +66,16 @@ void* init_library(SymbolList const* a1, uint64_t a2, ThreadContextOffsets const
     uintptr_t translation_ptr = runtime_library_base + kOffsets.translate_insn_addr;
     uintptr_t transaction_result_size_addr =
         runtime_library_base + kOffsets.transaction_result_size_addr;
+    uintptr_t classify_arm_pc_ptr = kOffsets.runtime_base + kOffsets.classify_arm_pc_rva;
 
-    printf("Installing JIT Translation Hook at 0x%llx\n", translation_ptr);
-    rosetta_core_init(kImports.version, translation_ptr, transaction_result_size_addr);
-    printf("JIT Translation Hook installed\n");
+    rosetta_core_init({
+        .runtime_version = kImports.version,
+        .translate_insn_addr = translation_ptr,
+        .transaction_result_size_addr = transaction_result_size_addr,
+        .classify_arm_pc_addr = classify_arm_pc_ptr,
+        .rosettax87_base = kOffsets.rosettax87_base,
+        .rosettax87_size = kOffsets.rosettax87_size,
+    });
 
     return orig_init_library(a1, a2, a3);
 }
@@ -88,9 +99,11 @@ X87_TRAMPOLINE(translator_get_branch_entries, x9)
 X87_TRAMPOLINE(translator_get_instruction_offsets, x9)
 X87_TRAMPOLINE(translator_apply_fixups, x9)
 
+
 void x87_init(X87State* state) {
     SIMDGuard simdGuard;
     LOG(1, "x87_init\n", 9);
+
     *state = X87State();
 }
 
