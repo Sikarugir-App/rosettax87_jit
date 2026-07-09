@@ -397,6 +397,168 @@ static void pass_f32_narrow(Context& ctx) {
     }
 }
 
+// ── Pass 2.6 (opt-in): f32 chain arithmetic ─────────────────────────────────
+//
+// ROSETTA_X87_F32_ARITH=1: keep INTERMEDIATE values of f32-sourced arithmetic
+// chains in f32 (fld m32; fadd m32; fmul m32; fstp m32 runs entirely in S
+// registers). Unlike pass_f32_narrow this is NOT bit-exact — x87 code
+// computed the intermediates in f64 — hence the opt-in flag.
+//
+// Fixpoint: a candidate f64 arithmetic node is f32-eligible while
+//   - every input is a widen of a raw-f32 value, a raw-f32 producer
+//     (kF32 arithmetic), ConstZero (an S read of a zeroed D is 0.0f), or
+//     another eligible node, and
+//   - every use is a CvtF64ToF32 or another eligible node — in particular it
+//     is not a final stack value (slots stay f64) and feeds no compare/FMA.
+// Eligible nodes are flipped to kF32 with widen inputs unwrapped; narrows of
+// flipped producers become copies and are bypassed. Orphans die in pass_dse.
+
+static void pass_f32_chain(Context& ctx) {
+    bool elig[kMaxNodes] = {};
+    int8_t nin_of[kMaxNodes];
+    bool any = false;
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & (kDead | kF32)) continue;
+        int nin;
+        if (f32_narrowable_op(n.op, &nin)) {
+            elig[i] = true;
+            nin_of[i] = static_cast<int8_t>(nin);
+            any = true;
+        }
+    }
+    if (!any) return;
+
+    // Final stack values must stay f64.
+    for (int d = 0; d < 8; d++) {
+        if (ctx.slot_val[d] >= 0 && ctx.slot_val[d] < ctx.num_nodes)
+            elig[ctx.slot_val[d]] = false;
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < ctx.num_nodes; i++) {
+            const auto& n = ctx.nodes[i];
+            if (n.flags & kDead) continue;
+            // Input legality for eligible nodes.
+            if (elig[i]) {
+                for (int j = 0; j < nin_of[i]; j++) {
+                    const int16_t in = n.inputs[j];
+                    const bool ok =
+                        in >= 0 && in < ctx.num_nodes &&
+                        !(ctx.nodes[in].flags & kDead) &&
+                        (ctx.nodes[in].op == Op::CvtF32ToF64 ||
+                         (ctx.nodes[in].flags & kF32) ||
+                         ctx.nodes[in].op == Op::ConstZero || elig[in]);
+                    if (!ok) {
+                        elig[i] = false;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            // Use legality: only a narrow or an eligible node may consume an
+            // eligible value.
+            const bool consumer_ok = (n.op == Op::CvtF64ToF32) || elig[i];
+            if (consumer_ok) continue;
+            for (int j = 0; j < 3; j++) {
+                const int16_t in = n.inputs[j];
+                if (in >= 0 && in < ctx.num_nodes && elig[in]) {
+                    elig[in] = false;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // Flip eligible nodes to f32 and unwrap their widen inputs.
+    any = false;
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        if (!elig[i]) continue;
+        auto& n = ctx.nodes[i];
+        n.flags |= kF32;
+        for (int j = 0; j < nin_of[i]; j++) {
+            const int16_t in = n.inputs[j];
+            if (ctx.nodes[in].op == Op::CvtF32ToF64)
+                n.inputs[j] = ctx.nodes[in].inputs[0];
+        }
+        any = true;
+    }
+    if (!any) return;
+
+    // Narrows of flipped producers are now copies — bypass and kill them.
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        if (n.op != Op::CvtF64ToF32) continue;
+        const int16_t src = n.inputs[0];
+        if (src < 0 || src >= ctx.num_nodes || !elig[src]) continue;
+        for (int k = 0; k < ctx.num_nodes; k++) {
+            auto& u = ctx.nodes[k];
+            if (u.flags & kDead) continue;
+            for (int j = 0; j < 3; j++) {
+                if (u.inputs[j] == i) u.inputs[j] = src;
+            }
+        }
+        n.flags |= kDead;
+    }
+}
+
+// ── Pass 2.7 (opt-in): f32 FMA ──────────────────────────────────────────────
+//
+// Same shapes as pass_fma, restricted to kF32 nodes produced by
+// pass_f32_chain (the f32 FMA vs mul+add difference is within the fidelity
+// class the flag already accepts).
+
+static void pass_f32_fma(Context& ctx) {
+    int16_t use_count[kMaxNodes] = {};
+    for (int d = 0; d < 8; d++) {
+        if (ctx.slot_val[d] >= 0 && ctx.slot_val[d] < ctx.num_nodes)
+            use_count[ctx.slot_val[d]]++;
+    }
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        for (int j = 0; j < 3; j++) {
+            if (n.inputs[j] >= 0) use_count[n.inputs[j]]++;
+        }
+    }
+
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        if (!(n.flags & kF32)) continue;
+        if (n.op != Op::FAdd && n.op != Op::FSub) continue;
+
+        auto try_fuse = [&](int mul_idx) -> bool {
+            const int16_t mul_id = n.inputs[mul_idx];
+            const int16_t other_id = n.inputs[1 - mul_idx];
+            if (mul_id < 0 || mul_id >= ctx.num_nodes) return false;
+            auto& mul = ctx.nodes[mul_id];
+            if (mul.op != Op::FMul || !(mul.flags & kF32)) return false;
+            if (mul.flags & kDead) return false;
+            if (use_count[mul_id] != 1) return false;
+
+            if (n.op == Op::FAdd)
+                n.op = Op::FMAdd;
+            else
+                n.op = (mul_idx == 0) ? Op::FNMSub : Op::FMSub;
+            n.inputs[0] = mul.inputs[0];
+            n.inputs[1] = mul.inputs[1];
+            n.inputs[2] = other_id;
+            mul.flags |= kDead;
+            use_count[mul_id] = 0;
+            if (mul.inputs[0] >= 0) use_count[mul.inputs[0]]++;
+            if (mul.inputs[1] >= 0) use_count[mul.inputs[1]]++;
+            return true;
+        };
+
+        if (!try_fuse(0))
+            try_fuse(1);
+    }
+}
+
 // ── Pass 3: FCOM + FSTSW Fusion ─────────────────────────────────────────────
 //
 // If a FCmp/FTst node is immediately followed by a FStsw with no intervening
@@ -438,10 +600,24 @@ void optimize(Context& ctx) {
     pass_const_arith(ctx);
     pass_dse(ctx);
     pass_fneg_fold(ctx);
-    pass_fma(ctx);
-    if (!(g_rosetta_config && g_rosetta_config->disable_f32_narrow)) {
+    const bool f32_narrow_on =
+        !(g_rosetta_config && g_rosetta_config->disable_f32_narrow);
+    const bool f32_chain_on =
+        f32_narrow_on && g_rosetta_config && g_rosetta_config->f32_arith;
+    if (f32_chain_on) {
+        // Chains must form before f64 FMA fusion claims the mul+add pairs;
+        // pass_fma then fuses whatever stayed f64.
         pass_f32_narrow(ctx);
-        pass_dse(ctx);  // reap widens orphaned by the narrowing rewrite
+        pass_f32_chain(ctx);
+        pass_f32_fma(ctx);
+        pass_fma(ctx);
+        pass_dse(ctx);  // reap widens orphaned by the f32 rewrites
+    } else {
+        pass_fma(ctx);
+        if (f32_narrow_on) {
+            pass_f32_narrow(ctx);
+            pass_dse(ctx);
+        }
     }
     pass_fcom_fstsw_fusion(ctx);
 }

@@ -711,35 +711,21 @@ void lower(Context& ctx, TranslationResult* result) {
         }
 
         // ── FMA ─────────────────────────────────────────────────────────
-        case Op::FMAdd: {
-            // FMADD Dd, Dn, Dm, Da → Da + Dn * Dm
-            // inputs[0] = Dn, inputs[1] = Dm, inputs[2] = Da
-            int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
-            int Da = fprs.get(n.inputs[2]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
-            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fmadd_f64(buf, Dd, Dn, Dm, Da);
-            break;
-        }
-        case Op::FMSub: {
-            // FMSUB Dd, Dn, Dm, Da → Da - Dn * Dm
-            int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
-            int Da = fprs.get(n.inputs[2]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
-            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fmsub_f64(buf, Dd, Dn, Dm, Da);
-            break;
-        }
+        // FMAdd:  Da + Dn * Dm    FMSub: Da - Dn * Dm    FNMSub: Dn * Dm - Da
+        // inputs[0] = Dn, inputs[1] = Dm, inputs[2] = Da.
+        // kF32 nodes (opt-in f32 chains) use the S-form encoding.
+        case Op::FMAdd:
+        case Op::FMSub:
         case Op::FNMSub: {
-            // FNMSUB Dd, Dn, Dm, Da → Dn * Dm - Da
             int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
             int Da = fprs.get(n.inputs[2]);
             int Dd = fprs.try_reuse_input(ctx, i);
             if (Dd < 0) Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fnmsub_f64(buf, Dd, Dn, Dm, Da);
+            const int o1 = (n.op == Op::FNMSub) ? 1 : 0;
+            const int o0 = (n.op == Op::FMAdd) ? 0 : 1;
+            emit_fp_dp3(buf, /*type=*/(n.flags & kF32) ? 0 : 1, o1, o0,
+                        Dd, Dn, Dm, Da);
             break;
         }
 
