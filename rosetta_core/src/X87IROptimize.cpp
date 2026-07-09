@@ -43,7 +43,23 @@ static void pass_dead_compares(Context& ctx) {
 //     in place).
 //   FCmp(x, ±0.0 const) → FTst(x)  — FCMP #0.0 compares -0 == +0, matching
 //     FCOM semantics; drops the constant materialization.
+//   Identity folds (IEEE-exact for every input incl. ±0/NaN):
+//     FMul(x, 1.0), FMul(1.0, x), FDiv(x, 1.0) → x
+//     FSub(x, +0.0) → x     FAdd(x, -0.0) → x
+//     (x + (+0.0) and x - (-0.0) are NOT identities: they flip -0 to +0.)
 // Runs before pass_dse so orphaned constants are reaped.
+
+// True if node c is a live constant with the given f64 bit pattern.
+// alias_op (< 0 = none): the dedicated Const node kind for this value
+// (ConstOne for 1.0, ConstZero for +0.0).
+static bool const_is(const Context& ctx, int16_t c, int alias_op,
+                     uint64_t f64_bits) {
+    if (c < 0 || c >= ctx.num_nodes) return false;
+    const auto& cn = ctx.nodes[c];
+    if (cn.flags & kDead) return false;
+    if (alias_op >= 0 && cn.op == static_cast<Op>(alias_op)) return true;
+    return cn.op == Op::ConstF64 && cn.imm_bits == f64_bits;
+}
 
 static void pass_const_arith(Context& ctx) {
     int16_t use_count[kMaxNodes] = {};
@@ -59,9 +75,53 @@ static void pass_const_arith(Context& ctx) {
         }
     }
 
+    // Replace every use of node i (a folded identity) with node keep and
+    // kill i plus its constant operand if orphaned.
+    auto fold_to = [&](int16_t i, int16_t keep, int16_t c) {
+        for (int k = 0; k < ctx.num_nodes; k++) {
+            auto& u = ctx.nodes[k];
+            if (u.flags & kDead) continue;
+            for (int j = 0; j < 3; j++) {
+                if (u.inputs[j] == i) u.inputs[j] = keep;
+            }
+        }
+        for (int d = 0; d < 8; d++) {
+            if (ctx.slot_val[d] == i) ctx.slot_val[d] = keep;
+        }
+        use_count[keep] = static_cast<int16_t>(use_count[keep] + use_count[i] - 1);
+        use_count[i] = 0;
+        ctx.nodes[i].flags |= kDead;
+        if (--use_count[c] == 0) ctx.nodes[c].flags |= kDead;
+    };
+
+    constexpr uint64_t kOneBits = 0x3FF0000000000000ULL;
+    constexpr uint64_t kMZeroBits = 0x8000000000000000ULL;
+
     for (int i = 0; i < ctx.num_nodes; i++) {
         auto& n = ctx.nodes[i];
         if (n.flags & kDead) continue;
+
+        // Identity folds.
+        {
+            int16_t keep = -1, cidx = -1;
+            if ((n.op == Op::FMul || n.op == Op::FDiv) &&
+                const_is(ctx, n.inputs[1], static_cast<int>(Op::ConstOne), kOneBits)) {
+                keep = n.inputs[0]; cidx = n.inputs[1];
+            } else if (n.op == Op::FMul &&
+                       const_is(ctx, n.inputs[0], static_cast<int>(Op::ConstOne), kOneBits)) {
+                keep = n.inputs[1]; cidx = n.inputs[0];
+            } else if (n.op == Op::FSub &&
+                       const_is(ctx, n.inputs[1], static_cast<int>(Op::ConstZero), 0)) {
+                keep = n.inputs[0]; cidx = n.inputs[1];
+            } else if (n.op == Op::FAdd &&
+                       const_is(ctx, n.inputs[1], /*alias_op=*/-1, kMZeroBits)) {
+                keep = n.inputs[0]; cidx = n.inputs[1];
+            }
+            if (keep >= 0) {
+                fold_to(static_cast<int16_t>(i), keep, cidx);
+                continue;
+            }
+        }
 
         if (n.op == Op::FDiv) {
             int16_t c = n.inputs[1];
