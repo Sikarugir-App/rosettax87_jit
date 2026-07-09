@@ -115,6 +115,20 @@ struct FPRState {
 // sit between the run and the redefinition. Anything unknown — including
 // reaching block end, since the terminator may be a JCC and Rosetta itself
 // treats flags as live across RET/CALL — keeps the conservative pair.
+
+// Shift count when provably a compile-time constant: -1 for CL/memory/unknown
+// forms, else the masked count. The 0x1F mask under-approximates the 0x3F
+// mask of 64-bit shifts (counts 32–63 report 0 → treated as flag-preserving
+// "unknown" by callers), which is the conservative direction.
+static int shift_imm_count(const IRInstr* t) {
+    if (t->num_operands < 2) return -1;
+    const auto& c = t->operands[1];
+    if (c.kind == IROperandKind::Register || c.kind == IROperandKind::MemRef ||
+        c.kind == IROperandKind::AbsMem)
+        return -1;
+    return static_cast<int>(c.imm.value & 0x1F);
+}
+
 static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_t end_idx) {
     for (int64_t i = end_idx; i < num_instrs; i++) {
         switch (instr_array[i].opcode()) {
@@ -127,7 +141,23 @@ static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_
             case kOpcodeName_cmp:
             case kOpcodeName_add:
             case kOpcodeName_sub:
+            case kOpcodeName_neg:   // CF/OF/SF/ZF/PF all defined
+            // MUL/IMUL define CF/OF; SF/ZF/PF are architecturally undefined,
+            // so no correct guest reads them — dead either way.
+            case kOpcodeName_mul:
+            case kOpcodeName_imul:
                 return true;
+            // Immediate-count shifts: count != 0 defines CF/SF/ZF/PF (OF
+            // undefined for count > 1 — within the standard above); count == 0
+            // leaves EFLAGS untouched (flag-neutral). CL-count is unknown.
+            case kOpcodeName_shl:
+            case kOpcodeName_shr:
+            case kOpcodeName_sar: {
+                const int cnt = shift_imm_count(&instr_array[i]);
+                if (cnt > 0) return true;
+                if (cnt == 0) continue;
+                return false;
+            }
             // Flag-neutral instructions (neither read nor write EFLAGS).
             case kOpcodeName_mov:
             case kOpcodeName_movzx:
@@ -137,6 +167,14 @@ static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_
             case kOpcodeName_push:
             case kOpcodeName_pop:
             case kOpcodeName_nop:
+            case kOpcodeName_not:   // NOT writes no flags
+            case kOpcodeName_xchg:
+            case kOpcodeName_leave:
+            case kOpcodeName_cbw:
+            case kOpcodeName_cwde:
+            case kOpcodeName_cdqe:
+            case kOpcodeName_cwd:
+            case kOpcodeName_cdq:
                 continue;
             default:
                 return false;  // reader / partial definer / unknown
@@ -1652,7 +1690,8 @@ static bool no_parity_reader_after(IRInstr* instr_array, int64_t num_instrs,
             // PF definers: the TEST's parity dies here. (This scan only
             // guards parity — N/Z/C/V from the fused TST are exact — so
             // partial-EFLAGS definers like INC/DEC/NEG, which leave CF alone
-            // but define PF, terminate it too.)
+            // but define PF, terminate it too. MUL/IMUL leave PF
+            // architecturally undefined — dead for correct guests.)
             case kOpcodeName_and:
             case kOpcodeName_or:
             case kOpcodeName_xor:
@@ -1663,7 +1702,19 @@ static bool no_parity_reader_after(IRInstr* instr_array, int64_t num_instrs,
             case kOpcodeName_inc:
             case kOpcodeName_dec:
             case kOpcodeName_neg:
+            case kOpcodeName_mul:
+            case kOpcodeName_imul:
                 return true;
+            // Immediate-count shifts: count != 0 defines PF; count == 0 is
+            // flag-neutral; CL-count is unknown.
+            case kOpcodeName_shl:
+            case kOpcodeName_shr:
+            case kOpcodeName_sar: {
+                const int cnt = shift_imm_count(&instr_array[i]);
+                if (cnt > 0) return true;
+                if (cnt == 0) continue;
+                return false;
+            }
             // Flag-neutral.
             case kOpcodeName_mov:
             case kOpcodeName_movzx:
@@ -1673,6 +1724,14 @@ static bool no_parity_reader_after(IRInstr* instr_array, int64_t num_instrs,
             case kOpcodeName_push:
             case kOpcodeName_pop:
             case kOpcodeName_nop:
+            case kOpcodeName_not:
+            case kOpcodeName_xchg:
+            case kOpcodeName_leave:
+            case kOpcodeName_cbw:
+            case kOpcodeName_cwde:
+            case kOpcodeName_cdqe:
+            case kOpcodeName_cwd:
+            case kOpcodeName_cdq:
                 continue;
             default:
                 return false;
