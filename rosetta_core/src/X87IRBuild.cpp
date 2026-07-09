@@ -101,6 +101,62 @@ static bool mem_operand_equal(const IROperand* a, const IROperand* b) {
     return false;
 }
 
+static int mem_operand_width(const IROperand* op) {
+    const IROperandSize sz =
+        (op->kind == IROperandKind::AbsMem) ? op->abs_mem.size : op->mem.size;
+    switch (sz) {
+        case IROperandSize::S16: return 2;
+        case IROperandSize::S32: return 4;
+        case IROperandSize::S64: return 8;
+        default: return 0;  // unknown width — treated as may-alias
+    }
+}
+
+// Provably disjoint accesses: same-kind operands whose address expressions
+// share the exact same dynamic base (registers cannot change within a run)
+// and whose [disp, disp+width) byte ranges do not overlap. Anything not
+// provable — different base registers, segment overrides, mixed kinds —
+// counts as aliasing. 32-bit addressing note: disps are compared without
+// mod-2^32 wrap, the same (documented) divergence the base-address cache
+// accepts — only reachable via pointer wraparound.
+static bool mem_operands_no_alias(const IROperand* a, const IROperand* b) {
+    const int aw = mem_operand_width(a), bw = mem_operand_width(b);
+    if (aw == 0 || bw == 0) return false;
+    if (a->kind == IROperandKind::MemRef && b->kind == IROperandKind::MemRef) {
+        if (a->mem.seg_override != 0 || b->mem.seg_override != 0) return false;
+        if (a->mem.addr_size != b->mem.addr_size ||
+            a->mem.mem_flags != b->mem.mem_flags ||
+            a->mem.base_reg != b->mem.base_reg ||
+            a->mem.index_reg != b->mem.index_reg ||
+            a->mem.shift_amount != b->mem.shift_amount)
+            return false;
+        return a->mem.disp + aw <= b->mem.disp || b->mem.disp + bw <= a->mem.disp;
+    }
+    if (a->kind == IROperandKind::AbsMem && b->kind == IROperandKind::AbsMem) {
+        uint64_t aa = static_cast<uint64_t>(a->abs_mem.value);
+        uint64_t ba = static_cast<uint64_t>(b->abs_mem.value);
+        if (a->abs_mem.addr_size == IROperandSize::S32) aa &= 0xFFFFFFFFu;
+        if (b->abs_mem.addr_size == IROperandSize::S32) ba &= 0xFFFFFFFFu;
+        return aa + aw <= ba || ba + bw <= aa;
+    }
+    return false;
+}
+
+// Drop every CSE entry the store may alias, keeping proven-disjoint ones.
+static void mem_cse_evict_may_alias(Context& ctx, const IROperand* store_op) {
+    int kept = 0;
+    for (int i = 0; i < ctx.mem_cse_count; i++) {
+        if (mem_operands_no_alias(ctx.mem_cse_op[i], store_op)) {
+            ctx.mem_cse_op[kept] = ctx.mem_cse_op[i];
+            ctx.mem_cse_kind[kept] = ctx.mem_cse_kind[i];
+            ctx.mem_cse_val[kept] = ctx.mem_cse_val[i];
+            kept++;
+        }
+    }
+    ctx.mem_cse_count = static_cast<int8_t>(kept);
+    ctx.mem_cse_next = 0;
+}
+
 static int16_t mem_cse_lookup(Context& ctx, const IROperand* op, Op kind) {
     for (int i = 0; i < ctx.mem_cse_count; i++) {
         if (ctx.mem_cse_kind[i] == kind && mem_operand_equal(ctx.mem_cse_op[i], op))
@@ -243,13 +299,14 @@ static bool build_fp_store(Context& ctx, IROperand* op, int16_t val_node) {
     auto id = ctx.add_node(store_op, store_val);
     if (id < 0) return false;
     ctx.nodes[id].mem_operand = op;
-    // The store may alias any cached load. Then forward the stored value to
-    // later loads of the same operand. f64 round-trips are bit-exact; for f32
+    // Evict cached loads the store may alias (proven-disjoint entries
+    // survive). Then forward the stored value to later loads of the same
+    // operand. f64 round-trips are bit-exact; for f32
     // a reload returns widen(narrow(val)), so forward the f64 view of the
     // *narrowed* value — the original widen node when the stored value came
     // from one, else a fresh widen of the narrowed bits (DSE reaps it if no
     // later load reads it).
-    ctx.mem_cse_clear();
+    mem_cse_evict_may_alias(ctx, op);
     if (store_op == Op::StoreF64) {
         mem_cse_insert(ctx, op, Op::LoadF64, val_node);
     } else {
@@ -274,8 +331,8 @@ static bool build_int_store(Context& ctx, IROperand* op, int16_t val_node, bool 
     if (id < 0) return false;
     ctx.nodes[id].mem_operand = op;
     if (truncate) ctx.nodes[id].flags |= kTruncate;
-    // May alias any cached load; no forwarding (f64→int isn't invertible).
-    ctx.mem_cse_clear();
+    // Evict may-aliasing entries; no forwarding (f64→int isn't invertible).
+    mem_cse_evict_may_alias(ctx, op);
     return true;
 }
 
@@ -778,8 +835,8 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 auto id = ctx.add_node(Op::LoadCW);
                 if (id < 0) { ok = false; break; }
                 ctx.nodes[id].mem_operand = &instr->operands[0];
-                // Writes guest memory — may alias any cached load.
-                ctx.mem_cse_clear();
+                // Writes guest memory — evict may-aliasing cached loads.
+                mem_cse_evict_may_alias(ctx, &instr->operands[0]);
                 break;
             }
 
