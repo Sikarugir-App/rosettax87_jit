@@ -100,6 +100,7 @@ struct RosettaConfig {
     uint8_t  force_cpu_mode32;       // ROSETTA_FORCE_CPU_MODE32=1 — force the decoder into 32-bit mode (test-only; lets aotinvoke reach legacy opcodes like ARPL)
     uint8_t  disable_f32_narrow;     // ROSETTA_X87_DISABLE_F32_NARROW=1 — don't rewrite narrow(op_f64(widen,widen)) to S-form arithmetic
     uint8_t  f32_arith;              // ROSETTA_X87_F32_ARITH=1 — keep f32-sourced arithmetic CHAINS in f32 (not bit-exact vs f64 intermediates; opt-in)
+    uint8_t  fast_recip_div;         // ROSETTA_X87_FAST_RECIP_DIV=1 — FDiv by ANY normal constant → FMul by reciprocal (up to 1 ulp off; opt-in)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

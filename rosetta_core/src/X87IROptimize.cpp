@@ -1,5 +1,7 @@
 #include "rosetta_core/X87IR.h"
 
+#include <cstring>
+
 #include "rosetta_config/Config.h"
 #include "rosetta_core/CoreConfig.h"
 
@@ -131,10 +133,25 @@ static void pass_const_arith(Context& ctx) {
                 continue;
             const uint64_t b = cn.imm_bits;
             const uint64_t exp = (b >> 52) & 0x7FF;
-            // ±2^k with both value and reciprocal normal.
+            // ±2^k with both value and reciprocal normal — exact.
             if ((b & 0x000FFFFFFFFFFFFFULL) == 0 && exp >= 1 && exp <= 2045) {
                 cn.imm_bits = (b & 0x8000000000000000ULL) | ((2046 - exp) << 52);
                 n.op = Op::FMul;
+            } else if (g_rosetta_config && g_rosetta_config->fast_recip_div &&
+                       exp >= 1 && exp <= 2046) {
+                // Opt-in: any normal divisor whose reciprocal is also normal.
+                // x * (1/d) differs from x / d by at most 1 ulp — the classic
+                // fast-division fidelity trade.
+                double d, r;
+                memcpy(&d, &b, 8);
+                r = 1.0 / d;
+                uint64_t rb;
+                memcpy(&rb, &r, 8);
+                const uint64_t rexp = (rb >> 52) & 0x7FF;
+                if (rexp >= 1 && rexp <= 2046) {
+                    cn.imm_bits = rb;
+                    n.op = Op::FMul;
+                }
             }
         } else if (n.op == Op::FCmp) {
             int16_t c = n.inputs[1];
