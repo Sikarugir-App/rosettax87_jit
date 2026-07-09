@@ -37,12 +37,14 @@ T load_symbol(void* handle, const char* name) {
 }
 
 bool find_patterns(uintptr_t aot_base, uintptr_t& trans_insn_addr,
-                   uintptr_t& transaction_result_size_addr) {
+                   uintptr_t& transaction_result_size_addr, uintptr_t& decode_opcode_addr) {
     static const std::array<uint8_t, 36> translate_insn_pattern = {
         0xFF, 0x43, 0x03, 0xD1, 0xFC, 0x6F, 0x07, 0xA9, 0xFA, 0x67, 0x08, 0xA9,
         0xF8, 0x5F, 0x09, 0xA9, 0xF6, 0x57, 0x0A, 0xA9, 0xF4, 0x4F, 0x0B, 0xA9,
         0xFD, 0x7B, 0x0C, 0xA9, 0xFD, 0x03, 0x03, 0x91, 0xF3, 0x03, 0x00, 0xAA};
     static const std::array<uint8_t, 4> transaction_result_size_pattern = {0x00, 0x51, 0x80, 0x52};
+    // Matches mid-instruction at a decode_opcode call site; the BL is at match + 0x0F.
+    static const std::array<uint8_t, 4> decode_opcode_pattern = {0xA3, 0x00, 0x91, 0xE2};
     // look up __TEXT, __text section
 
     mach_header_64* header = (mach_header_64*)aot_base;
@@ -73,29 +75,45 @@ bool find_patterns(uintptr_t aot_base, uintptr_t& trans_insn_addr,
 
     trans_insn_addr = 0;
     transaction_result_size_addr = 0;
+    decode_opcode_addr = 0;
 
     for (size_t offset = 0; offset < text_section->size; offset++) {
+        uintptr_t p = aot_base + text_section->offset + offset;
+
         if (trans_insn_addr == 0) {
-            if (std::memcmp((void*)(aot_base + text_section->offset + offset),
-                            translate_insn_pattern.data(), translate_insn_pattern.size()) == 0) {
-                trans_insn_addr = aot_base + text_section->offset + offset;
+            if (std::memcmp((void*)p, translate_insn_pattern.data(),
+                            translate_insn_pattern.size()) == 0) {
+                trans_insn_addr = p;
             }
         }
 
         if (transaction_result_size_addr == 0) {
-            if (std::memcmp((void*)(aot_base + text_section->offset + offset),
-                            transaction_result_size_pattern.data(),
+            if (std::memcmp((void*)p, transaction_result_size_pattern.data(),
                             transaction_result_size_pattern.size()) == 0) {
-                transaction_result_size_addr = aot_base + text_section->offset + offset;
+                transaction_result_size_addr = p;
             }
         }
 
-        if (trans_insn_addr != 0 && transaction_result_size_addr != 0) {
+        if (decode_opcode_addr == 0) {
+            if (std::memcmp((void*)p, decode_opcode_pattern.data(),
+                            decode_opcode_pattern.size()) == 0) {
+                // The BL is at match + 0x0F (pattern starts mid-instruction).
+                uintptr_t bl_ptr = p + 0x0F;
+                uint32_t bl = *reinterpret_cast<uint32_t*>(bl_ptr);
+                int32_t imm26 = bl & 0x03FFFFFF;
+                if (imm26 & (1 << 25))
+                    imm26 |= ~0x03FFFFFF;  // sign-extend from 26 bits
+                decode_opcode_addr = bl_ptr + ((int64_t)imm26 << 2);
+            }
+        }
+
+        if (trans_insn_addr != 0 && transaction_result_size_addr != 0 &&
+            decode_opcode_addr != 0) {
             break;
         }
     }
 
-    return trans_insn_addr != 0 && transaction_result_size_addr != 0;
+    return trans_insn_addr != 0 && transaction_result_size_addr != 0 && decode_opcode_addr != 0;
 }
 
 bool load_rosetta_aot() {
@@ -198,7 +216,8 @@ bool load_rosetta_aot() {
     g_rosetta_aot.base_addr = reinterpret_cast<uintptr_t>(dl_info.dli_fbase);
 
     return find_patterns(g_rosetta_aot.base_addr, g_rosetta_aot.translate_insn_addr,
-                         g_rosetta_aot.transaction_result_size_addr);
+                         g_rosetta_aot.transaction_result_size_addr,
+                         g_rosetta_aot.decode_opcode_addr);
 }
 
 /*

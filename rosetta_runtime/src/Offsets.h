@@ -12,8 +12,9 @@ struct Offsets {
     uint64_t rosettax87_base;
     uint64_t rosettax87_size;
     uint64_t classify_arm_pc_rva;  // classify_arm_pc offset within libRosettaRuntime
+    uint64_t decode_opcode_rva;    // decode_opcode offset within libRosettaRuntime
 };
 
-static_assert(sizeof(Offsets) == 0x38, "Invalid size for Offsets");
+static_assert(sizeof(Offsets) == 0x40, "Invalid size for Offsets");
 
 extern Offsets kOffsets;

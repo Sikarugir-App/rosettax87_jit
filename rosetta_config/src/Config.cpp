@@ -135,6 +135,9 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_FUSE_FCOM_TEST"))
         cfg.fuse_fcom_test = (*v == '1') ? 1 : 0;
 
+    if (const char* v = std::getenv("ROSETTA_FORCE_CPU_MODE32"))
+        cfg.force_cpu_mode32 = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')
             cfg.disabled_ops_mask = ~0ULL;

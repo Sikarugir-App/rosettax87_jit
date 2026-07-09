@@ -69,6 +69,8 @@ ALL_TESTS=(
     test_const_promote
     test_f32_raw
     test_fuse_fcom_test
+    test_decoder_fcomp_st
+    test_decoder_arpl
 )
 
 RED='\033[0;31m'
@@ -121,6 +123,12 @@ check_output() {
         echo -e "${RED}FAIL${NC}  $name"
         FAILED=$((FAILED + 1))
         echo "$out" | grep -E 'FAIL' | head -10 | sed 's/^/      /'
+    elif echo "$out" | grep -qE 'SKIP'; then
+        # Test self-reported SKIP (e.g. an opcode unsupported in this env, like
+        # the 32-bit ARPL / DC-D8 tests under native Rosetta). Not a pass.
+        echo -e "${YELLOW}SKIP${NC}  $name"
+        ERRORS=$((ERRORS + 1))
+        echo "$out" | grep -E 'SKIP' | head -1 | sed 's/^/      /'
     else
         echo -e "${GREEN}PASS${NC}  $name"
         PASSED=$((PASSED + 1))

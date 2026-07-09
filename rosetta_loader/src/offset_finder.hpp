@@ -16,4 +16,5 @@ struct OffsetFinder {
     std::uint64_t offsetTranslateInsn_;
     std::uint64_t offsetInitLibrary_;
     std::uint64_t offsetClassifyArmPc_;
+    std::uint64_t offsetDecodeOpcode_;
 };

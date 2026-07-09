@@ -67,12 +67,14 @@ void* init_library(SymbolList const* a1, uint64_t a2, ThreadContextOffsets const
     uintptr_t transaction_result_size_addr =
         runtime_library_base + kOffsets.transaction_result_size_addr;
     uintptr_t classify_arm_pc_ptr = kOffsets.runtime_base + kOffsets.classify_arm_pc_rva;
+    uintptr_t decode_opcode_ptr = runtime_library_base + kOffsets.decode_opcode_rva;
 
     rosetta_core_init({
         .runtime_version = kImports.version,
         .translate_insn_addr = translation_ptr,
         .transaction_result_size_addr = transaction_result_size_addr,
         .classify_arm_pc_addr = classify_arm_pc_ptr,
+        .decode_opcode_addr = decode_opcode_ptr,
         .rosettax87_base = kOffsets.rosettax87_base,
         .rosettax87_size = kOffsets.rosettax87_size,
     });

@@ -1,21 +1,32 @@
 name: Build and Release
 
 on:
-  push:
+  # Only run after CI completes on main, so we never publish a build that
+  # failed its tests. (workflow_run fires on the default branch's copy of this
+  # file, and only for the CI workflow's own triggers — i.e. pushes to main.)
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-26
+    # Gate on CI success. On workflow_dispatch there is no triggering run, so
+    # allow that through too.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     permissions:
       contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Select Xcode 15
-        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+        with:
+          # Build the exact commit CI validated (workflow_run checks out the
+          # default branch tip by default, which may have moved on).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Configure CMake
         run: cmake -B build
@@ -40,27 +51,12 @@ jobs:
           tar czf ../rosettax87-jit-macos-arm64.tar.gz .
 
       - name: Update latest release
-        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: Latest Build (${{ github.sha }})
+          name: Latest Build (${{ github.event.workflow_run.head_sha || github.sha }})
           prerelease: true
           make_latest: false
-          files: |
-            rosettax87-jit-macos-arm64.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create versioned release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: rosettax87_jit ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
           files: |
             rosettax87-jit-macos-arm64.tar.gz
         env:

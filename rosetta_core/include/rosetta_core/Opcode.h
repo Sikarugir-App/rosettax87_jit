@@ -672,6 +672,7 @@ enum Opcode : uint16_t {
     kOpcodeName_xrstor = 0x299,
     kOpcodeName_xsave = 0x29A,
     kOpcodeName_xsetbv = 0x29B,
+    kOpcodeName_arpl = 0x29C,
 };
 
-extern std::array<const char*, 0x29c> kOpcodeNames;
+extern std::array<const char*, 0x29d> kOpcodeNames;

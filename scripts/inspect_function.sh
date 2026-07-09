@@ -11,6 +11,10 @@
 #   --disable-all-ops      ROSETTA_X87_DISABLE_ALL_OPS=1
 #   --disable-all-fusions  ROSETTA_X87_DISABLE_ALL_FUSIONS=1
 #   --env VAR=VAL          Pass arbitrary env var to aotinvoke (repeatable)
+#   --no-verbose           Skip aotinvoke --verbose (the IR dump). Needed for
+#                          opcodes whose verbose printer isn't wired up (e.g. the
+#                          synthetic ARPL), where --verbose hangs; the AArch64
+#                          disassembly is still produced.
 #
 # Examples:
 #   scripts/inspect_function.sh build/bin/test_x87_full do_fcmov --opcode fcmovu
@@ -66,9 +70,11 @@ ALL_FUSIONS=(
 
 # ---- parse optional arguments ------------------------------------------------
 EXTRA_ENV=()
+VERBOSE=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --no-verbose)          VERBOSE=0; shift ;;
         --opcode)
             op="$2"; shift 2
             others=$(printf '%s\n' "${ALL_OPCODES[@]}" | grep -vFx "$op" | paste -s -d ',' -)
@@ -174,8 +180,12 @@ TRANSLATED="$WORK/translated.bin"
 dd if="$BINARY" bs=1 skip="$FILE_POS" count="$FN_SIZE" of="$EXTRACTED" 2>/dev/null
 
 # ---- 4. Translate to AArch64 via aotinvoke ----------------------------------
-echo "=== x86 IR: $SYMBOL ==="
-env "${EXTRA_ENV[@]}" "$AOTINVOKE" "$EXTRACTED" "$TRANSLATED" --verbose
+if [[ $VERBOSE -eq 1 ]]; then
+    echo "=== x86 IR: $SYMBOL ==="
+    env "${EXTRA_ENV[@]}" "$AOTINVOKE" "$EXTRACTED" "$TRANSLATED" --verbose
+else
+    env "${EXTRA_ENV[@]}" "$AOTINVOKE" "$EXTRACTED" "$TRANSLATED"
+fi
 echo ""
 
 # ---- 5. Disassemble ---------------------------------------------------------

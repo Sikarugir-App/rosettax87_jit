@@ -36,6 +36,7 @@ int main(int argc, char** argv) {
         .translate_insn_addr = g_rosetta_aot.translate_insn_addr,
         .transaction_result_size_addr = g_rosetta_aot.transaction_result_size_addr,
         .classify_arm_pc_addr = 0,
+        .decode_opcode_addr = g_rosetta_aot.decode_opcode_addr,
         .rosettax87_base = 0,
         .rosettax87_size = 0,
     });

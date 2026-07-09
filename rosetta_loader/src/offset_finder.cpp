@@ -31,7 +31,8 @@ auto OffsetFinder::setDefaultOffsets() -> void {
 
     offsetTransactionResultSize_ = 0x0BA44;
     offsetTranslateInsn_ = 0x01A654;
-    offsetClassifyArmPc_ = 0x0B6FC;  // classify_arm_pc RVA in libRosettaRuntime (macOS 26 default)
+    offsetClassifyArmPc_ = 0x0B6FC;   // classify_arm_pc RVA in /usr/libexec/rosetta/runtime (macOS 26 default)
+    offsetDecodeOpcode_ = 0x04DED4;   // decode_opcode RVA in libRosettaRuntime (macOS 26 default)
 }
 
 auto OffsetFinder::determineOffsets() -> bool {
@@ -162,6 +163,8 @@ auto OffsetFinder::determineRuntimeOffsets() -> bool {
         0xF8, 0x5F, 0x09, 0xA9, 0xF6, 0x57, 0x0A, 0xA9, 0xF4, 0x4F, 0x0B, 0xA9,
         0xFD, 0x7B, 0x0C, 0xA9, 0xFD, 0x03, 0x03, 0x91, 0xF3, 0x03, 0x00, 0xAA};
 
+    const std::vector<unsigned char> decodeOpcode = { 0xA3, 0x00, 0x91, 0xE2 };
+
     MachoLoader libRosettaRuntimeLoader;
     if (!libRosettaRuntimeLoader.open("/Library/Apple/usr/libexec/oah/libRosettaRuntime")) {
         fprintf(stderr,
@@ -179,7 +182,7 @@ auto OffsetFinder::determineRuntimeOffsets() -> bool {
     }
 
     std::vector<std::uint64_t> results;
-    for (const auto offset : {translation_result_size_pattern, translation_pattern}) {
+    for (const auto offset : {translation_result_size_pattern, translation_pattern, decodeOpcode}) {
         const std::boyer_moore_searcher searcher(offset.begin(), offset.end());
         const auto it = std::search(libRosettaRuntimeLoader.buffer_.begin(),
                                     libRosettaRuntimeLoader.buffer_.end(), searcher);
@@ -193,7 +196,7 @@ auto OffsetFinder::determineRuntimeOffsets() -> bool {
     }
 
     // If we've stored -1 in any offset, error out and fall back to non-accelerated x87 handles.
-    if ((int)results[0] <= -1 || (int)results[1] <= -1) {
+    if ((int)results[0] <= -1 || (int)results[1] <= -1 || (int)results[2] <= -1) {
         fprintf(
             stderr,
             "Problem searching libRosettaRuntime to determine runtime offsets automatically.\n");
@@ -202,6 +205,19 @@ auto OffsetFinder::determineRuntimeOffsets() -> bool {
 
     offsetTransactionResultSize_ = results[0];
     offsetTranslateInsn_ = results[1];
+
+    // Decode the BL target at a decode_opcode call site to get the function's RVA.
+    // The pattern starts mid-instruction (byte 1 of the first ADD), so the BL is at
+    // pattern_match + 0x0F (== insn0_start + 0x10, the 5th instruction).
+    uint64_t bl_offset = results[2] + 0x0F;
+    uint32_t bl_instruction =
+        reinterpret_cast<uint32_t*>(&libRosettaRuntimeLoader.buffer_.data()[bl_offset])[0];
+
+    // Decode BL: signed imm26 (bits [25:0]), scaled by 4, PC-relative to the BL itself.
+    int32_t imm26 = bl_instruction & 0x03FFFFFF;
+    if (imm26 & (1 << 25))
+        imm26 |= ~0x03FFFFFF;  // sign-extend from 26 bits
+    offsetDecodeOpcode_ = bl_offset + ((int64_t)imm26 << 2);
 
     auto exports_section = libRosettaRuntimeLoader.getSection("__DATA", "exports");
     if (!exports_section) {

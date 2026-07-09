@@ -3,6 +3,7 @@ set(ROSETTA_CORE_SOURCES
     src/CoreLog.cpp
     src/CustomTranslationHook.cpp
     src/ClassifyArmPCHook.cpp
+    src/DecodeOpcodeHook.cpp
     src/hook.cpp
     src/AssemblerHelpers.cpp
     src/IRBlock.cpp
@@ -19,6 +20,7 @@ set(ROSETTA_CORE_SOURCES
     src/Fixup.cpp
     src/Register.cpp
     src/Translator.cpp
+    src/TranslatorCustom.cpp
     src/TranslatorX87.cpp
     src/TranslatorX87Fusion.cpp
     src/TranslatorX87Helpers.cpp

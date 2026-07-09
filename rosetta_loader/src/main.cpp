@@ -616,8 +616,10 @@ int main(int argc, char* argv[]) {
     }
     if (offsetFinder.determineRuntimeOffsets()) {
         LOG("Found additional rosetta runtime offsets successfully!\n");
-        LOG("offset_translate_insn=%llx offset_transaction_result_size=%llx\n",
-            offsetFinder.offsetTranslateInsn_, offsetFinder.offsetTransactionResultSize_);
+        LOG("offset_translate_insn=%llx offset_transaction_result_size=%llx "
+            "offset_decode_opcode=%llx\n",
+            offsetFinder.offsetTranslateInsn_, offsetFinder.offsetTransactionResultSize_,
+            offsetFinder.offsetDecodeOpcode_);
     }
 
     const auto runtimeBase = dbg.findRuntime();
@@ -831,6 +833,7 @@ int main(int argc, char* argv[]) {
         .rosettax87_base = machoBase,
         .rosettax87_size = machoLoader.imageSize(),
         .classify_arm_pc_rva = offsetFinder.offsetClassifyArmPc_,
+        .decode_opcode_rva = offsetFinder.offsetDecodeOpcode_,
     };
 
     dbg.writeMemory(machoOffsetsAddress, &machoOffsets, sizeof(machoOffsets));

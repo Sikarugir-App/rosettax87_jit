@@ -1346,6 +1346,8 @@ auto opcode_host_to_internal(uint16_t opcode) -> uint16_t {
             return kOpcodeName_xsave;
         case kOpcode_26_4_xsetbv:
             return kOpcodeName_xsetbv;
+        case kOpcode_26_4_arpl:
+            return kOpcodeName_arpl;
     }
 
     return 0;
@@ -2693,6 +2695,8 @@ auto opcode_internal_to_host(uint16_t opcode) -> uint16_t {
             return kOpcode_26_4_xsave;
         case kOpcodeName_xsetbv:
             return kOpcode_26_4_xsetbv;
+        case kOpcodeName_arpl:
+            return kOpcode_26_4_arpl;
     }
     return 0;
 }

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Rosetta is installed
+        run: softwareupdate --install-rosetta --agree-to-license
+
+      - name: Configure
+        run: cmake -B build
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        # PT_ATTACH on macOS needs either the debugger entitlement (granted via
+        # an interactive system dialog on first launch — not available in
+        # headless CI, would hang the job) or root. GitHub's macOS runners give
+        # passwordless sudo, so use that. --no-build: already built above.
+        run: sudo scripts/run_tests.sh --no-build

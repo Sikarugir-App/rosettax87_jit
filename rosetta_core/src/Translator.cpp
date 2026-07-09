@@ -5,6 +5,7 @@
 #include "rosetta_core/IRInstr.h"
 #include "rosetta_core/Opcode.h"
 #include "rosetta_core/TranslationResult.h"
+#include "rosetta_core/TranslatorCustom.h"
 #include "rosetta_core/TranslatorX87.h"
 #include "rosetta_core/TranslatorX87Fusion.h"
 #include "rosetta_core/X87Cache.h"
@@ -350,6 +351,10 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
 
             case Opcode::kOpcodeName_fnop:
                 TranslatorX87::translate_fnop(translation_result, cur_instr);
+                break;
+
+            case Opcode::kOpcodeName_arpl:
+                TranslatorCustom::translate_arpl(translation_result, cur_instr);
                 break;
 
             default:
