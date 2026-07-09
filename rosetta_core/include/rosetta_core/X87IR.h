@@ -137,8 +137,11 @@ struct Context {
     // Consts are pure values — never invalidated within a run.
     int16_t  const_zero_node;
     int16_t  const_one_node;
-    int16_t  const_f64_node;        // most recent ConstF64
-    uint64_t const_f64_bits;        // its bit pattern
+    static constexpr int kConstF64Slots = 4;
+    int16_t  const_f64_node[kConstF64Slots];  // recent ConstF64 nodes
+    uint64_t const_f64_bits[kConstF64Slots];  // their bit patterns
+    int8_t   const_f64_count;
+    int8_t   const_f64_next;        // rotating overwrite cursor when full
 
     // CC tracking for FCOM+FSTSW fusion.
     int16_t last_fcmp;              // most recent FCmp/FTst node ID, or -1
@@ -179,7 +182,8 @@ struct Context {
         last_narrow_node = -1;
         const_zero_node = -1;
         const_one_node = -1;
-        const_f64_node = -1;
+        const_f64_count = 0;
+        const_f64_next = 0;
         for (int i = 0; i < 8; i++) {
             slot_val[i] = static_cast<int16_t>(-(i + 1));
             initial_read[i] = -1;

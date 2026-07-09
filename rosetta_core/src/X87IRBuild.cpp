@@ -263,13 +263,22 @@ static int16_t build_int_load(Context& ctx, IROperand* op) {
 // Build a constant-push (FLDL2E, FLDL2T, etc.), reusing a prior node with
 // the same bit pattern.
 static int16_t build_const(Context& ctx, uint64_t bits) {
-    if (ctx.const_f64_node >= 0 && ctx.const_f64_bits == bits)
-        return ctx.const_f64_node;
+    for (int i = 0; i < ctx.const_f64_count; i++) {
+        if (ctx.const_f64_bits[i] == bits) return ctx.const_f64_node[i];
+    }
     auto id = ctx.add_node(Op::ConstF64);
     if (id < 0) return -1;
     ctx.nodes[id].imm_bits = bits;
-    ctx.const_f64_node = id;
-    ctx.const_f64_bits = bits;
+    int slot;
+    if (ctx.const_f64_count < Context::kConstF64Slots) {
+        slot = ctx.const_f64_count++;
+    } else {
+        slot = ctx.const_f64_next;
+        ctx.const_f64_next =
+            static_cast<int8_t>((slot + 1) % Context::kConstF64Slots);
+    }
+    ctx.const_f64_node[slot] = id;
+    ctx.const_f64_bits[slot] = bits;
     return id;
 }
 
