@@ -82,6 +82,8 @@ enum NodeFlags : uint8_t {
     kTestFused    = 1 << 4,    // FCmp/FTst + FStsw: the guest TEST after the run
                                // is consumed; lower to FCMP + CSET + TST (the
                                // AArch64 cond lives in the FStsw node's imm_bits)
+    kF32          = 1 << 5,    // arithmetic node computes in f32 (S-form): takes
+                               // raw-f32 inputs, produces a raw-f32 value
 };
 
 // ── IR node ─────────────────────────────────────────────────────────────────

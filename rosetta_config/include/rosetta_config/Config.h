@@ -98,10 +98,11 @@ struct RosettaConfig {
     uint8_t  disable_const_promote;  // ROSETTA_X87_DISABLE_CONST_PROMOTE=1 — don't promote loads from read-only absolute addresses to constants
     uint8_t  fuse_fcom_test;         // ROSETTA_X87_FUSE_FCOM_TEST=1 — fuse fcom+fnstsw+test into FCMP+CSET+TST (leaves AX/status-word CC stale; opt-in)
     uint8_t  force_cpu_mode32;       // ROSETTA_FORCE_CPU_MODE32=1 — force the decoder into 32-bit mode (test-only; lets aotinvoke reach legacy opcodes like ARPL)
+    uint8_t  disable_f32_narrow;     // ROSETTA_X87_DISABLE_F32_NARROW=1 — don't rewrite narrow(op_f64(widen,widen)) to S-form arithmetic
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };
-static_assert(sizeof(RosettaConfig) == 0x18);
+static_assert(sizeof(RosettaConfig) == 0x20);
 
 inline bool op_is_disabled(const RosettaConfig& cfg, OpcodeId id) {
     return (cfg.disabled_ops_mask >> static_cast<int>(id)) & 1u;

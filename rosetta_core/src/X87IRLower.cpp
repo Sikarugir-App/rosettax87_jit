@@ -687,44 +687,26 @@ void lower(Context& ctx, TranslationResult* result) {
         }
 
         // ── Binary arithmetic ───────────────────────────────────────────
-        case Op::FAdd: {
-            int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
-            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fadd_f64(buf, Dd, Dn, Dm);
-            break;
-        }
-        case Op::FSub: {
-            int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
-            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fsub_f64(buf, Dd, Dn, Dm);
-            break;
-        }
-        case Op::FMul: {
-            int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
-            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fmul_f64(buf, Dd, Dn, Dm);
-            break;
-        }
-        case Op::FNMul: {
-            int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
-            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fnmul_f64(buf, Dd, Dn, Dm);
-            break;
-        }
+        // kF32 nodes compute in S registers (type=0): inputs and result are
+        // raw f32 (see pass_f32_narrow).
+        case Op::FAdd:
+        case Op::FSub:
+        case Op::FMul:
+        case Op::FNMul:
         case Op::FDiv: {
             int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
             int Dd = fprs.try_reuse_input(ctx, i);
             if (Dd < 0) Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fdiv_f64(buf, Dd, Dn, Dm);
+            int opc;
+            switch (n.op) {
+                case Op::FMul:  opc = 0; break;
+                case Op::FDiv:  opc = 1; break;
+                case Op::FAdd:  opc = 2; break;
+                case Op::FSub:  opc = 3; break;
+                default:        opc = 8; break;  // FNMul
+            }
+            emit_fp_dp2(buf, /*type=*/(n.flags & kF32) ? 0 : 1, opc, Dd, Dn, Dm);
             break;
         }
 
@@ -762,28 +744,16 @@ void lower(Context& ctx, TranslationResult* result) {
         }
 
         // ── Unary ───────────────────────────────────────────────────────
-        case Op::FNeg: {
-            int Dn = fprs.get(n.inputs[0]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
-            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fneg_f64(buf, Dd, Dn);
-            break;
-        }
-        case Op::FAbs: {
-            int Dn = fprs.get(n.inputs[0]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
-            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fabs_f64(buf, Dd, Dn);
-            break;
-        }
+        // kF32: S-form, same as binary arithmetic above.
+        case Op::FNeg:
+        case Op::FAbs:
         case Op::FSqrt: {
             int Dn = fprs.get(n.inputs[0]);
             int Dd = fprs.try_reuse_input(ctx, i);
             if (Dd < 0) Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fsqrt_f64(buf, Dd, Dn);
+            const int opc = (n.op == Op::FAbs) ? 1 : (n.op == Op::FNeg) ? 2 : 3;
+            emit_fp_dp1(buf, /*type=*/(n.flags & kF32) ? 0 : 1, opc, Dd, Dn);
             break;
         }
         case Op::FRndInt: {

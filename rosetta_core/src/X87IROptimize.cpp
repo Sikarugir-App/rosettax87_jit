@@ -1,5 +1,8 @@
 #include "rosetta_core/X87IR.h"
 
+#include "rosetta_config/Config.h"
+#include "rosetta_core/CoreConfig.h"
+
 namespace X87IR {
 
 // ── Pass 0: Dead-compare elimination ────────────────────────────────────────
@@ -309,6 +312,91 @@ static void pass_fma(Context& ctx) {
     }
 }
 
+// ── Pass 2.5: f32 single-op narrowing ───────────────────────────────────────
+//
+// narrow(op_f64(widen(a), widen(b))) is bit-identical to op_f32(a, b) for
+// FAdd/FSub/FMul/FDiv/FSqrt (Figueroa: double rounding through f64 is
+// innocuous for one operation on f32 inputs since 53 ≥ 2·24 + 2) and
+// trivially for FNeg/FAbs/FNMul (sign flips are exact). So when an f64 op
+// whose inputs are all widened raw-f32 values dies into a CvtF64ToF32, the
+// whole widen/compute/narrow sandwich can run in S registers — same result,
+// 2–3 fewer FCVTs. The CvtF64ToF32 node is rewritten in place into the
+// f32-typed op (kF32) reading the raw sources, so consumers keep seeing a
+// raw-f32 value at the same node ID; the f64 op dies here and orphaned
+// widens are reaped by the final pass_dse.
+//
+// Runs after pass_fma: f64 FMAs get first pick (narrowing a fused FMA is
+// NOT exact — the a*b+c sum double-rounds — so FMA stays f64).
+
+static bool f32_narrowable_op(Op op, int* num_inputs) {
+    switch (op) {
+        case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
+        case Op::FNMul:
+            *num_inputs = 2; return true;
+        case Op::FNeg: case Op::FAbs: case Op::FSqrt:
+            *num_inputs = 1; return true;
+        default:
+            return false;
+    }
+}
+
+static void pass_f32_narrow(Context& ctx) {
+    int16_t use_count[kMaxNodes] = {};
+    for (int d = 0; d < 8; d++) {
+        if (ctx.slot_val[d] >= 0 && ctx.slot_val[d] < ctx.num_nodes)
+            use_count[ctx.slot_val[d]]++;
+    }
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        for (int j = 0; j < 3; j++) {
+            if (n.inputs[j] >= 0) use_count[n.inputs[j]]++;
+        }
+    }
+
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& c = ctx.nodes[i];
+        if (c.flags & kDead) continue;
+        if (c.op != Op::CvtF64ToF32) continue;
+        const int16_t x = c.inputs[0];
+        if (x < 0 || x >= ctx.num_nodes) continue;
+        auto& xn = ctx.nodes[x];
+        if ((xn.flags & kDead) || (xn.flags & kF32)) continue;
+        int nin;
+        if (!f32_narrowable_op(xn.op, &nin)) continue;
+        if (use_count[x] != 1) continue;  // f64 value must die into this narrow
+
+        // Every input must be a widened raw-f32 value.
+        int16_t raw[2] = {-1, -1};
+        bool ok = true;
+        for (int j = 0; j < nin; j++) {
+            const int16_t in = xn.inputs[j];
+            if (in < 0 || in >= ctx.num_nodes ||
+                ctx.nodes[in].op != Op::CvtF32ToF64 ||
+                (ctx.nodes[in].flags & kDead)) {
+                ok = false;
+                break;
+            }
+            raw[j] = ctx.nodes[in].inputs[0];
+        }
+        if (!ok) continue;
+
+        c.op = xn.op;
+        c.flags |= kF32;
+        c.inputs[0] = raw[0];
+        c.inputs[1] = raw[1];
+        xn.flags |= kDead;
+        use_count[x] = 0;
+        for (int j = 0; j < nin; j++) {
+            // Orphaned widens die now so later candidates see live counts;
+            // the final pass_dse handles any cascade below them.
+            if (--use_count[xn.inputs[j]] == 0)
+                ctx.nodes[xn.inputs[j]].flags |= kDead;
+            use_count[raw[j]]++;
+        }
+    }
+}
+
 // ── Pass 3: FCOM + FSTSW Fusion ─────────────────────────────────────────────
 //
 // If a FCmp/FTst node is immediately followed by a FStsw with no intervening
@@ -351,6 +439,10 @@ void optimize(Context& ctx) {
     pass_dse(ctx);
     pass_fneg_fold(ctx);
     pass_fma(ctx);
+    if (!(g_rosetta_config && g_rosetta_config->disable_f32_narrow)) {
+        pass_f32_narrow(ctx);
+        pass_dse(ctx);  // reap widens orphaned by the narrowing rewrite
+    }
     pass_fcom_fstsw_fusion(ctx);
 }
 
