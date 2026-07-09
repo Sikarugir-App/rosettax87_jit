@@ -1143,6 +1143,9 @@ void lower(Context& ctx, TranslationResult* result) {
     // 2. Store modified stack values.
     // At this point, Wd_top holds the FINAL top. slot_val[d] tells us what value
     // should be at logical depth d relative to the final TOP.
+    // In the specialized body every slot address is a static [Xbase, #imm];
+    // gather the dirty slots and pair consecutive physical indices into STPs.
+    int stp_phys[8], stp_fpr[8], stp_cnt = 0;
     for (int d = 0; d < 8; d++) {
         int16_t val = ctx.slot_val[d];
         if (val < 0) continue;  // initial slot, unchanged (no store needed)
@@ -1154,11 +1157,30 @@ void lower(Context& ctx, TranslationResult* result) {
         int Dd = fprs.get(val);
         if (Dd < 0) continue;   // dead or already freed
         if (top_known >= 0) {
+            // Insertion-sorted by physical index (wrap can reorder them).
             const int phys = (final_top_known + d) & 7;
-            emit_fstr_imm(buf, 3, Dd, Xbase,
-                          static_cast<int16_t>((kX87RegFileOff >> 3) + phys));
+            int k = stp_cnt++;
+            while (k > 0 && stp_phys[k - 1] > phys) {
+                stp_phys[k] = stp_phys[k - 1];
+                stp_fpr[k] = stp_fpr[k - 1];
+                k--;
+            }
+            stp_phys[k] = phys;
+            stp_fpr[k] = Dd;
         } else {
             emit_store_st(buf, Xbase, Wd_top, d, Wd_tmp, Dd, Xst_base);
+        }
+    }
+    for (int k = 0; k < stp_cnt;) {
+        if (k + 1 < stp_cnt && stp_phys[k + 1] == stp_phys[k] + 1) {
+            emit_fldp_fstp_d(buf, /*is_load=*/0,
+                             static_cast<int16_t>((kX87RegFileOff >> 3) + stp_phys[k]),
+                             Xbase, stp_fpr[k], stp_fpr[k + 1]);
+            k += 2;
+        } else {
+            emit_fstr_imm(buf, 3, stp_fpr[k], Xbase,
+                          static_cast<int16_t>((kX87RegFileOff >> 3) + stp_phys[k]));
+            k++;
         }
     }
 
