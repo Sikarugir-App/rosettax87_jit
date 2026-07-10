@@ -725,42 +725,10 @@ auto translate_gpr(TranslationResult* result, int is_64bit, uint8_t reg, unsigne
     }
 
     // -------------------------------------------------------------------------
-    // size_class == 2: byte-low (AL/BL/CL/DL)
-    // Binary at 0x20e50–0x20e54: CMP W8, #2 / B.NE loc_20EF0
-    // immr=0, imms=7 — but this is the sign/zero extend of a full low byte.
-    // Reaches here only when extend_mode!=0 AND reg>=0x10 AND size_class==2.
-    // Binary loc_20F50: CMP W3, #1 / B.HI → opc=0 (SBFX) if extend>1 else UBFX
-    // -------------------------------------------------------------------------
-    if (size_class == 2) {
-        // Binary at 0x20f50:
-        //   CMP W1, #0 / CSET W1, NE  → is_64bit = (is_64bit != 0)
-        //   ORR W5, W4, #7            → imms = immr|7, but immr=0 here (class 2 * 8... wait)
-        // Actually loc_20F50 is reached from the size_class<=1 block via B.HI on extend_mode>1.
-        // For size_class==2 we go to loc_20EF0 which then falls to size_class==3 check.
-        // size_class==2 with extend_mode!=0: same BFX block as class 0/1 but via loc_20F50.
-        // immr = size_class*8 = 16? No — re-read: loc_20F50 is entered from the SAME
-        // BFX block (loc_20E9C) when extend_mode > 1. Let's re-trace:
-        //
-        // loc_20E9C is entered for size_class==0 OR size_class==1 OR !needs_extend.
-        // For size_class==2: needs_extend=true, size_class!=1 → does NOT go to loc_20E9C.
-        // For size_class==2: goes to loc_20EF0.
-        // loc_20EF0: CBZ W3 → if extend_mode==0 → loc_20F6C (return index)
-        //            CMP W1,#1 / B.NE → if !is_64bit → loc_20F6C
-        //            CMP W8,#3 / B.NE → if size_class!=3 → loc_20F6C
-        // So size_class==2 always falls to loc_20F6C regardless!
-        // loc_20F6C: CBZ W3 → extend_mode==0: return index (loc_20FD0 = MOV X19,X6)
-        //            CMP W8,#3 / B.NE → size_class!=3: return index
-        //            CBNZ W1 → is_64bit!=0: return index
-        //            CMP W19,#0x1F / B.EQ → hint_reg==XZR: return index
-        //            → emit_mov_reg(hint_reg, index)
-        //
-        // So size_class==2: returns index OR emits MOV, never BFX.
-        // Fall through to the size_class==3/fallthrough logic below.
-    }
-
-    // -------------------------------------------------------------------------
-    // loc_20EF0: reached for size_class==2 or size_class==3 (with needs_extend)
-    // Also reached for size_class>=4 (undefined, falls to loc_20F6C)
+    // size_class == 2 (byte-low with extend): the binary (loc_20EF0) never
+    // emits a BFX for it — it always falls through to the loc_20F6C logic
+    // below, returning `index` or emitting a plain MOV. Same for undefined
+    // size_class >= 4. Only size_class==3 gets special handling here.
     // -------------------------------------------------------------------------
 
     // size_class == 3, extend_mode!=0, is_64bit==1 → sign-extend word → 64-bit

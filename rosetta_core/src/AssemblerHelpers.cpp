@@ -123,21 +123,6 @@ auto emit_add_imm(AssemblerBuffer& buf, int is_64bit, int is_sub, int is_set_fla
     buf.emit(insn);
 }
 
-// auto emit_and_imm(AssemblerBuffer& buf, int is_64bit, int Rd, int N,
-//                   int64_t immr, int64_t imms, int Rn) -> void {
-//     // AND (immediate): sf | 00 | 100100 | N | immr | imms | Rn | Rd
-//     // [31]=sf [30:29]=00 [28:23]=100100 [22]=N [21:16]=immr [15:10]=imms
-//     // [9:5]=Rn [4:0]=Rd
-//     uint32_t insn = 0x12000000;
-//     insn |= (uint32_t)(is_64bit != 0) << 31;
-//     insn |= (uint32_t)(N & 0x1)       << 22;
-//     insn |= (uint32_t)(immr & 0x3F)   << 16;
-//     insn |= (uint32_t)(imms & 0x3F)   << 10;
-//     insn |= (uint32_t)(Rn & 0x1F)     << 5;
-//     insn |= (uint32_t)(Rd & 0x1F);
-//     buf.emit(insn);
-// }
-
 auto emit_bitfield(AssemblerBuffer& buf, int is_64bit, int opc, int N, int8_t immr, int8_t imms,
                    int Rn, int Rd) -> void {
     // BFM/UBFM/SBFM: sf | opc | 100110 | N | immr | imms | Rn | Rd
