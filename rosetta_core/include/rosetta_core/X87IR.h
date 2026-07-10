@@ -270,12 +270,23 @@ int peak_live_fprs(const Context& ctx);
 // Lower IR to AArch64 instructions, writing into result->insn_buf.
 void lower(Context& ctx, TranslationResult* result);
 
+// Why compile_run declined a run (or that it succeeded). Reported via the
+// optional `err` out-param; the int return still carries the consumed count.
+enum class CompileError {
+    kSuccess,       // run lowered; return value is the consumed count (>0)
+    kBuildFailed,   // build() could not construct IR from the run
+    kFprPressure,   // peak live FPRs exceeded the free FPR pool
+    kGprPressure,   // peak live GPRs exceeded the free GPR pool
+};
+
 // Main entry point: build + optimize + lower.
 // Returns the number of x87 instructions consumed (0 = IR couldn't handle any).
 // `tail_consumed` (optional out): number of additional non-x87 guest
 // instructions consumed past the run (the TEST of a fcom+fnstsw+test fusion).
 // The caller must skip these but must NOT tick the x87 run cache for them.
+// `err` (optional out): why the run was declined, or kSuccess. See CompileError.
 int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_instrs,
-                int64_t start_idx, int run_length, int* tail_consumed = nullptr);
+                int64_t start_idx, int run_length, int* tail_consumed = nullptr,
+                CompileError* err = nullptr);
 
 }  // namespace X87IR

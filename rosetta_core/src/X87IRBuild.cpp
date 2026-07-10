@@ -184,6 +184,24 @@ static void mem_cse_insert(Context& ctx, IROperand* op, Op kind, int16_t val) {
 
 static int16_t build_const(Context& ctx, uint64_t bits);
 
+// Constant node for a known f64 bit pattern; +0.0 / +1.0 get the cheaper
+// MOVI / FMOV-one nodes (and their dedup).
+static int16_t const_node_for_bits(Context& ctx, uint64_t bits) {
+    if (bits == 0) {
+        if (ctx.const_zero_node >= 0) return ctx.const_zero_node;
+        auto id = ctx.add_node(Op::ConstZero);
+        if (id >= 0) ctx.const_zero_node = id;
+        return id;
+    }
+    if (bits == 0x3FF0000000000000ULL) {
+        if (ctx.const_one_node >= 0) return ctx.const_one_node;
+        auto id = ctx.add_node(Op::ConstOne);
+        if (id >= 0) ctx.const_one_node = id;
+        return id;
+    }
+    return build_const(ctx, bits);
+}
+
 // Promote an fp load from a read-only absolute address to a constant node.
 // Returns the node ID, or -1 if not promotable.
 static int16_t try_const_promote(Context& ctx, const IROperand* op, Op load_op) {
@@ -202,21 +220,74 @@ static int16_t try_const_promote(Context& ctx, const IROperand* op, Op load_op) 
     } else {
         memcpy(&bits, reinterpret_cast<const void*>(addr), 8);
     }
+    return const_node_for_bits(ctx, bits);
+}
 
-    // +0.0 / +1.0 get the cheaper MOVI / FMOV-one nodes (and their dedup).
-    if (bits == 0) {
-        if (ctx.const_zero_node >= 0) return ctx.const_zero_node;
-        auto id = ctx.add_node(Op::ConstZero);
-        if (id >= 0) ctx.const_zero_node = id;
-        return id;
+// Convert an x87 80-bit extended value (64-bit mantissa with explicit integer
+// bit + sign/15-bit-exponent word) to f64 bits, round-to-nearest-even — the
+// same result the runtime fld_fp80 routine produces (ST regs are f64).
+// Returns false for values this converter doesn't handle (results that would
+// be denormal in f64) — the caller then declines promotion.
+static bool f80_to_f64_bits(uint64_t m, uint16_t se, uint64_t* out) {
+    const uint64_t sign = static_cast<uint64_t>(se >> 15) << 63;
+    int e = se & 0x7FFF;
+
+    if (m == 0) {  // ±0 (e==0) or pseudo-infinity (invalid; don't promote)
+        if (e != 0) return false;
+        *out = sign;
+        return true;
     }
-    if (bits == 0x3FF0000000000000ULL) {
-        if (ctx.const_one_node >= 0) return ctx.const_one_node;
-        auto id = ctx.add_node(Op::ConstOne);
-        if (id >= 0) ctx.const_one_node = id;
-        return id;
+    if (e == 0x7FFF) {
+        if ((m << 1) == 0) {  // infinity (only the integer bit set)
+            *out = sign | 0x7FF0000000000000ULL;
+            return true;
+        }
+        // NaN: keep the top fraction bits, force the quiet bit (matches the
+        // x87 load behavior of quieting SNaNs).
+        uint64_t frac = (m >> 11) & 0x000FFFFFFFFFFFFFULL;
+        frac |= 0x0008000000000000ULL;
+        *out = sign | 0x7FF0000000000000ULL | frac;
+        return true;
     }
-    return build_const(ctx, bits);
+
+    // Normalize (covers denormals e==0 and unnormals with a clear integer
+    // bit): value = m * 2^(max(e,1) - 16383 - 63).
+    if (e == 0) e = 1;
+    const int shift = __builtin_clzll(m);
+    m <<= shift;
+    int E = (e - 16383) - shift;  // exponent of the (now bit-63) leading 1
+
+    // Round the 64-bit mantissa to 53 bits (round-to-nearest-even).
+    uint64_t mant = m >> 11;
+    const uint64_t rem = m & 0x7FF;
+    if (rem > 0x400 || (rem == 0x400 && (mant & 1))) {
+        if (++mant == (1ULL << 53)) { mant >>= 1; E++; }
+    }
+    if (E > 1023) {  // overflows f64 → infinity
+        *out = sign | 0x7FF0000000000000ULL;
+        return true;
+    }
+    if (E < -1022) return false;  // would be denormal — decline
+    *out = sign | (static_cast<uint64_t>(E + 1023) << 52) |
+           (mant & 0x000FFFFFFFFFFFFFULL);
+    return true;
+}
+
+// FLD m80fp from a read-only absolute address: promote to a constant node
+// (the only way the IR can handle m80 — there is no 80-bit load node).
+static int16_t try_const_promote_m80(Context& ctx, const IROperand* op) {
+    if (!ctx.const_promote) return -1;
+    uint64_t addr;
+    if (!const_promote_addr(op, &addr)) return -1;
+    if (!range_is_readonly(addr, 10)) return -1;
+
+    uint64_t m;
+    uint16_t se;
+    memcpy(&m, reinterpret_cast<const void*>(addr), 8);
+    memcpy(&se, reinterpret_cast<const void*>(addr + 8), 2);
+    uint64_t bits;
+    if (!f80_to_f64_bits(m, se, &bits)) return -1;
+    return const_node_for_bits(ctx, bits);
 }
 
 // Build a memory load node. Returns node ID (always f64-typed) or -1 on bail
@@ -226,7 +297,11 @@ static int16_t try_const_promote(Context& ctx, const IROperand* op, Op load_op) 
 // widened view.
 static int16_t build_fp_load(Context& ctx, IROperand* op) {
     const bool is_f32 = op->mem.size == IROperandSize::S32;
-    if (!is_f32 && op->mem.size != IROperandSize::S64) return -1;  // m80 → bail
+    if (!is_f32 && op->mem.size != IROperandSize::S64) {
+        if (op->mem.size == IROperandSize::S80)
+            return try_const_promote_m80(ctx, op);  // m80: const-promote or bail
+        return -1;
+    }
     const Op load_op = is_f32 ? Op::LoadF32Raw : Op::LoadF64;
     auto promoted = try_const_promote(ctx, op, load_op);
     if (promoted >= 0) return promoted;

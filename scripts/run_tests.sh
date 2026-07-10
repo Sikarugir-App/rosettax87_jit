@@ -71,6 +71,7 @@ ALL_TESTS=(
     test_fuse_fcom_test
     test_decoder_fcomp_st
     test_decoder_arpl
+    test_ir_gpr_pressure
 )
 
 RED='\033[0;31m'

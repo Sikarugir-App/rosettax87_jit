@@ -1333,6 +1333,11 @@ void lower(Context& ctx, TranslationResult* result) {
 //
 // Permanent GPRs (held for the entire lower() duration):
 //   - Xbase (pool 0), Wd_top (pool 1), Wd_tmp (pool 2), Xst_base (pool 6) = 4
+//     ... except on mid-run entry (`gprs_cached`): x87_begin then reuses the
+//     cache's already-pinned Xbase/Wd_top/Xst_base, which the caller has
+//     already excluded from the free pool — counting them again would
+//     double-charge 3 registers and spuriously decline nearly every mid-run
+//     attempt. Only Wd_tmp is newly allocated in that case = 1.
 //   - Wd_rc_cached (pool 3) when RC caching is active = +1
 //
 // Per-node transient GPR demand (mirrors the lowering code exactly):
@@ -1352,7 +1357,7 @@ void lower(Context& ctx, TranslationResult* result) {
 //
 // Fused FCmp/FTst holds 1 GPR (Wd_packed) alive across nodes until FStsw.
 // We track this as a "held" count that overlaps with per-node transient demand.
-int peak_live_gprs(const Context& ctx, bool entry_deferred) {
+int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
     // Determine if RC caching will be active (same logic as lower()).
     bool rc_cache = false;
     if (!(g_rosetta_config && g_rosetta_config->fast_round)) {
@@ -1368,8 +1373,8 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred) {
         }
     }
 
-    int pinned = 4;  // Xbase, Wd_top, Wd_tmp, Xst_base
-    if (rc_cache) pinned++;  // Wd_rc_cached
+    int pinned = gprs_cached ? 1 : 4;  // Wd_tmp [+ Xbase, Wd_top, Xst_base]
+    if (rc_cache) pinned++;            // Wd_rc_cached
 
     // NZCV hoisting/elision mirror (same predicates as lower()): when hoisting,
     // one GPR (Wd_nzcv_saved) is held from the first FCmp/FTst through the
@@ -1836,9 +1841,12 @@ static bool try_fuse_fcom_test(Context& ctx, IRInstr* instr_array, int64_t num_i
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_instrs,
-                int64_t start_idx, int run_length, int* tail_consumed) {
+                int64_t start_idx, int run_length, int* tail_consumed,
+                CompileError* err) {
     Context ctx;
 
+    // Report a decline reason and yield 0 (nothing consumed) in one line.
+    auto fail = [&](CompileError e) { if (err) *err = e; return 0; };
 
     // Fold carried-in deferred-FXCH permutation into the initial slot map.
     const auto& cache = result->x87_cache;
@@ -1854,7 +1862,7 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
         !(g_rosetta_config && g_rosetta_config->disable_const_promote);
 
     if (!build(ctx, instr_array, num_instrs, start_idx, run_length, perm, const_promote))
-        return 0;
+        return fail(CompileError::kBuildFailed);
 
     optimize(ctx);
 
@@ -1877,7 +1885,7 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
     int available = 0;
     while (fpr_pool) { available++; fpr_pool &= fpr_pool - 1; }
     if (peak_live_fprs(ctx) > available) {
-        return 0;
+        return fail(CompileError::kFprPressure);
     }
 
     // Gate lowering on GPR pressure vs. available pool.
@@ -1888,9 +1896,13 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
         uint32_t gpr_pool = result->free_gpr_mask;
         int gpr_available = 0;
         while (gpr_pool) { gpr_available++; gpr_pool &= gpr_pool - 1; }
-        const int peak = peak_live_gprs(ctx, entry_deferred);
+        // Mid-run entry: x87_begin will reuse the cache's pinned GPRs (same
+        // predicate), so the model must not charge for them — the caller
+        // already removed them from free_gpr_mask.
+        const bool gprs_cached = cache.run_remaining > 0 && cache.gprs_valid;
+        const int peak = peak_live_gprs(ctx, entry_deferred, gprs_cached);
         if (peak > gpr_available) {
-            return 0;
+            return fail(CompileError::kGprPressure);
         }
         // Base-address cache: each cached base pins exactly one extra GPR for
         // the whole run (on top of every per-node total), so peak+N is exact.
@@ -1903,6 +1915,7 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
 
     lower(ctx, result);
 
+    if (err) *err = CompileError::kSuccess;
     return ctx.consumed;
 }
 

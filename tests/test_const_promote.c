@@ -9,12 +9,15 @@
  * __PAGEZERO (-pagezero_size 0x4000).
  *
  * Covers: promotion of f64/f32 loads from a read-only page (values must be
- * bit-exact), FDIV-by-power-of-two → FMUL-reciprocal, FCOM-vs-0.0 → FTST,
+ * bit-exact), m80 loads (FLD tbyte — promotable ONLY as a constant; the
+ * conversion must round-to-nearest to f64 like the runtime fld_fp80 routine),
+ * FDIV-by-power-of-two → FMUL-reciprocal, FCOM-vs-0.0 → FTST,
  * and the critical negative case: loads from a WRITABLE page must NOT be
  * promoted (value changes between calls must be observed).
  *
  * Build: clang -arch x86_64 -O0 -g -Wl,-pagezero_size,0x4000 -o ...
  */
+#include <math.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -52,6 +55,15 @@ static int setup_pages(void) {
     float f = 1.5f;
     memcpy((void *)(RO_BASE + 24), &f, 4);  /* +24 — f32 constant */
     d[4] = 0.0;   /* +32 — zero for FCOM→FTST     */
+    /* +40 — pi as x87 80-bit extended (mantissa LE, then sign+exponent).
+     * Rounds to the f64 pi (0x400921FB54442D18). */
+    static const uint8_t kPi80[10] = {0x35, 0xC2, 0x68, 0x21, 0xA2,
+                                      0xDA, 0x0F, 0xC9, 0x00, 0x40};
+    memcpy((void *)(RO_BASE + 40), kPi80, 10);
+    /* +56 — +inf as x87 80-bit (integer bit only, exponent 0x7FFF). */
+    static const uint8_t kInf80[10] = {0x00, 0x00, 0x00, 0x00, 0x00,
+                                       0x00, 0x00, 0x80, 0xFF, 0x7F};
+    memcpy((void *)(RO_BASE + 56), kInf80, 10);
     *(double *)RW_BASE = 5.0;
     if (mprotect((void *)RO_BASE, 0x4000, PROT_READ) != 0) {
         printf("FAIL  mprotect\n");
@@ -106,6 +118,38 @@ static uint16_t cmp_ro_zero(double x) {
     return sw;
 }
 
+/* fldt [RO+40] (pi as f80) — the only way the IR can take an m80 load is as
+ * a promoted constant; the value must round to f64 exactly like the runtime
+ * fld_fp80 routine. */
+static double load_ro_m80_pi(void) {
+    double out;
+    __asm__ volatile(
+        ".byte 0xDB,0x2C,0x25,0x28,0x00,0x00,0x40\n\t"  /* fldt [RO+40] */
+        "fstpl %0\n"
+        : "=m"(out));
+    return out;
+}
+
+/* fldt [RO+56] (+inf as f80). */
+static double load_ro_m80_inf(void) {
+    double out;
+    __asm__ volatile(
+        ".byte 0xDB,0x2C,0x25,0x38,0x00,0x00,0x40\n\t"  /* fldt [RO+56] */
+        "fstpl %0\n"
+        : "=m"(out));
+    return out;
+}
+
+/* fldt [RW+16] — writable page: must NOT be promoted. */
+static double load_rw_m80(void) {
+    double out;
+    __asm__ volatile(
+        ".byte 0xDB,0x2C,0x25,0x10,0x40,0x00,0x40\n\t"  /* fldt [RW+16] */
+        "fstpl %0\n"
+        : "=m"(out));
+    return out;
+}
+
 /* fldl [RW] — page is writable: must NOT be promoted, must see live value. */
 static double load_rw(void) {
     double out;
@@ -136,6 +180,15 @@ int main(void) {
         check("fcom vs RO zero: less", (double)lt, (double)0x0100);
         check("fcom vs RO zero: equal", (double)eq, (double)0x4000);
     }
+
+    check("m80 RO const (pi rounds to f64 pi)", load_ro_m80_pi(), kPi);
+    check("m80 RO const (+inf)", load_ro_m80_inf(), (double)INFINITY);
+
+    /* Writable m80: value must be re-read on every call. */
+    *(volatile long double *)(RW_BASE + 16) = 5.0L;
+    check("m80 RW load, first value", load_rw_m80(), 5.0);
+    *(volatile long double *)(RW_BASE + 16) = -2.75L;
+    check("m80 RW load, after modification", load_rw_m80(), -2.75);
 
     /* Writable page: change the value between calls — a wrong promotion
      * would freeze the first value into the translated code. */
