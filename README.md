@@ -53,8 +53,12 @@ All flags are set via environment variables and read at runtime.
 | Variable | Description |
 |----------|-------------|
 | `ROSETTA_X87_FAST_ROUND=1` | Skip rounding mode dispatch (faster but unsafe for FLDCW-heavy code) |
-| `ROSETTA_X87_EXTENDED_FPR_SCRATCH=1` | Expand FPR scratch register pool |
+| `ROSETTA_X87_EXTENDED_FPR_SCRATCH=1` | Expand FPR scratch register pool from 8 (V24–V31) to 16 (V16–V31) |
 | `ROSETTA_X87_FUSE_FCOM_TEST=1` | Fuse `fcom`+`fnstsw ax`+`test` into FCMP+CSET+TST (~3× faster compares; leaves AX and status-word CC bits stale after the fused pattern) |
+| `ROSETTA_X87_F32_ARITH=1` | Keep f32-sourced arithmetic chains in f32 registers instead of widening intermediates to f64 (not bit-exact vs real x87 f64 intermediates) |
+| `ROSETTA_X87_FAST_RECIP_DIV=1` | Rewrite FDIV by *any* normal constant as FMUL by its reciprocal (up to 1 ulp off; exact power-of-two divisors are always rewritten regardless of this flag) |
+
+Flags in this table that trade fidelity for speed (`FAST_ROUND`, `FUSE_FCOM_TEST`, `F32_ARITH`, `FAST_RECIP_DIV`) are opt-in and default to off.
 
 ### Debugging & Troubleshooting
 
@@ -65,11 +69,15 @@ These flags are primarily useful for narrowing down bugs by selectively disablin
 | `ROSETTA_X87_DISABLE_CACHE=1` | Disable x87 translation cache |
 | `ROSETTA_X87_DISABLE_DEFERRED_FXCH=1` | Disable deferred FXCH optimization |
 | `ROSETTA_X87_DISABLE_IR=1` | Disable IR optimization pipeline |
+| `ROSETTA_X87_DISABLE_CONST_PROMOTE=1` | Don't promote FP loads from read-only absolute addresses to translate-time constants |
+| `ROSETTA_X87_DISABLE_F32_NARROW=1` | Don't rewrite `narrow(op_f64(widen, widen))` sandwiches to single f32 (S-register) operations |
 | `ROSETTA_X87_DISABLE_ALL_OPS=1` | Disable all translated opcodes (fall back to Rosetta default) |
 | `ROSETTA_X87_DISABLE_ALL_FUSIONS=1` | Disable all instruction fusions |
-| `ROSETTA_X87_DISABLE_OPS=op1,op2,...` | Disable specific opcodes (comma-separated) |
-| `ROSETTA_X87_DISABLE_FUSIONS=f1,f2,...` | Disable specific fusions (comma-separated) |
+| `ROSETTA_X87_DISABLE_OPS=op1,op2,...` | Disable specific opcodes (comma-separated; names = `OpcodeId` entries in `rosetta_config/include/rosetta_config/Config.h`) |
+| `ROSETTA_X87_DISABLE_FUSIONS=f1,f2,...` | Disable specific fusions (comma-separated; names = `FusionId` entries in `rosetta_config/include/rosetta_config/Config.h`) |
+| `ROSETTA_X87_LOG_IR_DECLINES=1` | Log guest address + reason (`CompileError`) for every x87 run the IR pipeline declines — useful for finding translation gaps in real workloads |
 | `ROSETTA_X87_LOGS=1` | Enable verbose logging output from the loader |
+| `ROSETTA_FORCE_CPU_MODE32=1` | Force the decoder into 32-bit mode (test-only; lets `aotinvoke` reach legacy opcodes like ARPL) |
 
 ## Usage with Wine
 
