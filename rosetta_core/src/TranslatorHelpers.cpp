@@ -661,6 +661,27 @@ auto emit_gpr_mem_access(TranslationResult& result, int is_64bit, IROperand* op,
     free_gpr(result, a.base);
 }
 
+auto emit_load_int_operand(TranslationResult& result, IROperand* op, bool is_m16) -> int {
+    const int size = is_m16 ? 1 : 2;
+    const OperandAccess acc = compute_operand_access(result, /*is_64bit=*/1, op, size);
+    const int Wd_val =
+        ((kGprScratchMask >> acc.base) & 1u) ? acc.base : alloc_free_gpr(result);
+    if (acc.enc == OperandAccess::Enc::Unscaled9)
+        emit_ldur_stur(result.insn_buf, size, /*is_load=*/1, (int16_t)acc.offset, acc.base,
+                       Wd_val);
+    else
+        emit_ldr_str_imm(result.insn_buf, size, /*is_fp=*/0, /*opc=*/1 /*LDR*/,
+                         (int16_t)(acc.offset >> size), acc.base, Wd_val);
+    if (is_m16) {
+        // SXTH Wd_val, Wd_val — sign-extend bits[15:0] → W (SBFM W,W,#0,#15)
+        emit_bitfield(result.insn_buf, /*is_64bit=*/0, /*opc=*/0 /*SBFM*/, /*N=*/0,
+                      /*immr=*/0, /*imms=*/15, Wd_val, Wd_val);
+    }
+    if (Wd_val != acc.base)
+        free_gpr(result, acc.base);
+    return Wd_val;
+}
+
 // =============================================================================
 // translate_gpr  (mirrors binary at 0x20e14)
 //

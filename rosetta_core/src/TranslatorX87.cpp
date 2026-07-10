@@ -16,36 +16,6 @@
 
 namespace TranslatorX87 {
 
-// -----------------------------------------------------------------------------
-// Load a signed integer memory operand (m16 → LDRH+SXTH, else LDR W) into a
-// GPR and return that register; the caller frees it. Folds the displacement
-// into the load's addressing mode when possible (compute_operand_access).
-//
-// The value register is the address register only when the latter is a scratch
-// we own. Folded encodings — and zero-disp [reg] operands — hand back a LIVE
-// guest base register, which must never be used as a load destination.
-// -----------------------------------------------------------------------------
-static int emit_load_int_operand(TranslationResult& result, AssemblerBuffer& buf, IROperand* op,
-                                 bool is_m16) {
-    const int size = is_m16 ? 1 : 2;
-    const OperandAccess acc = compute_operand_access(result, /*is_64bit=*/1, op, size);
-    const int Wd_val =
-        ((kGprScratchMask >> acc.base) & 1u) ? acc.base : alloc_free_gpr(result);
-    if (acc.enc == OperandAccess::Enc::Unscaled9)
-        emit_ldur_stur(buf, size, /*is_load=*/1, (int16_t)acc.offset, acc.base, Wd_val);
-    else
-        emit_ldr_str_imm(buf, size, /*is_fp=*/0, /*opc=*/1 /*LDR*/,
-                         (int16_t)(acc.offset >> size), acc.base, Wd_val);
-    if (is_m16) {
-        // SXTH Wd_val, Wd_val — sign-extend bits[15:0] → W (SBFM W,W,#0,#15)
-        emit_bitfield(buf, /*is_64bit=*/0, /*opc=*/0 /*SBFM*/, /*N=*/0,
-                      /*immr=*/0, /*imms=*/15, Wd_val, Wd_val);
-    }
-    if (Wd_val != acc.base)
-        free_gpr(result, acc.base);
-    return Wd_val;
-}
-
 // FLDZ -- push +0.0 onto the x87 stack.
 //
 // x87 semantics:
@@ -948,7 +918,7 @@ auto translate_fiadd(TranslationResult* a1, IRInstr* a2) -> void {
     // when possible; never loads into a live guest base register). Loading
     // into a register other than Wd_tmp preserves the ST(0) byte offset for
     // emit_store_st_at_offset below (Opt 3).
-    const int Wd_val = emit_load_int_operand(*a1, buf, &a2->operands[0], is_m16);
+    const int Wd_val = emit_load_int_operand(*a1, &a2->operands[0], is_m16);
 
     // Step 4: SCVTF Dd_int, Wd_val — signed W → f64
     emit_scvtf(buf, /*is_64bit_int=*/0, /*ftype=*/1, Dd_int, Wd_val);
@@ -1954,7 +1924,7 @@ auto translate_fidiv(TranslationResult* a1, IRInstr* a2) -> void {
     // when possible; never loads into a live guest base register). Loading
     // into a register other than Wd_tmp preserves the ST(0) byte offset for
     // emit_store_st_at_offset below (Opt 3).
-    const int Wd_val = emit_load_int_operand(*a1, buf, &a2->operands[0], is_m16);
+    const int Wd_val = emit_load_int_operand(*a1, &a2->operands[0], is_m16);
 
     // Step 4: SCVTF Dd_int, Wd_val — signed W → f64
     emit_scvtf(buf, /*is_64bit_int=*/0, /*ftype=*/1, Dd_int, Wd_val);
@@ -2004,7 +1974,7 @@ auto translate_fimul(TranslationResult* a1, IRInstr* a2) -> void {
     // when possible; never loads into a live guest base register). Loading
     // into a register other than Wd_tmp preserves the ST(0) byte offset for
     // emit_store_st_at_offset below (Opt 3).
-    const int Wd_val = emit_load_int_operand(*a1, buf, &a2->operands[0], is_m16);
+    const int Wd_val = emit_load_int_operand(*a1, &a2->operands[0], is_m16);
 
     // Step 4: SCVTF Dd_int, Wd_val — signed W → f64
     emit_scvtf(buf, /*is_64bit_int=*/0, /*ftype=*/1, Dd_int, Wd_val);
@@ -2053,7 +2023,7 @@ auto translate_fisub(TranslationResult* a1, IRInstr* a2) -> void {
     // when possible; never loads into a live guest base register). Loading
     // into a register other than Wd_tmp preserves the ST(0) byte offset for
     // emit_store_st_at_offset below (Opt 3).
-    const int Wd_val = emit_load_int_operand(*a1, buf, &a2->operands[0], is_m16);
+    const int Wd_val = emit_load_int_operand(*a1, &a2->operands[0], is_m16);
 
     // Step 4: SCVTF Dd_int, Wd_val — signed W → f64
     emit_scvtf(buf, /*is_64bit_int=*/0, /*ftype=*/1, Dd_int, Wd_val);
@@ -2104,7 +2074,7 @@ auto translate_fidivr(TranslationResult* a1, IRInstr* a2) -> void {
     // when possible; never loads into a live guest base register). Loading
     // into a register other than Wd_tmp preserves the ST(0) byte offset for
     // emit_store_st_at_offset below (Opt 3).
-    const int Wd_val = emit_load_int_operand(*a1, buf, &a2->operands[0], is_m16);
+    const int Wd_val = emit_load_int_operand(*a1, &a2->operands[0], is_m16);
 
     // Step 4: SCVTF Dd_int, Wd_val — signed W → f64
     emit_scvtf(buf, /*is_64bit_int=*/0, /*ftype=*/1, Dd_int, Wd_val);
@@ -2469,7 +2439,7 @@ auto translate_fisubr(TranslationResult* a1, IRInstr* a2) -> void {
     // when possible; never loads into a live guest base register). Loading
     // into a register other than Wd_tmp preserves the ST(0) byte offset for
     // emit_store_st_at_offset below (Opt 3).
-    const int Wd_val = emit_load_int_operand(*a1, buf, &a2->operands[0], is_m16);
+    const int Wd_val = emit_load_int_operand(*a1, &a2->operands[0], is_m16);
 
     // Step 4: SCVTF Dd_int, Wd_val — signed W → f64
     emit_scvtf(buf, /*is_64bit_int=*/0, /*ftype=*/1, Dd_int, Wd_val);
@@ -2609,7 +2579,7 @@ auto translate_ficom(TranslationResult* a1, IRInstr* a2) -> void {
     // when possible; never loads into a live guest base register). Loading
     // into a register other than Wd_tmp preserves the ST(0) byte offset for
     // emit_store_st_at_offset below (Opt 3).
-    const int Wd_val = emit_load_int_operand(*a1, buf, &a2->operands[0], is_m16);
+    const int Wd_val = emit_load_int_operand(*a1, &a2->operands[0], is_m16);
 
     // Step 4: SCVTF Dd_int, Wd_val — signed W → f64
     emit_scvtf(buf, /*is_64bit_int=*/0, /*ftype=*/1, Dd_int, Wd_val);

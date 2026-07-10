@@ -159,6 +159,15 @@ auto emit_fp_mem_access(TranslationResult& result, int is_64bit, IROperand* op, 
 auto emit_gpr_mem_access(TranslationResult& result, int is_64bit, IROperand* op, int size_log2,
                          int is_load, int Rt) -> void;
 
+// Load a signed integer memory operand (m16 → LDRH+SXTH, else LDR W) into a
+// GPR and return that register; the caller frees it. Folds the displacement
+// into the load's addressing mode when possible (compute_operand_access).
+//
+// The value register is the address register only when the latter is a scratch
+// we own. Folded encodings — and zero-disp [reg] operands — hand back a LIVE
+// guest base register, which must never be used as a load destination.
+auto emit_load_int_operand(TranslationResult& result, IROperand* op, bool is_m16) -> int;
+
 auto translate_gpr(TranslationResult* result, int is_64bit, uint8_t reg, unsigned int extend_mode,
                    int hint_reg) -> int;
 
