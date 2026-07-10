@@ -1267,7 +1267,7 @@ auto translate_fst(TranslationResult* a1, IRInstr* a2) -> void {
         if (is_fstp)
             x87_pop(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
-        free_fpr(*a1, Dd_src);
+        // Dd_src was already freed right after the FMOV to Xbits above.
         x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
         free_gpr(*a1, Wd_tmp);
         return;
