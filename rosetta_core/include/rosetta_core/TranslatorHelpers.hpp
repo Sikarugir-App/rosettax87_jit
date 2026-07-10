@@ -111,6 +111,54 @@ auto compute_mem_operand_address(TranslationResult& result, bool is_64bit, const
 auto compute_operand_address(TranslationResult& result, int is_64bit, IROperand* op, int dst_reg)
     -> int;
 
+// =============================================================================
+// Addressing-mode folding (ROSETTA_X87_DISABLE_ADDR_FOLD=1 to disable)
+//
+// For simple [base + disp] operands (64-bit address size, no index, no segment
+// override), the displacement can be folded straight into the AArch64 load/
+// store addressing mode instead of materializing the full effective address
+// with an ADD/SUB into a scratch register.
+// =============================================================================
+
+struct OperandAccess {
+    // Address register for the access. Callers ALWAYS free_gpr() it after the
+    // last use — free_gpr is a no-op for guest (non-scratch) registers, which
+    // the folded encodings return directly. NOTE: when enc != FullEA (and even
+    // for FullEA with zero disp) `base` may be a live guest register — never
+    // write to it.
+    int base;
+    int32_t offset;  // folded byte offset; always 0 when enc == FullEA
+    enum class Enc : uint8_t {
+        ScaledImm12,  // LDR/STR [base, #offset]   (offset / access_size as imm12)
+        Unscaled9,    // LDUR/STUR [base, #offset] (offset as signed imm9)
+        FullEA,       // offset already folded into base; access [base, #0]
+    } enc;
+};
+
+// Compute an access plan for `op`. Folds op->mem.disp into the addressing mode
+// when the operand is a plain MemRef [base + disp] with 64-bit address size and
+// the disp encodes for an access of size (1 << size_log2); otherwise falls back
+// to compute_operand_address (bit-identical to the pre-fold behavior).
+//
+// extra_off/extra_size_log2: a second access made through the same base at
+// byte offset (disp + extra_off) with size (1 << extra_size_log2) — e.g. the
+// trailing 2-byte exponent load of an m80 at +8. Folding requires both
+// accesses to encode in the SAME class (both imm12-scaled or both imm9).
+auto compute_operand_access(TranslationResult& result, int is_64bit, IROperand* op, int size_log2,
+                            int32_t extra_off = 0, int extra_size_log2 = 0) -> OperandAccess;
+
+// One-call replacement for the dominant pattern
+//   addr = compute_operand_address(...); emit_fldr/fstr_imm(size, Vt, addr, 0);
+//   free_gpr(addr);
+// size: 2=S (f32), 3=D (f64).  is_load: 1=LDR, 0=STR.
+auto emit_fp_mem_access(TranslationResult& result, int is_64bit, IROperand* op, int size,
+                        int is_load, int Vt) -> void;
+
+// GPR counterpart of emit_fp_mem_access. size_log2: 0=B 1=H 2=W 3=X.
+// Rt must not be a live guest register when is_load (it is written).
+auto emit_gpr_mem_access(TranslationResult& result, int is_64bit, IROperand* op, int size_log2,
+                         int is_load, int Rt) -> void;
+
 auto translate_gpr(TranslationResult* result, int is_64bit, uint8_t reg, unsigned int extend_mode,
                    int hint_reg) -> int;
 

@@ -99,6 +99,23 @@ auto emit_ldr_str_imm_ext(AssemblerBuffer& buf, int data_size, int write_back, i
 auto emit_fldur_fstur(AssemblerBuffer& buf, int size, int is_load, int16_t imm9, int Rn,
                       int Vt) -> void;
 
+// LDUR / STUR (GPR) — unscaled signed 9-bit offset, no writeback.
+// size: 0=B 1=H 2=W 3=X.  is_load: 1=LDUR, 0=STUR.
+auto emit_ldur_stur(AssemblerBuffer& buf, int size, int is_load, int16_t imm9, int Rn,
+                    int Rt) -> void;
+
+// Classify a byte displacement for a load/store of size (1 << size_log2):
+//   1 = scaled imm12  ([Rn, #disp], disp >= 0, aligned, disp/size <= 4095)
+//   2 = unscaled imm9 (LDUR/STUR, disp in [-256, 255])
+//   0 = neither encodes (materialize the full address instead)
+auto classify_ldst_disp(int64_t disp, int size_log2) -> int;
+
+// Emit one FP load/store folding a byte displacement into the addressing
+// mode (scaled imm12, else LDUR/STUR). Returns false — emitting nothing —
+// if neither form encodes.  size: 2=S (f32), 3=D (f64).
+auto try_emit_fp_ldst_disp(AssemblerBuffer& buf, int size, int is_load, int Vt, int Rn,
+                           int64_t disp) -> bool;
+
 // LDP / STP (SIMD&FP, D registers) — signed 7-bit offset scaled by 8.
 // Vt1 accesses [Rn + imm7*8], Vt2 accesses [Rn + imm7*8 + 8].
 auto emit_fldp_fstp_d(AssemblerBuffer& buf, int is_load, int16_t imm7_scaled, int Rn, int Vt1,

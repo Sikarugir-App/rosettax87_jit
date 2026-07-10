@@ -599,6 +599,60 @@ auto compute_operand_address(TranslationResult& result, int is_64bit, IROperand*
     __builtin_unreachable();
 }
 
+auto compute_operand_access(TranslationResult& result, int is_64bit, IROperand* op, int size_log2,
+                            int32_t extra_off, int extra_size_log2) -> OperandAccess {
+    const bool fold_enabled = !(g_rosetta_config && g_rosetta_config->disable_addr_fold);
+    // Fold only plain [base + disp] MemRefs with 64-bit address size: 32-bit
+    // address size needs W-register wraparound arithmetic (and guest upper-32
+    // bits may be dirty), and segment overrides / index registers / AbsMem /
+    // Immediate operands all need the full computation.
+    if (fold_enabled && op->kind == IROperandKind::MemRef && op->mem.seg_override == 0 &&
+        is_64bit && op->mem.addr_size == IROperandSize::S64 && op->mem.mem_flags == 1 &&
+        op->mem.base_reg < 0x50) {
+        const int64_t disp = op->mem.disp;
+        int cls = classify_ldst_disp(disp, size_log2);
+        if (cls != 0 && extra_off != 0 &&
+            classify_ldst_disp(disp + extra_off, extra_size_log2) != cls)
+            cls = 0;
+        if (cls != 0) {
+            return OperandAccess{(int)(op->mem.base_reg & 0xF), (int32_t)disp,
+                                 cls == 1 ? OperandAccess::Enc::ScaledImm12
+                                          : OperandAccess::Enc::Unscaled9};
+        }
+    }
+    return OperandAccess{compute_operand_address(result, is_64bit, op, GPR::XZR), 0,
+                         OperandAccess::Enc::FullEA};
+}
+
+auto emit_fp_mem_access(TranslationResult& result, int is_64bit, IROperand* op, int size,
+                        int is_load, int Vt) -> void {
+    const OperandAccess a = compute_operand_access(result, is_64bit, op, /*size_log2=*/size);
+    switch (a.enc) {
+    case OperandAccess::Enc::ScaledImm12:
+    case OperandAccess::Enc::FullEA:
+        if (is_load)
+            emit_fldr_imm(result.insn_buf, size, Vt, a.base, (int16_t)(a.offset >> size));
+        else
+            emit_fstr_imm(result.insn_buf, size, Vt, a.base, (int16_t)(a.offset >> size));
+        break;
+    case OperandAccess::Enc::Unscaled9:
+        emit_fldur_fstur(result.insn_buf, size, is_load, (int16_t)a.offset, a.base, Vt);
+        break;
+    }
+    free_gpr(result, a.base);
+}
+
+auto emit_gpr_mem_access(TranslationResult& result, int is_64bit, IROperand* op, int size_log2,
+                         int is_load, int Rt) -> void {
+    const OperandAccess a = compute_operand_access(result, is_64bit, op, size_log2);
+    if (a.enc == OperandAccess::Enc::Unscaled9)
+        emit_ldur_stur(result.insn_buf, size_log2, is_load, (int16_t)a.offset, a.base, Rt);
+    else
+        emit_ldr_str_imm(result.insn_buf, size_log2, /*is_fp=*/0, /*opc=*/is_load,
+                         (int16_t)(a.offset >> size_log2), a.base, Rt);
+    free_gpr(result, a.base);
+}
+
 // =============================================================================
 // translate_gpr  (mirrors binary at 0x20e14)
 //

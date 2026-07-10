@@ -111,17 +111,15 @@ static void emit_fld_value(AssemblerBuffer& buf, TranslationResult& a1,
 
         case kFldM32: {
             const bool a64 = (fld_instr->operands[0].mem.addr_size == IROperandSize::S64);
-            const int addr = compute_operand_address(a1, a64, &fld_instr->operands[0], GPR::XZR);
-            emit_fldr_imm(buf, /*size=*/2 /*S*/, Dd_val, addr, 0);
-            free_gpr(a1, addr);
+            emit_fp_mem_access(a1, (int)a64, &fld_instr->operands[0], /*size=*/2 /*S*/,
+                               /*is_load=*/1, Dd_val);
             emit_fcvt_s_to_d(buf, Dd_val, Dd_val);
             break;
         }
         case kFldM64: {
             const bool a64 = (fld_instr->operands[0].mem.addr_size == IROperandSize::S64);
-            const int addr = compute_operand_address(a1, a64, &fld_instr->operands[0], GPR::XZR);
-            emit_fldr_imm(buf, /*size=*/3 /*D*/, Dd_val, addr, 0);
-            free_gpr(a1, addr);
+            emit_fp_mem_access(a1, (int)a64, &fld_instr->operands[0], /*size=*/3 /*D*/,
+                               /*is_load=*/1, Dd_val);
             break;
         }
 
@@ -129,17 +127,17 @@ static void emit_fld_value(AssemblerBuffer& buf, TranslationResult& a1,
         case kFildM32:
         case kFildM64: {
             const int Wd_int = alloc_free_gpr(a1);
-            const int addr =
-                compute_operand_address(a1, /*is_64bit=*/true, &fld_instr->operands[0], GPR::XZR);
             if (cls.source == kFildM16) {
-                emit_ldr_str_imm(buf, 1, 0, 1, 0, addr, Wd_int);     // LDRH
-                emit_bitfield(buf, 0, 0, 0, 0, 15, Wd_int, Wd_int);  // SXTH
+                emit_gpr_mem_access(a1, /*is_64bit=*/1, &fld_instr->operands[0],
+                                    /*size_log2=*/1, /*is_load=*/1, Wd_int);   // LDRH
+                emit_bitfield(buf, 0, 0, 0, 0, 15, Wd_int, Wd_int);            // SXTH
             } else if (cls.source == kFildM32) {
-                emit_ldr_str_imm(buf, 2, 0, 1, 0, addr, Wd_int);  // LDR W
+                emit_gpr_mem_access(a1, /*is_64bit=*/1, &fld_instr->operands[0],
+                                    /*size_log2=*/2, /*is_load=*/1, Wd_int);   // LDR W
             } else {
-                emit_ldr_str_imm(buf, 3, 0, 1, 0, addr, Wd_int);  // LDR X
+                emit_gpr_mem_access(a1, /*is_64bit=*/1, &fld_instr->operands[0],
+                                    /*size_log2=*/3, /*is_load=*/1, Wd_int);   // LDR X
             }
-            free_gpr(a1, addr);
             const int is_64 = (cls.source == kFildM64) ? 1 : 0;
             emit_scvtf(buf, is_64, 1 /*f64*/, Dd_val, Wd_int);
             free_gpr(a1, Wd_int);
@@ -431,10 +429,8 @@ static auto try_fuse_fld_fstp(TranslationResult* a1, IRInstr* fld_instr, IRInstr
         if (is_f32)
             emit_fcvt_d_to_s(buf, Dd_val, Dd_val);
 
-        const int addr =
-            compute_operand_address(*a1, /*is_64bit=*/true, &fstp_instr->operands[0], GPR::XZR);
-        emit_fstr_imm(buf, is_f32 ? 2 : 3, Dd_val, addr, 0);
-        free_gpr(*a1, addr);
+        emit_fp_mem_access(*a1, /*is_64bit=*/1, &fstp_instr->operands[0], is_f32 ? 2 : 3,
+                           /*is_load=*/0, Dd_val);
     }
 
     free_fpr(*a1, Dd_val);
@@ -539,10 +535,8 @@ static auto try_fuse_fcom_fstsw(TranslationResult* a1, IRInstr* fcom_instr, IRIn
         emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, depth), Wd_tmp, Dd_src, Xst_base);
     } else {
         const bool is_f32 = (fcom_instr->operands[1].mem.size == IROperandSize::S32);
-        const int addr_reg =
-            compute_operand_address(*a1, /*is_64bit=*/true, &fcom_instr->operands[1], GPR::XZR);
-        emit_fldr_imm(buf, is_f32 ? 2 : 3, Dd_src, addr_reg, /*imm12=*/0);
-        free_gpr(*a1, addr_reg);
+        emit_fp_mem_access(*a1, /*is_64bit=*/1, &fcom_instr->operands[1], is_f32 ? 2 : 3,
+                           /*is_load=*/1, Dd_src);
         if (is_f32)
             emit_fcvt_s_to_d(buf, Dd_src, Dd_src);
     }
@@ -715,10 +709,8 @@ static auto try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
     if (arith_is_mem) {
         // Memory form: ARITH [mem] — load from memory
         const bool is_f32 = (arith_instr->operands[0].mem.size == IROperandSize::S32);
-        const int addr_reg =
-            compute_operand_address(*a1, /*is_64bit=*/true, &arith_instr->operands[0], GPR::XZR);
-        emit_fldr_imm(buf, is_f32 ? 2 : 3, Dd_src, addr_reg, /*imm12=*/0);
-        free_gpr(*a1, addr_reg);
+        emit_fp_mem_access(*a1, /*is_64bit=*/1, &arith_instr->operands[0], is_f32 ? 2 : 3,
+                           /*is_load=*/1, Dd_src);
         if (is_f32)
             emit_fcvt_s_to_d(buf, Dd_src, Dd_src);
     } else {
@@ -769,10 +761,8 @@ static auto try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
         if (is_f32)
             emit_fcvt_d_to_s(buf, Dd_fld, Dd_fld);
 
-        const int addr =
-            compute_operand_address(*a1, /*is_64bit=*/true, &fstp_instr->operands[0], GPR::XZR);
-        emit_fstr_imm(buf, is_f32 ? 2 : 3, Dd_fld, addr, 0);
-        free_gpr(*a1, addr);
+        emit_fp_mem_access(*a1, /*is_64bit=*/1, &fstp_instr->operands[0], is_f32 ? 2 : 3,
+                           /*is_load=*/0, Dd_fld);
     }
 
     free_fpr(*a1, Dd_fld);
@@ -894,10 +884,8 @@ static auto try_fuse_fld_arith_arithp(TranslationResult* a1, IRInstr* fld_instr,
         // FMA with memory multiply operand: load mem → Dd_mem, then single FMA.
         const int Dd_mem = alloc_free_fpr(*a1);
         const bool is_f32 = (arith_instr->operands[0].mem.size == IROperandSize::S32);
-        const int addr_reg =
-            compute_operand_address(*a1, /*is_64bit=*/true, &arith_instr->operands[0], GPR::XZR);
-        emit_fldr_imm(buf, is_f32 ? 2 : 3, Dd_mem, addr_reg, /*imm12=*/0);
-        free_gpr(*a1, addr_reg);
+        emit_fp_mem_access(*a1, /*is_64bit=*/1, &arith_instr->operands[0], is_f32 ? 2 : 3,
+                           /*is_load=*/1, Dd_mem);
         if (is_f32)
             emit_fcvt_s_to_d(buf, Dd_mem, Dd_mem);
 
@@ -924,10 +912,8 @@ static auto try_fuse_fld_arith_arithp(TranslationResult* a1, IRInstr* fld_instr,
         if (arith1_is_mem) {
             const int Dd_mem = alloc_free_fpr(*a1);
             const bool is_f32 = (arith_instr->operands[0].mem.size == IROperandSize::S32);
-            const int addr_reg =
-                compute_operand_address(*a1, /*is_64bit=*/true, &arith_instr->operands[0], GPR::XZR);
-            emit_fldr_imm(buf, is_f32 ? 2 : 3, Dd_mem, addr_reg, /*imm12=*/0);
-            free_gpr(*a1, addr_reg);
+            emit_fp_mem_access(*a1, /*is_64bit=*/1, &arith_instr->operands[0], is_f32 ? 2 : 3,
+                               /*is_load=*/1, Dd_mem);
             if (is_f32)
                 emit_fcvt_s_to_d(buf, Dd_mem, Dd_mem);
             switch (arith1) {
@@ -1038,10 +1024,8 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     // ── 4b: Load comparand → Dd_cmp ────────────────────────────────────────
     if (fcomp_is_mem) {
         const bool is_f32 = (fcomp_instr->operands[1].mem.size == IROperandSize::S32);
-        const int addr_reg =
-            compute_operand_address(*a1, /*is_64bit=*/true, &fcomp_instr->operands[1], GPR::XZR);
-        emit_fldr_imm(buf, is_f32 ? 2 : 3, Dd_cmp, addr_reg, /*imm12=*/0);
-        free_gpr(*a1, addr_reg);
+        emit_fp_mem_access(*a1, /*is_64bit=*/1, &fcomp_instr->operands[1], is_f32 ? 2 : 3,
+                           /*is_load=*/1, Dd_cmp);
         if (is_f32)
             emit_fcvt_s_to_d(buf, Dd_cmp, Dd_cmp);
     } else {
@@ -1512,10 +1496,8 @@ static auto try_fuse_arithp_fstp(TranslationResult* a1, IRInstr* arithp_instr, I
     if (is_f32)
         emit_fcvt_d_to_s(buf, Dd_dst, Dd_dst);
 
-    const int addr_reg =
-        compute_operand_address(*a1, /*is_64bit=*/true, &fstp_instr->operands[0], GPR::XZR);
-    emit_fstr_imm(buf, is_f32 ? 2 : 3, Dd_dst, addr_reg, /*imm12=*/0);
-    free_gpr(*a1, addr_reg);
+    emit_fp_mem_access(*a1, /*is_64bit=*/1, &fstp_instr->operands[0], is_f32 ? 2 : 3,
+                       /*is_load=*/0, Dd_dst);
 
     // Double pop — both old ST(0) and old ST(1) are consumed.
     // No stack slot writeback needed since both slots are popped away.
@@ -1617,10 +1599,8 @@ static auto try_fuse_arith_fstp(TranslationResult* a1, IRInstr* arith_instr, IRI
         emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp, Dd_dst, Xst_base);
 
         const bool arith_f32 = (arith_instr->operands[0].mem.size == IROperandSize::S32);
-        const int addr_arith =
-            compute_operand_address(*a1, /*is_64bit=*/true, &arith_instr->operands[0], GPR::XZR);
-        emit_fldr_imm(buf, arith_f32 ? 2 : 3, Dd_src, addr_arith, /*imm12=*/0);
-        free_gpr(*a1, addr_arith);
+        emit_fp_mem_access(*a1, /*is_64bit=*/1, &arith_instr->operands[0], arith_f32 ? 2 : 3,
+                           /*is_load=*/1, Dd_src);
 
         if (arith_f32)
             emit_fcvt_s_to_d(buf, Dd_src, Dd_src);
@@ -1652,10 +1632,8 @@ static auto try_fuse_arith_fstp(TranslationResult* a1, IRInstr* arith_instr, IRI
     if (is_f32)
         emit_fcvt_d_to_s(buf, Dd_dst, Dd_dst);
 
-    const int addr_fstp =
-        compute_operand_address(*a1, /*is_64bit=*/true, &fstp_instr->operands[0], GPR::XZR);
-    emit_fstr_imm(buf, is_f32 ? 2 : 3, Dd_dst, addr_fstp, /*imm12=*/0);
-    free_gpr(*a1, addr_fstp);
+    emit_fp_mem_access(*a1, /*is_64bit=*/1, &fstp_instr->operands[0], is_f32 ? 2 : 3,
+                       /*is_load=*/0, Dd_dst);
 
     // Single pop — ARITH doesn't pop, FSTP pops once.
     // Use x87_pop (not x87_pop_n) to participate in OPT-D2 deferred tag
@@ -1745,10 +1723,8 @@ static auto try_fuse_arith_faddp(TranslationResult* a1, IRInstr* mul_instr, IRIn
         emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp, Dd_st0, Xst_base);
 
         const bool mul_f32 = (mul_instr->operands[0].mem.size == IROperandSize::S32);
-        const int addr_mul =
-            compute_operand_address(*a1, /*is_64bit=*/true, &mul_instr->operands[0], GPR::XZR);
-        emit_fldr_imm(buf, mul_f32 ? 2 : 3, Dd_mul_op, addr_mul, /*imm12=*/0);
-        free_gpr(*a1, addr_mul);
+        emit_fp_mem_access(*a1, /*is_64bit=*/1, &mul_instr->operands[0], mul_f32 ? 2 : 3,
+                           /*is_load=*/1, Dd_mul_op);
 
         if (mul_f32)
             emit_fcvt_s_to_d(buf, Dd_mul_op, Dd_mul_op);
@@ -1894,10 +1870,8 @@ static auto try_fuse_fstp_fld(TranslationResult* a1, IRInstr* fstp_instr, IRInst
         if (is_f32)
             emit_fcvt_d_to_s(buf, Dd_st0, Dd_st0);
 
-        const int addr =
-            compute_operand_address(*a1, /*is_64bit=*/true, &fstp_instr->operands[0], GPR::XZR);
-        emit_fstr_imm(buf, is_f32 ? 2 : 3, Dd_st0, addr, 0);
-        free_gpr(*a1, addr);
+        emit_fp_mem_access(*a1, /*is_64bit=*/1, &fstp_instr->operands[0], is_f32 ? 2 : 3,
+                           /*is_load=*/0, Dd_st0);
 
         if (cls.source == kFldReg) {
             emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, cls.reg_depth + 1), Wd_tmp, Dd_fld, Xst_base);

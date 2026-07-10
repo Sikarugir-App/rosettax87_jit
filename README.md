@@ -71,6 +71,7 @@ These flags are primarily useful for narrowing down bugs by selectively disablin
 | `ROSETTA_X87_DISABLE_IR=1` | Disable IR optimization pipeline |
 | `ROSETTA_X87_DISABLE_CONST_PROMOTE=1` | Don't promote FP loads from read-only absolute addresses to translate-time constants |
 | `ROSETTA_X87_DISABLE_F32_NARROW=1` | Don't rewrite `narrow(op_f64(widen, widen))` sandwiches to single f32 (S-register) operations |
+| `ROSETTA_X87_DISABLE_ADDR_FOLD=1` | Don't fold `[base + disp]` displacements into LDR/STR addressing modes in the singular/fusion translators (materialize the full address instead) |
 | `ROSETTA_X87_DISABLE_ALL_OPS=1` | Disable all translated opcodes (fall back to Rosetta default) |
 | `ROSETTA_X87_DISABLE_ALL_FUSIONS=1` | Disable all instruction fusions |
 | `ROSETTA_X87_DISABLE_OPS=op1,op2,...` | Disable specific opcodes (comma-separated; names = `OpcodeId` entries in `rosetta_config/include/rosetta_config/Config.h`) |

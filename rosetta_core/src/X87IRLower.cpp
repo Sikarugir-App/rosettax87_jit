@@ -497,22 +497,9 @@ void lower(Context& ctx, TranslationResult* result) {
     auto emit_cached_access = [&](const Node& n, int size, int is_load, int Vt) -> bool {
         for (int k = 0; k < addr_n; k++) {
             if (!addr_base_key_equal(n.mem_operand, addr_rep[k])) continue;
-            const int64_t disp = n.mem_operand->mem.disp;
-            const int scale = (size == 3) ? 8 : 4;
-            if (disp >= 0 && disp % scale == 0 && disp / scale <= 4095) {
-                if (is_load)
-                    emit_fldr_imm(buf, size, Vt, addr_reg[k],
-                                  static_cast<int16_t>(disp / scale));
-                else
-                    emit_fstr_imm(buf, size, Vt, addr_reg[k],
-                                  static_cast<int16_t>(disp / scale));
-            } else if (disp >= -256 && disp <= 255) {
-                emit_fldur_fstur(buf, size, is_load, static_cast<int16_t>(disp),
-                                 addr_reg[k], Vt);
-            } else {
-                continue;
-            }
-            return true;
+            if (try_emit_fp_ldst_disp(buf, size, is_load, Vt, addr_reg[k],
+                                      n.mem_operand->mem.disp))
+                return true;
         }
         return false;
     };

@@ -102,6 +102,7 @@ struct RosettaConfig {
     uint8_t  f32_arith;              // ROSETTA_X87_F32_ARITH=1 — keep f32-sourced arithmetic CHAINS in f32 (not bit-exact vs f64 intermediates; opt-in)
     uint8_t  fast_recip_div;         // ROSETTA_X87_FAST_RECIP_DIV=1 — FDiv by ANY normal constant → FMul by reciprocal (up to 1 ulp off; opt-in)
     uint8_t  log_ir_declines;        // ROSETTA_X87_LOG_IR_DECLINES=1 — print address + CompileError for every run the IR pipeline declines
+    uint8_t  disable_addr_fold;      // ROSETTA_X87_DISABLE_ADDR_FOLD=1 — don't fold base+disp into LDR/STR addressing modes (singular + fusion paths)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

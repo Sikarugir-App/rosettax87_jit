@@ -311,6 +311,42 @@ auto emit_fstr_imm(AssemblerBuffer& buf, int size, int Dt, int Rn, int16_t imm12
     emit_ldr_str_imm(buf, size, /*is_fp=*/1, /*opc=*/0, imm12, Rn, Dt);
 }
 
+auto emit_ldur_stur(AssemblerBuffer& buf, int size, int is_load, int16_t imm9, int Rn,
+                    int Rt) -> void {
+    // LDUR/STUR (GPR), unscaled signed 9-bit offset, no writeback.
+    // Encoding: size(2) 111 V=0 00 opc(2) 0 imm9 00 Rn Rt
+    uint32_t insn = 0x38000000u;
+    insn |= (uint32_t)(size & 3) << 30;
+    insn |= (uint32_t)(is_load & 1) << 22;
+    insn |= ((uint32_t)imm9 & 0x1FF) << 12;
+    insn |= (uint32_t)(Rn & 0x1F) << 5;
+    insn |= (uint32_t)(Rt & 0x1F);
+    buf.emit(insn);
+}
+
+auto classify_ldst_disp(int64_t disp, int size_log2) -> int {
+    if (disp >= 0 && (disp & ((1 << size_log2) - 1)) == 0 && (disp >> size_log2) <= 4095)
+        return 1;
+    if (disp >= -256 && disp <= 255)
+        return 2;
+    return 0;
+}
+
+auto try_emit_fp_ldst_disp(AssemblerBuffer& buf, int size, int is_load, int Vt, int Rn,
+                           int64_t disp) -> bool {
+    switch (classify_ldst_disp(disp, size)) {
+    case 1:
+        emit_ldr_str_imm(buf, size, /*is_fp=*/1, /*opc=*/is_load,
+                         (int16_t)(disp >> size), Rn, Vt);
+        return true;
+    case 2:
+        emit_fldur_fstur(buf, size, is_load, (int16_t)disp, Rn, Vt);
+        return true;
+    default:
+        return false;
+    }
+}
+
 auto emit_fldp_fstp_d(AssemblerBuffer& buf, int is_load, int16_t imm7_scaled, int Rn, int Vt1,
                       int Vt2) -> void {
     // LDP/STP (SIMD&FP, 64-bit D registers, signed offset, no writeback).
