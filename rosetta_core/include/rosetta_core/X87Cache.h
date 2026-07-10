@@ -42,10 +42,25 @@ struct X87Cache {
     void reset_perm();
     bool perm_is_identity() const;
 
+    // True if the opcode has a translate_* handler (participates in x87 runs).
+    static bool is_handled(uint16_t op);
+
+    // OPT-RB: run-transparent integer instructions (mov/movzx/movsx/movsxd/
+    // lea/nop). With ROSETTA_X87_RUN_BRIDGE=1, an active run's pinned GPRs
+    // survive across them: Rosetta translates the instruction itself, but the
+    // pinned registers stay excluded from free_gpr_mask.
+    static bool is_transparent(uint16_t op);
+
     // Scan forward from insn_idx counting consecutive handled x87 instructions.
     // disabled_ops_mask: bitmask of OpcodeId bits for disabled opcodes — stops
     // counting when a disabled opcode is encountered (it will fall back to Rosetta,
     // breaking the run from our perspective).
+    // bridge (OPT-RB): additionally count short gaps (≤ kMaxBridgeGap) of
+    // run-transparent instructions between x87 groups. A gap is only counted
+    // when another enabled x87 instruction follows it — a run NEVER ends on a
+    // bridged instruction (the deferred TOP/tag flush in x87_end / the IR
+    // epilogue relies on the last counted instruction being x87).
+    static constexpr int kMaxBridgeGap = 4;
     static int lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
-                         uint64_t disabled_ops_mask = 0);
+                         uint64_t disabled_ops_mask = 0, bool bridge = false);
 };

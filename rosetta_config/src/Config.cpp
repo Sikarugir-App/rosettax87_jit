@@ -153,6 +153,12 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ADDR_FOLD"))
         cfg.disable_addr_fold = (*v == '1') ? 1 : 0;
 
+    if (const char* v = std::getenv("ROSETTA_X87_LOG_RUN_BREAKS"))
+        cfg.log_run_breaks = (*v == '1') ? 1 : 0;
+
+    if (const char* v = std::getenv("ROSETTA_X87_RUN_BRIDGE"))
+        cfg.run_bridge = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')
             cfg.disabled_ops_mask = ~0ULL;

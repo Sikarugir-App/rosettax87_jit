@@ -81,6 +81,33 @@ static OpcodeId opcode_to_id(uint16_t op) {
     }
 }
 
+// ── Phase-0 run-break telemetry (ROSETTA_X87_LOG_RUN_BREAKS) ─────────────────
+// One line per x87 run at translation time: run length, the guest opcode that
+// ended it, the gap until the next x87 instruction (within 16), and the
+// breaker's address. Drives the transparent-set choice for OPT-RB bridging.
+static void log_run_break(TranslationResult* translation_result, IRInstr* instr_array,
+                          int64_t num_instrs, int64_t insn_idx, int run) {
+    const int64_t brk = insn_idx + run;
+    if (brk >= num_instrs) {
+        CORE_LOG("X87 run-break: len=%d block-end", run);
+        return;
+    }
+    const uint16_t bop = instr_array[brk].opcode();
+    int gap = 0;
+    int64_t j = brk;
+    while (j < num_instrs && gap < 16 && !X87Cache::is_handled(instr_array[j].opcode())) {
+        j++;
+        gap++;
+    }
+    const int resumes = (j < num_instrs && X87Cache::is_handled(instr_array[j].opcode())) ? 1 : 0;
+    const char* name =
+        (bop < kOpcodeNames.size() && kOpcodeNames[bop]) ? kOpcodeNames[bop] : "?";
+    const uintptr_t address =
+        translation_result->ir_module_data->text_vmaddr_range + instr_array[brk].pc;
+    CORE_LOG("X87 run-break: len=%d breaker=%s(%u) gap=%d resumes=%d at %lx", run, name,
+             bop, gap, resumes, address);
+}
+
 auto Translator::translate_instruction(TranslationResult* translation_result, IRBlock* block,
                                        IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx)
     -> std::optional<int64_t> {
@@ -108,10 +135,19 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
             const bool cache_disabled = g_rosetta_config && g_rosetta_config->disable_x87_cache;
             if (!cache_disabled) {
                 const uint64_t ops_mask = g_rosetta_config ? g_rosetta_config->disabled_ops_mask : 0;
-                const int run = X87Cache::lookahead(instr_array, num_instrs, insn_idx, ops_mask);
+                const bool bridge = g_rosetta_config && g_rosetta_config->run_bridge;
+                const int run =
+                    X87Cache::lookahead(instr_array, num_instrs, insn_idx, ops_mask, bridge);
+                if (g_rosetta_config && g_rosetta_config->log_run_breaks && run > 0)
+                    log_run_break(translation_result, instr_array, num_instrs, insn_idx, run);
                 cache.set_run(run);
             }
         }
+        // OPT-RB: after a bridged instruction, Rosetta's own translation ran.
+        // If it reset the scratch mask, re-exclude the pinned cache GPRs
+        // before anything here allocates from it.
+        if (g_rosetta_config && g_rosetta_config->run_bridge && cache.active())
+            translation_result->free_gpr_mask &= ~cache.pinned_mask();
     }
 
     // ── IR pipeline: try whole-run optimization for runs of 2+ ─────────────
@@ -362,6 +398,26 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                 break;
 
             default:
+                // OPT-RB (opt-in ROSETTA_X87_RUN_BRIDGE): a run-transparent
+                // integer instruction inside an active run. Rosetta translates
+                // it itself; we only tick the run counter and keep the pinned
+                // cache GPRs excluded from the scratch pool so the cache
+                // survives. lookahead guarantees a run never ENDS on a bridged
+                // instruction, so pending deferred TOP/tag state is always
+                // flushed by a later x87 instruction's x87_end / IR epilogue.
+                if (cache.active() && g_rosetta_config && g_rosetta_config->run_bridge &&
+                    X87Cache::is_transparent(opcode)) {
+                    cache.tick();
+                    if (cache.active()) {
+                        translation_result->free_gpr_mask =
+                            kGprScratchMask & ~cache.pinned_mask();
+                    } else {
+                        translation_result->free_gpr_mask = kGprScratchMask;
+                    }
+                    translation_result->free_fpr_mask =
+                        translation_result->_unoccupied_temporary_fprs_for_xmm_scalars;
+                    return std::nullopt;
+                }
                 // Hand translation back to rosetta, we don't support this instruction - invalidate
                 // cache.
                 cache.invalidate(translation_result->free_gpr_mask, kGprScratchMask);

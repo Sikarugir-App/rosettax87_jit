@@ -211,19 +211,67 @@ static OpcodeId opcode_to_id_local(uint16_t op) {
     }
 }
 
+bool X87Cache::is_handled(uint16_t op) {
+    return is_handled_x87(op);
+}
+
+// OPT-RB: instructions Rosetta may translate mid-run without invalidating the
+// pinned base/TOP/st_base GPRs. Criteria: trivially self-contained, no x87
+// side effects, no control flow. Kept deliberately minimal (v1); push/pop and
+// flag definers are excluded on purpose.
+bool X87Cache::is_transparent(uint16_t op) {
+    switch (op) {
+        case kOpcodeName_mov:
+        case kOpcodeName_movzx:
+        case kOpcodeName_movsx:
+        case kOpcodeName_movsxd:
+        case kOpcodeName_lea:
+        case kOpcodeName_nop:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool op_disabled_for_run(uint16_t op, uint64_t disabled_ops_mask) {
+    if (!disabled_ops_mask)
+        return false;
+    const auto id = opcode_to_id_local(op);
+    return id != OpcodeId::kCount &&
+           ((disabled_ops_mask >> static_cast<int>(id)) & 1u);
+}
+
 int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
-                        uint64_t disabled_ops_mask) {
+                        uint64_t disabled_ops_mask, bool bridge) {
     int count = 0;
-    for (int64_t i = insn_idx; i < num_instrs; i++) {
-        if (!is_handled_x87(instr_array[i].opcode()))
-            break;
-        if (disabled_ops_mask) {
-            const auto id = opcode_to_id_local(instr_array[i].opcode());
-            if (id != OpcodeId::kCount &&
-                ((disabled_ops_mask >> static_cast<int>(id)) & 1u))
-                break;
+    int64_t i = insn_idx;
+    for (;;) {
+        // Consume a maximal group of handled, enabled x87 instructions.
+        int group = 0;
+        while (i < num_instrs && is_handled_x87(instr_array[i].opcode()) &&
+               !op_disabled_for_run(instr_array[i].opcode(), disabled_ops_mask)) {
+            i++;
+            group++;
         }
-        count++;
+        count += group;
+        if (!bridge || count == 0)
+            break;
+        // OPT-RB: cross a short transparent gap, but only when another enabled
+        // x87 instruction follows — a trailing gap is never counted, so a run
+        // always ends on an x87 instruction (see header comment).
+        int gap = 0;
+        int64_t j = i;
+        while (j < num_instrs && gap < kMaxBridgeGap &&
+               is_transparent(instr_array[j].opcode())) {
+            j++;
+            gap++;
+        }
+        if (gap == 0 || j >= num_instrs ||
+            !is_handled_x87(instr_array[j].opcode()) ||
+            op_disabled_for_run(instr_array[j].opcode(), disabled_ops_mask))
+            break;
+        count += gap;
+        i = j;
     }
     return count;
 }

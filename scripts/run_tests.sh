@@ -73,6 +73,7 @@ ALL_TESTS=(
     test_decoder_arpl
     test_ir_gpr_pressure
     test_int_regbase
+    test_run_breaks
 )
 
 RED='\033[0;31m'
