@@ -74,6 +74,7 @@ ALL_TESTS=(
     test_ir_gpr_pressure
     test_int_regbase
     test_run_breaks
+    test_ir_fpr_pressure
 )
 
 RED='\033[0;31m'

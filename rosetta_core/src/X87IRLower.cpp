@@ -1830,8 +1830,6 @@ static bool try_fuse_fcom_test(Context& ctx, IRInstr* instr_array, int64_t num_i
 int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_instrs,
                 int64_t start_idx, int run_length, int* tail_consumed,
                 CompileError* err) {
-    Context ctx;
-
     // Report a decline reason and yield 0 (nothing consumed) in one line.
     auto fail = [&](CompileError e) { if (err) *err = e; return 0; };
 
@@ -1848,6 +1846,17 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
     const bool const_promote =
         !(g_rosetta_config && g_rosetta_config->disable_const_promote);
 
+    // NOTE (2026-07-11): a pressure-decline PREFIX RETRY (halve run_length on
+    // kFprPressure/kGprPressure and lower the fitting prefix) was implemented
+    // here and reverted after measurement: it benched 16% SLOWER than the
+    // full decline on the 8-live-loads shape. Splitting the run pays two
+    // epilogues and breaks the deferred push/pop tag cancellation, while the
+    // singular fallback keeps the run cache active and defers everything.
+    // The effective fix for FPR-pressure declines is the extended FPR pool
+    // (ROSETTA_X87_EXTENDED_FPR_SCRATCH=1): the same shape lowers as ONE run,
+    // 2.3x faster than the decline path. If a retry is ever revisited, split
+    // at a balanced point (cumulative top_delta == 0), never at consumed/2.
+    Context ctx;
     if (!build(ctx, instr_array, num_instrs, start_idx, run_length, perm, const_promote))
         return fail(CompileError::kBuildFailed);
 

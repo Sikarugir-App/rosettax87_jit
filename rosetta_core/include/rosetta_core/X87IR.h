@@ -9,7 +9,7 @@ union IROperand;
 
 namespace X87IR {
 
-static constexpr int kMaxNodes = 64;
+static constexpr int kMaxNodes = 128;
 
 // ── IR opcodes ──────────────────────────────────────────────────────────────
 
