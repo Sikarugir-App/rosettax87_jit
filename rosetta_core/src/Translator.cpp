@@ -257,6 +257,15 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
         }
     }
 
+    // OPT-BC: an x87 instruction is about to go through the peephole/singular
+    // translators. Release any carried addr-cache/RC pins first: those paths
+    // can change control_word (fldcw) or AX (fstsw) behind the carried state,
+    // and they allocate several transient GPRs (emit_fcom_cc_pack peaks at 4)
+    // — the carried pins would shrink the pool below what they were audited
+    // against.
+    if (cache.carried_any() && X87Cache::is_handled(opcode))
+        cache.carried_release(translation_result->free_gpr_mask);
+
     // ── Peephole: try 2-instruction fusion patterns ─────────────────────────
     const uint64_t fusions_mask = g_rosetta_config ? g_rosetta_config->disabled_fusions_mask : 0;
     const auto fused =
@@ -473,6 +482,12 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                 // flushed by a later x87 instruction's x87_end / IR epilogue.
                 if (cache.active() && g_rosetta_config && g_rosetta_config->run_bridge &&
                     X87Cache::is_transparent(opcode)) {
+                    // OPT-BC: the gap instruction may redefine a guest GPR a
+                    // carried base was derived from. Freed bits return via
+                    // the pinned_mask() recompute below.
+                    if (cache.carried_any())
+                        cache.carried_drop_written(
+                            X87Cache::gap_written_gpr_mask(cur_instr));
                     cache.tick();
                     if (cache.active()) {
                         translation_result->free_gpr_mask =

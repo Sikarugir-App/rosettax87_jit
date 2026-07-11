@@ -264,6 +264,36 @@ static double inline_movzx_movsx(long *zxb, long *sxb, long *zxh, long *sxw, lon
     return r;
 }
 
+/* (j) OPT-BC (ROSETTA_X87_BRIDGE_CARRY): fistp runs split by a non-inlinable
+ *     SSE gap, with an fldcw changing the rounding mode between carried
+ *     runs. The carried RC value must be invalidated when the fldcw goes
+ *     through a non-IR path, and re-cached when it lands in-run — either
+ *     way each fistp must honor the control word in force. */
+static void carry_rc_fldcw(double v, int *near1, int *near2, int *trunc1, int *trunc2) {
+    unsigned short cw_old = 0, cw_trunc = 0;
+    int a = 0, b = 0, c = 0, d = 0;
+    float f = 1.0f;
+    __asm__ volatile(
+        "fnstcw %4\n"
+        "movzwl %4, %%ecx\n"
+        "orl $0x0C00, %%ecx\n"        /* RC = truncate */
+        "movw %%cx, %5\n"
+        /* nearest-mode pair, split by movss */
+        "fldl %6\n" "fistpl %0\n"
+        "fldl %6\n" "fistpl %1\n"
+        "movss %7, %%xmm1\n"
+        /* switch to truncate between runs */
+        "fldcw %5\n"
+        "fldl %6\n" "fistpl %2\n"
+        "movss %7, %%xmm1\n"
+        "fldl %6\n" "fistpl %3\n"
+        "fldcw %4\n"                  /* restore */
+        : "=m"(a), "=m"(b), "=m"(c), "=m"(d), "+m"(cw_old), "+m"(cw_trunc)
+        : "m"(v), "m"(f)
+        : "ecx", "xmm1");
+    *near1 = a; *near2 = b; *trunc1 = c; *trunc2 = d;
+}
+
 /* (i) deep x87 stack with guest movs interleaved — exercises the pressure
  *     models with Guest nodes present. */
 static double inline_deep_stack(void) {
@@ -352,6 +382,15 @@ int main(void) {
     GUARDED("inline_deep_stack", {
         check("inline_deep_stack: sum with interleaved movs",
               inline_deep_stack(), 21.0);
+    });
+
+    GUARDED("carry_rc_fldcw", {
+        int n1 = 0, n2 = 0, t1 = 0, t2 = 0;
+        carry_rc_fldcw(3.7, &n1, &n2, &t1, &t2);
+        check_long("carry_rc_fldcw: nearest before fldcw", n1, 4);
+        check_long("carry_rc_fldcw: nearest across gap", n2, 4);
+        check_long("carry_rc_fldcw: truncate after fldcw", t1, 3);
+        check_long("carry_rc_fldcw: truncate across gap", t2, 3);
     });
 
     printf("\n%d failure(s)\n", failures);

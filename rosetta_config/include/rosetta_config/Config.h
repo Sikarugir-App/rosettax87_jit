@@ -106,10 +106,15 @@ struct RosettaConfig {
     uint8_t  log_run_breaks;         // ROSETTA_X87_LOG_RUN_BREAKS=1 — log length + breaking opcode + gap-to-next-x87 for every x87 run
     uint8_t  run_bridge;             // ROSETTA_X87_RUN_BRIDGE=1 — keep an active run's pinned cache GPRs across run-transparent integer instrs (mov/lea/…; opt-in)
     uint8_t  transparent_int;        // ROSETTA_X87_TRANSPARENT_INT=1 — inline simple reg-form mov/lea/movzx/movsx into IR runs (requires RUN_BRIDGE; opt-in)
+    uint8_t  bridge_carry;           // ROSETTA_X87_BRIDGE_CARRY=1 — carry base-address-cache + RC GPRs across bridged gaps (implies RUN_BRIDGE; opt-in)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };
-static_assert(sizeof(RosettaConfig) == 0x20);
+// Grown 0x20 → 0x28 when the 17th byte-flag (bridge_carry) crossed the old
+// size. The loader writes this struct into the runtime's __DATA,config by
+// sizeof — both sides compile from this header, so they stay in sync as long
+// as loader and runtime dylib come from the same build.
+static_assert(sizeof(RosettaConfig) == 0x28);
 
 inline bool op_is_disabled(const RosettaConfig& cfg, OpcodeId id) {
     return (cfg.disabled_ops_mask >> static_cast<int>(id)) & 1u;

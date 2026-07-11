@@ -167,6 +167,13 @@ RosettaConfig parse_config_from_env() {
         if (cfg.transparent_int) cfg.run_bridge = 1;
     }
 
+    // Carrying pinned addr-cache/RC GPRs across gaps only means anything when
+    // gaps are bridged. Setting it implies RUN_BRIDGE.
+    if (const char* v = std::getenv("ROSETTA_X87_BRIDGE_CARRY")) {
+        cfg.bridge_carry = (*v == '1') ? 1 : 0;
+        if (cfg.bridge_carry) cfg.run_bridge = 1;
+    }
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')
             cfg.disabled_ops_mask = ~0ULL;

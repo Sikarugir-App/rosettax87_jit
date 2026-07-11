@@ -517,6 +517,16 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
     }
 }
 
+// ── OPT-BC: carried-entry key match ─────────────────────────────────────────
+// Same identity as addr_base_key_equal, against a CarriedBase snapshot.
+static bool carried_key_match(const X87Cache::CarriedBase& c, const IROperand* op) {
+    return c.addr_size == static_cast<uint8_t>(op->mem.addr_size) &&
+           c.mem_flags == op->mem.mem_flags &&
+           c.base_reg == op->mem.base_reg &&
+           c.index_reg == op->mem.index_reg &&
+           c.shift_amount == op->mem.shift_amount;
+}
+
 // ── RC preamble: load control_word and extract rounding-control bits ────────
 
 static void emit_rc_preamble(AssemblerBuffer& buf, int Xbase, int Wd_out) {
@@ -587,12 +597,32 @@ void lower(Context& ctx, TranslationResult* result) {
     const bool top0_specialize = top0_benefit >= 4;
 
     // ── Base-address cache: materialize planned guest bases ────────────────
+    // OPT-BC: a planned base whose key matches a carried entry reuses the
+    // carried GPR (already pinned, value still valid) instead of
+    // re-materializing.
+    auto& xc = result->x87_cache;
+    const bool carry_on = g_rosetta_config && g_rosetta_config->bridge_carry;
     const int addr_n = ctx.addr_cache_n;
     IROperand* addr_rep[2] = {nullptr, nullptr};
     int addr_reg[2] = {-1, -1};
     bool addr_owned[2] = {false, false};
     for (int k = 0; k < addr_n; k++) {
         addr_rep[k] = ctx.nodes[ctx.addr_cache_rep[k]].mem_operand;
+        if (carry_on) {
+            int hit = -1;
+            for (int s = 0; s < X87Cache::kMaxCarried; s++) {
+                if (xc.carried_base[s].gpr >= 0 &&
+                    carried_key_match(xc.carried_base[s], addr_rep[k])) {
+                    hit = s;
+                    break;
+                }
+            }
+            if (hit >= 0) {
+                addr_reg[k] = xc.carried_base[hit].gpr;
+                addr_owned[k] = false;  // pinned by the cache, not allocated here
+                continue;
+            }
+        }
         IROperand base_op = *addr_rep[k];
         base_op.mem.disp = 0;
         addr_reg[k] = compute_operand_address(*result, true, &base_op, GPR::XZR);
@@ -643,25 +673,34 @@ void lower(Context& ctx, TranslationResult* result) {
     };
 
     // ── RC caching: hoist LDRH+UBFX when ≥2 RC consumers in a segment ────
+    // OPT-BC: a carried RC GPR is reused regardless of this run's consumer
+    // count — its value is already valid (only FLDCW changes control_word,
+    // and StoreCW re-caches into the same register).
     int Wd_rc_cached = -1;
+    bool rc_entry_valid = false;
 
     if (!(g_rosetta_config && g_rosetta_config->fast_round)) {
-        int rc_count = 0;
-        bool use_rc_cache = false;
-        for (int i = 0; i < ctx.num_nodes; i++) {
-            auto& n = ctx.nodes[i];
-            if (n.flags & kDead) continue;
-            if (n.op == Op::StoreCW) { continue; }
-            bool is_rc = (n.op == Op::FRndInt) ||
-                ((n.op == Op::StoreI16 || n.op == Op::StoreI32 || n.op == Op::StoreI64)
-                 && !(n.flags & kTruncate));
-            if (is_rc && ++rc_count >= 2) { use_rc_cache = true; break; }
+        if (carry_on && xc.carried_rc_gpr >= 0) {
+            Wd_rc_cached = xc.carried_rc_gpr;
+            rc_entry_valid = true;
+        } else {
+            int rc_count = 0;
+            bool use_rc_cache = false;
+            for (int i = 0; i < ctx.num_nodes; i++) {
+                auto& n = ctx.nodes[i];
+                if (n.flags & kDead) continue;
+                if (n.op == Op::StoreCW) { continue; }
+                bool is_rc = (n.op == Op::FRndInt) ||
+                    ((n.op == Op::StoreI16 || n.op == Op::StoreI32 || n.op == Op::StoreI64)
+                     && !(n.flags & kTruncate));
+                if (is_rc && ++rc_count >= 2) { use_rc_cache = true; break; }
+            }
+            if (use_rc_cache)
+                // alloc_free_gpr, NOT alloc_gpr(pool 3): the addr cache may
+                // already hold x25 (any scratch), and fixed-slot allocation
+                // asserts on collision. The RC dispatch works from any register.
+                Wd_rc_cached = alloc_free_gpr(*result);
         }
-        if (use_rc_cache)
-            // alloc_free_gpr, NOT alloc_gpr(pool 3): the addr cache may
-            // already hold x25 (any scratch), and fixed-slot allocation
-            // asserts on collision. The RC dispatch works from any register.
-            Wd_rc_cached = alloc_free_gpr(*result);
     }
 
     // ── NZCV hoisting / elision around FCmp/FTst ────────────────────────────
@@ -709,7 +748,7 @@ void lower(Context& ctx, TranslationResult* result) {
         if (in_s >= 0 && fprs.last_use[in_s] < e)
             fprs.last_use[in_s] = static_cast<int16_t>(e);
     }
-    bool rc_cache_valid = false;
+    bool rc_cache_valid = rc_entry_valid;  // OPT-BC: carried RC is pre-loaded
     int Wd_nzcv_saved = -1;
     const int final_top_known =
         (top_known >= 0) ? ((top_known + ctx.top_delta) & 7) : -1;
@@ -1411,13 +1450,90 @@ void lower(Context& ctx, TranslationResult* result) {
     result->x87_cache.deferred_pop_count = 0;
     result->x87_cache.reset_perm();
 
-    // 7. Free scratch GPRs.
-    for (int k = 0; k < addr_n; k++) {
-        if (addr_owned[k])
-            free_gpr(*result, addr_reg[k]);
+    // 7. Free scratch GPRs — or carry them across the bridge (OPT-BC).
+    // When the cache stays active past this run, transfer up to kMaxCarried
+    // pins (planned bases first, then still-valid older entries, then RC) to
+    // X87Cache; the next IR run reuses them instead of re-materializing.
+    // Dropped GPRs return to the pool when the caller recomputes
+    // free_gpr_mask from pinned_mask().
+    {
+        bool base_carried[2] = {false, false};
+        bool rc_carried = false;
+        const bool stays_active = xc.run_remaining > ctx.consumed;
+        if (carry_on && stays_active) {
+            bool run_has_fstsw = false;
+            for (int i = 0; i < ctx.num_nodes; i++) {
+                const auto& n = ctx.nodes[i];
+                if (!(n.flags & kDead) && n.op == Op::FStsw) {
+                    run_has_fstsw = true;
+                    break;
+                }
+            }
+            // Never carry x29 (pool slot 7 — compute_operand_address's
+            // GS/TLS fallback fixed-allocates it) or a non-scratch register
+            // (the 64-bit no-disp path returns the guest register itself).
+            auto gpr_carryable = [](int g) {
+                return g >= 0 && g != GPR::X29 && ((kGprScratchMask >> g) & 1u) != 0;
+            };
+
+            X87Cache::CarriedBase next[X87Cache::kMaxCarried];
+            int8_t next_rc = -1;
+            int nbase = 0;
+            // This run's planned reps: plan_addr_cache already excluded
+            // guest-written and FSTSW/RAX operands, so every rep qualifies.
+            for (int k = 0; k < addr_n && nbase < X87Cache::kMaxCarried; k++) {
+                if (!gpr_carryable(addr_reg[k])) continue;
+                auto& c = next[nbase];
+                c.addr_size = static_cast<uint8_t>(addr_rep[k]->mem.addr_size);
+                c.mem_flags = addr_rep[k]->mem.mem_flags;
+                c.base_reg = addr_rep[k]->mem.base_reg;
+                c.index_reg = addr_rep[k]->mem.index_reg;
+                c.shift_amount = addr_rep[k]->mem.shift_amount;
+                c.gpr = static_cast<int8_t>(addr_reg[k]);
+                base_carried[k] = true;
+                nbase++;
+            }
+            // Older carried entries this run didn't plan stay valid unless
+            // the run redefined their guest registers (inlined Guest nodes,
+            // or FSTSW writing AX).
+            for (int s = 0; s < X87Cache::kMaxCarried && nbase < X87Cache::kMaxCarried;
+                 s++) {
+                const auto& oc = xc.carried_base[s];
+                if (oc.gpr < 0) continue;
+                bool dup = false;
+                for (int j = 0; j < nbase; j++)
+                    if (next[j].gpr == oc.gpr) dup = true;
+                if (dup) continue;
+                uint16_t written = ctx.guest_written_mask;
+                if (run_has_fstsw) written |= 1u;  // AX
+                const bool stale =
+                    ((oc.mem_flags & 1) && ((written >> (oc.base_reg & 0xF)) & 1)) ||
+                    ((oc.mem_flags & 2) && ((written >> (oc.index_reg & 0xF)) & 1));
+                if (stale) continue;
+                next[nbase++] = oc;
+            }
+            if (Wd_rc_cached >= 0 && nbase < X87Cache::kMaxCarried &&
+                gpr_carryable(Wd_rc_cached)) {
+                next_rc = static_cast<int8_t>(Wd_rc_cached);
+                rc_carried = true;
+            }
+            xc.carried_clear();
+            for (int j = 0; j < nbase; j++)
+                xc.carried_base[j] = next[j];
+            xc.carried_rc_gpr = next_rc;
+        } else if (carry_on) {
+            // Run cache expires with this run; tick() clears the flags and
+            // the caller resets the mask.
+            xc.carried_clear();
+        }
+
+        for (int k = 0; k < addr_n; k++) {
+            if (addr_owned[k] && !base_carried[k])
+                free_gpr(*result, addr_reg[k]);
+        }
+        if (Wd_rc_cached >= 0 && !rc_carried)
+            free_gpr(*result, Wd_rc_cached);
     }
-    if (Wd_rc_cached >= 0)
-        free_gpr(*result, Wd_rc_cached);
     free_gpr(*result, Wd_tmp);
 
     // 8. If cache is about to expire (run_remaining will hit 0 after ticks),
@@ -2025,13 +2141,48 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
         const bool gprs_cached = cache.run_remaining > 0 && cache.gprs_valid;
         const int peak = peak_live_gprs(ctx, entry_deferred, gprs_cached);
         if (peak > gpr_available) {
-            return fail(CompileError::kGprPressure);
+            // OPT-BC: carried pins are an optimization, releasable at will —
+            // give their registers back and retry before declining the run.
+            if (result->x87_cache.carried_any()) {
+                result->x87_cache.carried_release(result->free_gpr_mask);
+                gpr_pool = result->free_gpr_mask;
+                gpr_available = 0;
+                while (gpr_pool) { gpr_available++; gpr_pool &= gpr_pool - 1; }
+            }
+            if (peak > gpr_available)
+                return fail(CompileError::kGprPressure);
         }
         // Base-address cache: each cached base pins exactly one extra GPR for
         // the whole run (on top of every per-node total), so peak+N is exact.
-        // Degrade the plan until it fits.
+        // Degrade the plan until it fits. OPT-BC: a rep matching a carried
+        // entry reuses its already-pinned GPR — it costs nothing new, so it
+        // is not charged (otherwise a carried RC pin, which already shrank
+        // the pool, would spuriously degrade the plan).
         int addr_n = plan_addr_cache(ctx);
-        while (addr_n > 0 && peak + addr_n > gpr_available)
+        const bool carry_on = g_rosetta_config && g_rosetta_config->bridge_carry;
+        auto chargeable = [&](int n) {
+            if (!carry_on) return n;  // default accounting stays byte-identical
+            int c = 0;
+            for (int k = 0; k < n; k++) {
+                const IROperand* mo = ctx.nodes[ctx.addr_cache_rep[k]].mem_operand;
+                // 64-bit base-only operand: compute_operand_address returns
+                // the guest register itself — nothing is pinned.
+                if (mo->mem.addr_size == IROperandSize::S64 &&
+                    mo->mem.mem_flags == 1)
+                    continue;
+                bool carried = false;
+                for (int s = 0; s < X87Cache::kMaxCarried; s++) {
+                    if (cache.carried_base[s].gpr >= 0 &&
+                        carried_key_match(cache.carried_base[s], mo)) {
+                        carried = true;
+                        break;
+                    }
+                }
+                if (!carried) c++;
+            }
+            return c;
+        };
+        while (addr_n > 0 && peak + chargeable(addr_n) > gpr_available)
             addr_n--;
         ctx.addr_cache_n = static_cast<int8_t>(addr_n);
     }

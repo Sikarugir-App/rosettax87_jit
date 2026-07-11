@@ -89,12 +89,97 @@ bool X87Cache::active() const {
     return run_remaining > 0;
 }
 
+void X87Cache::carried_clear() {
+    for (int i = 0; i < kMaxCarried; i++) carried_base[i].gpr = -1;
+    carried_rc_gpr = -1;
+}
+
+void X87Cache::carried_release(uint32_t& free_gpr_mask) {
+    for (int i = 0; i < kMaxCarried; i++) {
+        if (carried_base[i].gpr >= 0) free_gpr_mask |= 1u << carried_base[i].gpr;
+    }
+    if (carried_rc_gpr >= 0) free_gpr_mask |= 1u << carried_rc_gpr;
+    carried_clear();
+}
+
+void X87Cache::carried_drop_written(uint16_t guest_mask) {
+    if (!guest_mask) return;
+    for (int i = 0; i < kMaxCarried; i++) {
+        auto& c = carried_base[i];
+        if (c.gpr < 0) continue;
+        const bool hit =
+            ((c.mem_flags & 1) && ((guest_mask >> (c.base_reg & 0xF)) & 1)) ||
+            ((c.mem_flags & 2) && ((guest_mask >> (c.index_reg & 0xF)) & 1));
+        if (hit) c.gpr = -1;
+    }
+    // The RC cache tracks control_word, not a guest GPR — unaffected.
+}
+
+// Conservative written-GPR mask for a run-transparent instruction. Explicit
+// register destinations plus the implicit writers in the transparent set;
+// 0xFFFF (drop everything) for shapes this doesn't understand.
+uint16_t X87Cache::gap_written_gpr_mask(const IRInstr* instr) {
+    const uint16_t all = 0xFFFF;
+    uint16_t mask = 0;
+    const uint16_t op = instr->opcode();
+    switch (op) {
+        case kOpcodeName_nop:
+        case kOpcodeName_cmp:
+        // SSE compares write flags only.
+        case kOpcodeName_ucomiss: case kOpcodeName_ucomisd:
+        case kOpcodeName_comiss:  case kOpcodeName_comisd:
+            return 0;
+        // rax/rdx implicit writers.
+        case kOpcodeName_cbw: case kOpcodeName_cwde: case kOpcodeName_cdqe:
+            return 1u << 0;
+        case kOpcodeName_cwd: case kOpcodeName_cdq:
+            return 1u << 2;
+        case kOpcodeName_mul:
+            return (1u << 0) | (1u << 2);
+        case kOpcodeName_imul:
+            if (instr->num_operands <= 1) return (1u << 0) | (1u << 2);
+            break;  // 2/3-operand form: explicit dst below
+        case kOpcodeName_push:
+        case kOpcodeName_pop:
+        case kOpcodeName_pushd:
+        case kOpcodeName_popd:
+            mask |= 1u << 4;  // RSP
+            break;
+        case kOpcodeName_xchg: {
+            // Both operands are written; include any register operand.
+            for (int i = 0; i < 2 && i < instr->num_operands; i++) {
+                const auto& o = instr->operands[i];
+                if (o.kind == IROperandKind::Register) {
+                    if (!o.reg.reg.is_gpr()) return all;
+                    mask |= 1u << o.reg.reg.index();
+                }
+            }
+            return mask;
+        }
+        default:
+            break;
+    }
+    // Explicit destination: operands[0] when it is a register. GPR dst →
+    // its bit (partial writes still change the value — must count). XMM/MM
+    // dst or memory dst → no guest GPR written.
+    if (instr->num_operands >= 1) {
+        const auto& dst = instr->operands[0];
+        if (dst.kind == IROperandKind::Register) {
+            if (dst.reg.reg.is_gpr())
+                mask |= 1u << dst.reg.reg.index();
+            // vector destinations write no GPR
+        }
+    }
+    return mask;
+}
+
 void X87Cache::invalidate() {
     gprs_valid = 0;
     top_dirty = 0;
     deferred_push_count = 0;
     deferred_pop_count = 0;
     run_remaining = 0;
+    carried_clear();
     reset_perm();
 }
 
@@ -116,6 +201,7 @@ void X87Cache::tick() {
             top_dirty = 0;
             deferred_push_count = 0;
             deferred_pop_count = 0;
+            carried_clear();
         }
     }
 }
@@ -139,6 +225,10 @@ uint32_t X87Cache::pinned_mask() const {
         mask |= (1u << top_gpr);
         mask |= (1u << st_base_gpr);
     }
+    for (int i = 0; i < kMaxCarried; i++) {
+        if (carried_base[i].gpr >= 0) mask |= 1u << carried_base[i].gpr;
+    }
+    if (carried_rc_gpr >= 0) mask |= 1u << carried_rc_gpr;
     return mask;
 }
 

@@ -31,6 +31,42 @@ struct X87Cache {
 
     IRBlock* prev_block = nullptr;
 
+    // OPT-BC (ROSETTA_X87_BRIDGE_CARRY): base-address-cache + RC GPRs carried
+    // across bridged gaps so the next IR run skips re-materializing them.
+    // Capacity is capped at kMaxCarried TOTAL pins (bases + RC combined) on
+    // top of the 3 cache pins: the allocator-contract audit only established
+    // headroom for whitelisted gap translations with ≥3 scratch GPRs free.
+    //
+    // A carried base is keyed by the address expression modulo displacement
+    // (same key as the lowering's addr_base_key_equal); `gpr` holds the
+    // materialized zero-disp base. Validity: the key's guest registers are
+    // unchanged since transfer — enforced by carried_drop_written (bridged
+    // gap writes / IR-inlined guest writes) and by releasing everything
+    // before any non-IR x87 translation (singular fldcw/fstsw can change
+    // control_word / AX behind our back).
+    static constexpr int kMaxCarried = 2;
+    struct CarriedBase {
+        uint8_t addr_size, mem_flags, base_reg, index_reg, shift_amount;  // key
+        int8_t gpr = -1;   // scratch GPR holding the base; -1 = slot empty
+    };
+    CarriedBase carried_base[kMaxCarried];
+    int8_t carried_rc_gpr = -1;  // GPR holding the cached RC field; -1 = none
+
+    bool carried_any() const {
+        return carried_base[0].gpr >= 0 || carried_base[1].gpr >= 0 ||
+               carried_rc_gpr >= 0;
+    }
+    void carried_clear();
+    // Clear all carried entries and return their GPRs to the free mask.
+    void carried_release(uint32_t& free_gpr_mask);
+    // Drop carried bases whose key uses a guest GPR in `guest_mask`
+    // (bit per guest reg index). Freed bits come back when the caller
+    // recomputes free_gpr_mask from pinned_mask().
+    void carried_drop_written(uint16_t guest_mask);
+    // Written-guest-GPR mask of a run-transparent instruction (conservative:
+    // includes implicit writers; returns 0xFFFF when unsure).
+    static uint16_t gap_written_gpr_mask(const IRInstr* instr);
+
     bool active() const;
     void invalidate();
     void invalidate(uint32_t& free_gpr_mask, uint32_t scratch_mask);
