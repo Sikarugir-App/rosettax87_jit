@@ -71,6 +71,17 @@ enum class Op : uint8_t {
     // Control word
     StoreCW,        // FLDCW: load u16 from memory, write to X87State.control_word
     LoadCW,         // FNSTCW: read X87State.control_word, store u16 to memory
+
+    // Run-transparent guest integer instructions (opt-in
+    // ROSETTA_X87_TRANSPARENT_INT): mov/movzx/movsx/movsxd/lea consumed
+    // mid-run so SSA values stay in FPRs across them. Side-effect nodes,
+    // emitted in program order with flag-free encodings; the whole payload is
+    // packed into imm_bits (see GuestPayload) — inputs[] stay -1 so the
+    // optimizer's use-count / input-rewrite loops never touch guest fields.
+    GuestMovRR,     // mov r32/r64, r
+    GuestMovRI,     // mov r32, imm32 (64-bit imm dst declined at build)
+    GuestLea,       // lea r32/r64, [base + index<<shift + disp32]
+    GuestExt,       // movzx/movsx/movsxd r32/r64, r8/r16/r32 (register source)
 };
 
 enum NodeFlags : uint8_t {
@@ -85,6 +96,56 @@ enum NodeFlags : uint8_t {
     kF32          = 1 << 5,    // arithmetic node computes in f32 (S-form): takes
                                // raw-f32 inputs, produces a raw-f32 value
 };
+
+// ── Guest* node payload ─────────────────────────────────────────────────────
+//
+// Packed into Node::imm_bits:
+//   [31:0]  imm32 (GuestMovRI) / disp32 (GuestLea; sign-extended for 64-bit
+//           address computation)
+//   [35:32] dst guest reg index (guest GPR index == host GPR number,
+//           binary-verified: Rosetta lowers `mov ecx, 1` to `MOVZ W1, #1`)
+//   [39:36] src guest reg index (GuestMovRR/GuestExt) / lea base reg
+//   [43:40] lea index reg
+//   [45:44] lea shift amount / GuestExt source class (0=8lo, 1=8hi, 2=16, 3=32)
+//   [46]    dst is 64-bit
+//   [47]    GuestExt sign-extend (movsx/movsxd)
+//   [48]    lea has_base
+//   [49]    lea has_index
+//   [50]    lea 32-bit address size (compute in W regs)
+
+struct GuestPayload {
+    uint32_t imm;
+    uint8_t  dst, src, idx, cls;
+    bool     is64, sign, has_base, has_index, addr32;
+};
+
+inline uint64_t guest_pack(const GuestPayload& p) {
+    return static_cast<uint64_t>(p.imm) |
+           (static_cast<uint64_t>(p.dst & 0xF) << 32) |
+           (static_cast<uint64_t>(p.src & 0xF) << 36) |
+           (static_cast<uint64_t>(p.idx & 0xF) << 40) |
+           (static_cast<uint64_t>(p.cls & 0x3) << 44) |
+           (static_cast<uint64_t>(p.is64) << 46) |
+           (static_cast<uint64_t>(p.sign) << 47) |
+           (static_cast<uint64_t>(p.has_base) << 48) |
+           (static_cast<uint64_t>(p.has_index) << 49) |
+           (static_cast<uint64_t>(p.addr32) << 50);
+}
+
+inline GuestPayload guest_unpack(uint64_t b) {
+    GuestPayload p;
+    p.imm       = static_cast<uint32_t>(b);
+    p.dst       = (b >> 32) & 0xF;
+    p.src       = (b >> 36) & 0xF;
+    p.idx       = (b >> 40) & 0xF;
+    p.cls       = (b >> 44) & 0x3;
+    p.is64      = (b >> 46) & 1;
+    p.sign      = (b >> 47) & 1;
+    p.has_base  = (b >> 48) & 1;
+    p.has_index = (b >> 49) & 1;
+    p.addr32    = (b >> 50) & 1;
+    return p;
+}
 
 // ── IR node ─────────────────────────────────────────────────────────────────
 
@@ -167,6 +228,12 @@ struct Context {
     // (set by build() from its parameter; JIT mode only).
     int8_t  const_promote;
 
+    // Guest GPRs written by inlined Guest* nodes (bit per guest reg index).
+    // Operands addressed through these registers are excluded from the
+    // base-address cache for the whole run (the base is materialized in the
+    // preamble, before any inlined write could happen).
+    uint16_t guest_written_mask;
+
     void init() {
         num_nodes = 0;
         top_delta = 0;
@@ -178,6 +245,7 @@ struct Context {
         addr_cache_n = 0;
         nzcv_dead = 0;
         const_promote = 0;
+        guest_written_mask = 0;
         last_narrow_input = -1;
         last_narrow_node = -1;
         const_zero_node = -1;

@@ -105,6 +105,7 @@ struct RosettaConfig {
     uint8_t  disable_addr_fold;      // ROSETTA_X87_DISABLE_ADDR_FOLD=1 — don't fold base+disp into LDR/STR addressing modes (singular + fusion paths)
     uint8_t  log_run_breaks;         // ROSETTA_X87_LOG_RUN_BREAKS=1 — log length + breaking opcode + gap-to-next-x87 for every x87 run
     uint8_t  run_bridge;             // ROSETTA_X87_RUN_BRIDGE=1 — keep an active run's pinned cache GPRs across run-transparent integer instrs (mov/lea/…; opt-in)
+    uint8_t  transparent_int;        // ROSETTA_X87_TRANSPARENT_INT=1 — inline simple reg-form mov/lea/movzx/movsx into IR runs (requires RUN_BRIDGE; opt-in)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

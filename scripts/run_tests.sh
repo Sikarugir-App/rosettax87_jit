@@ -9,6 +9,7 @@
 #   3. runtime_loader with ROSETTA_X87_DISABLE_IR=1 (direct translator only)
 #   4. runtime_loader with ROSETTA_X87_DISABLE_IR=1 + ROSETTA_X87_DISABLE_ALL_FUSIONS=1
 #   5. runtime_loader with ROSETTA_X87_RUN_BRIDGE=1 + ROSETTA_X87_EXTENDED_FPR_SCRATCH=1
+#   6. runtime_loader with ROSETTA_X87_TRANSPARENT_INT=1 + ROSETTA_X87_EXTENDED_FPR_SCRATCH=1
 #
 # Usage:
 #   bash scripts/run_tests.sh                # build + test (all phases)
@@ -75,6 +76,7 @@ ALL_TESTS=(
     test_ir_gpr_pressure
     test_int_regbase
     test_run_breaks
+    test_transparent_int
     test_ir_fpr_pressure
 )
 
@@ -221,6 +223,24 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
             continue
         fi
         OUT=$(ROSETTA_X87_RUN_BRIDGE=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
+        check_output "$t" "$OUT"
+    done
+fi
+
+# ── Phase 6: runtime_loader, TRANSPARENT_INT ──────────────────────────────────
+# Inlined guest integer instructions inside IR runs (implies RUN_BRIDGE).
+if [[ $NATIVE_ONLY -eq 0 ]]; then
+    echo ""
+    echo -e "${BOLD}=== Phase 6: runtime_loader (TRANSPARENT_INT + EXTENDED_FPR_SCRATCH) ===${NC}"
+
+    for t in "${TESTS[@]}"; do
+        BINARY="$BIN/$t"
+        if [[ ! -x "$BINARY" ]]; then
+            echo -e "${YELLOW}SKIP${NC}  $t  (binary not found)"
+            ERRORS=$((ERRORS + 1))
+            continue
+        fi
+        OUT=$(ROSETTA_X87_TRANSPARENT_INT=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
         check_output "$t" "$OUT"
     done
 fi

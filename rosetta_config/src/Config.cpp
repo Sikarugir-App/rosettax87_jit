@@ -159,6 +159,14 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_RUN_BRIDGE"))
         cfg.run_bridge = (*v == '1') ? 1 : 0;
 
+    // Inlining gap instructions into IR runs presupposes the bridge: lookahead
+    // must count gaps into the run and the pinned GPRs must survive the gap
+    // instructions the IR does NOT inline. Setting it implies RUN_BRIDGE.
+    if (const char* v = std::getenv("ROSETTA_X87_TRANSPARENT_INT")) {
+        cfg.transparent_int = (*v == '1') ? 1 : 0;
+        if (cfg.transparent_int) cfg.run_bridge = 1;
+    }
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')
             cfg.disabled_ops_mask = ~0ULL;

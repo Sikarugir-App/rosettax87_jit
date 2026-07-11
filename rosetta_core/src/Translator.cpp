@@ -85,8 +85,72 @@ static OpcodeId opcode_to_id(uint16_t op) {
 // One line per x87 run at translation time: run length, the guest opcode that
 // ended it, the gap until the next x87 instruction (within 16), and the
 // breaker's address. Drives the transparent-set choice for OPT-RB bridging.
+//
+// Operand-form suffix (drives the TRANSPARENT_INT inline-set choice): for the
+// mov/movzx/movsx/movsxd/lea family, classify dst<-src as r/m/i with the dst
+// width, e.g. "r32<-i", "r64<-m", "m<-r". Inline v1 handles only the
+// register-destination, non-memory-source forms.
+static const char* operand_form_kind(const IROperand& op) {
+    switch (op.kind) {
+        case IROperandKind::Register: return "r";
+        case IROperandKind::MemRef:
+        case IROperandKind::AbsMem:   return "m";
+        // Immediates arrive in more than one immediate-like kind; the payload
+        // sits at the same offset in all of them (see try_fuse_fcom_test).
+        default: return "i";
+    }
+}
+
+static const char* operand_width(const IROperand& op) {
+    if (op.kind != IROperandKind::Register) return "";
+    switch (op.reg.size) {
+        case IROperandSize::S8:  return "8";
+        case IROperandSize::S16: return "16";
+        case IROperandSize::S32: return "32";
+        case IROperandSize::S64: return "64";
+        default: return "?";
+    }
+}
+
+// Writes "form=r32<-i " (or "" for non-mov-family / operand-less ops) into buf.
+static void mov_family_form(const IRInstr* in, char* buf, int buf_len) {
+    buf[0] = '\0';
+    switch (in->opcode()) {
+        case kOpcodeName_mov:
+        case kOpcodeName_movzx:
+        case kOpcodeName_movsx:
+        case kOpcodeName_movsxd:
+        case kOpcodeName_lea:
+            break;
+        default:
+            return;
+    }
+    if (in->num_operands < 2) return;
+    const auto& dst = in->operands[0];
+    const auto& src = in->operands[1];
+    snprintf(buf, static_cast<size_t>(buf_len), "form=%s%s<-%s(k%u) ",
+             operand_form_kind(dst), operand_width(dst), operand_form_kind(src),
+             static_cast<unsigned>(src.kind));
+}
+
 static void log_run_break(TranslationResult* translation_result, IRInstr* instr_array,
                           int64_t num_instrs, int64_t insn_idx, int run) {
+    // Bridged runs contain non-x87 gap instructions inside [insn_idx, run):
+    // log each one so the inline-set histogram covers in-run gaps, not just
+    // run-ending breakers.
+    for (int64_t g = insn_idx; g < insn_idx + run && g < num_instrs; g++) {
+        const uint16_t gop = instr_array[g].opcode();
+        if (X87Cache::is_handled(gop)) continue;
+        char form[24];
+        mov_family_form(&instr_array[g], form, sizeof(form));
+        const char* gname =
+            (gop < kOpcodeNames.size() && kOpcodeNames[gop]) ? kOpcodeNames[gop] : "?";
+        CORE_LOG("X87 bridge-gap: op=%s(%u) %sat %lx", gname, gop, form,
+                 static_cast<uintptr_t>(
+                     translation_result->ir_module_data->text_vmaddr_range +
+                     instr_array[g].pc));
+    }
+
     const int64_t brk = insn_idx + run;
     if (brk >= num_instrs) {
         CORE_LOG("X87 run-break: len=%d block-end", run);
@@ -104,8 +168,10 @@ static void log_run_break(TranslationResult* translation_result, IRInstr* instr_
         (bop < kOpcodeNames.size() && kOpcodeNames[bop]) ? kOpcodeNames[bop] : "?";
     const uintptr_t address =
         translation_result->ir_module_data->text_vmaddr_range + instr_array[brk].pc;
-    CORE_LOG("X87 run-break: len=%d breaker=%s(%u) gap=%d resumes=%d at %lx", run, name,
-             bop, gap, resumes, address);
+    char form[24];
+    mov_family_form(&instr_array[brk], form, sizeof(form));
+    CORE_LOG("X87 run-break: len=%d breaker=%s(%u) %sgap=%d resumes=%d at %lx", run, name,
+             bop, form, gap, resumes, address);
 }
 
 auto Translator::translate_instruction(TranslationResult* translation_result, IRBlock* block,

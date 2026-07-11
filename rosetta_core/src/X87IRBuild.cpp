@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "rosetta_config/Config.h"
+#include "rosetta_core/CoreConfig.h"
 #include "rosetta_core/IRInstr.h"
 #include "rosetta_core/IROperand.h"
 #include "rosetta_core/Opcode.h"
@@ -147,6 +149,32 @@ static void mem_cse_evict_may_alias(Context& ctx, const IROperand* store_op) {
     int kept = 0;
     for (int i = 0; i < ctx.mem_cse_count; i++) {
         if (mem_operands_no_alias(ctx.mem_cse_op[i], store_op)) {
+            ctx.mem_cse_op[kept] = ctx.mem_cse_op[i];
+            ctx.mem_cse_kind[kept] = ctx.mem_cse_kind[i];
+            ctx.mem_cse_val[kept] = ctx.mem_cse_val[i];
+            kept++;
+        }
+    }
+    ctx.mem_cse_count = static_cast<int8_t>(kept);
+    ctx.mem_cse_next = 0;
+}
+
+// True if the operand's address depends on guest GPR `reg` (base or index).
+// AbsMem never references registers.
+static bool mem_operand_uses_reg(const IROperand* op, int reg) {
+    if (op->kind != IROperandKind::MemRef) return false;
+    if ((op->mem.mem_flags & 1) && (op->mem.base_reg & 0xF) == reg) return true;
+    if ((op->mem.mem_flags & 2) && (op->mem.index_reg & 0xF) == reg) return true;
+    return false;
+}
+
+// Drop every CSE entry whose address uses guest GPR `reg` — after an inlined
+// guest instruction redefines it, the same operand text addresses a
+// different location.
+static void mem_cse_evict_reg(Context& ctx, int reg) {
+    int kept = 0;
+    for (int i = 0; i < ctx.mem_cse_count; i++) {
+        if (!mem_operand_uses_reg(ctx.mem_cse_op[i], reg)) {
             ctx.mem_cse_op[kept] = ctx.mem_cse_op[i];
             ctx.mem_cse_kind[kept] = ctx.mem_cse_kind[i];
             ctx.mem_cse_val[kept] = ctx.mem_cse_val[i];
@@ -559,6 +587,119 @@ static bool build_fcmov(Context& ctx, IRInstr* instr, int aarch64_cond) {
     return true;
 }
 
+// ── Run-transparent guest integer instructions (opt-in) ────────────────────
+//
+// ROSETTA_X87_TRANSPARENT_INT=1: consume whitelisted mov/movzx/movsx/movsxd/
+// lea/nop mid-run as Guest* IR nodes instead of ending the run — SSA values
+// stay in FPRs across them, and one Context (mem-CSE, const dedup, base
+// cache) spans the former gap. lookahead only ever counts these inside a run
+// when RUN_BRIDGE counted a gap (TRANSPARENT_INT implies RUN_BRIDGE).
+//
+// v1 accepts only forms exactly representable in 1-2 flag-free A64
+// instructions with a register destination:
+//   - 8/16-bit destinations (partial-register merge) → decline
+//   - memory sources/destinations → decline (stay bridge-only)
+//   - mov r64, imm → decline (imm sign-extension semantics not needed for
+//     the 32-bit target; keeps the payload at 32 bits)
+//   - immediates carrying a fixup (relocated address) → decline: the payload
+//     is the fixup target, not the literal
+// A declined instruction ends IR consumption there; the run bridge still
+// carries the pinned GPRs across it and the IR re-enters mid-run after.
+
+static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
+    if (!(g_rosetta_config && g_rosetta_config->transparent_int)) return false;
+    if (op == kOpcodeName_nop) return true;  // consume; no node, no effect
+
+    if (instr->num_operands < 2) return false;
+    const IROperand& dst = instr->operands[0];
+    const IROperand& src = instr->operands[1];
+    if (dst.kind != IROperandKind::Register || !dst.reg.reg.is_gpr()) return false;
+    const bool dst64 = dst.reg.size == IROperandSize::S64;
+    if (!dst64 && dst.reg.size != IROperandSize::S32) return false;
+
+    GuestPayload p = {};
+    p.dst = dst.reg.reg.index();
+    p.is64 = dst64;
+    Op node_op;
+
+    switch (op) {
+        case kOpcodeName_mov: {
+            if (src.kind == IROperandKind::Register) {
+                if (!src.reg.reg.is_gpr() || src.reg.size != dst.reg.size)
+                    return false;
+                p.src = src.reg.reg.index();
+                node_op = Op::GuestMovRR;
+            } else if (src.kind == IROperandKind::MemRef ||
+                       src.kind == IROperandKind::AbsMem) {
+                return false;
+            } else {
+                // Immediate-like kinds share the payload offset (see
+                // try_fuse_fcom_test); kind Immediate may carry a fixup.
+                if (src.kind == IROperandKind::Immediate && src.imm.mem_flags != 0)
+                    return false;
+                if (dst64) return false;
+                p.imm = static_cast<uint32_t>(src.imm.value);
+                node_op = Op::GuestMovRI;
+            }
+            break;
+        }
+        case kOpcodeName_movzx:
+        case kOpcodeName_movsx:
+        case kOpcodeName_movsxd: {
+            if (src.kind != IROperandKind::Register || !src.reg.reg.is_gpr())
+                return false;
+            p.sign = (op != kOpcodeName_movzx);
+            switch (src.reg.size) {
+                case IROperandSize::S8:
+                    // Register-byte high nibble: 0x0X = low byte, 0x1X = high
+                    // byte (AH/CH/DH/BH); anything else is unexpected.
+                    if ((src.reg.reg.value & 0xF0) > 0x10) return false;
+                    p.cls = ((src.reg.reg.value & 0xF0) == 0x10) ? 1 : 0;
+                    break;
+                case IROperandSize::S16:
+                    p.cls = 2;
+                    break;
+                case IROperandSize::S32:
+                    if (op != kOpcodeName_movsxd) return false;
+                    p.cls = 3;
+                    break;
+                default:
+                    return false;
+            }
+            p.src = src.reg.reg.index();
+            node_op = Op::GuestExt;
+            break;
+        }
+        case kOpcodeName_lea: {
+            if (src.kind != IROperandKind::MemRef) return false;
+            if (src.mem.seg_override != 0) return false;
+            const int64_t d = src.mem.disp;
+            if (d < INT32_MIN || d > INT32_MAX) return false;
+            if (src.mem.shift_amount > 3) return false;
+            p.imm = static_cast<uint32_t>(d);
+            p.has_base = (src.mem.mem_flags & 1) != 0;
+            p.has_index = (src.mem.mem_flags & 2) != 0;
+            p.src = src.mem.base_reg & 0xF;
+            p.idx = src.mem.index_reg & 0xF;
+            p.cls = src.mem.shift_amount;
+            p.addr32 = src.mem.addr_size == IROperandSize::S32;
+            node_op = Op::GuestLea;
+            break;
+        }
+        default:
+            return false;
+    }
+
+    auto id = ctx.add_node(node_op);
+    if (id < 0) return false;
+    ctx.nodes[id].imm_bits = guest_pack(p);
+    // The dst register is redefined: cached loads addressed through it now
+    // point at a different location, and it may not serve as a cached base.
+    ctx.guest_written_mask |= static_cast<uint16_t>(1u << p.dst);
+    mem_cse_evict_reg(ctx, p.dst);
+    return true;
+}
+
 // ── Main build loop ─────────────────────────────────────────────────────────
 
 bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start_idx,
@@ -927,6 +1068,16 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             // ── FNOP ────────────────────────────────────────────────────
             case kOpcodeName_fnop:
                 // No operation; just let the run continue.
+                break;
+
+            // ── Run-transparent guest integer instructions (opt-in) ─────
+            case kOpcodeName_mov:
+            case kOpcodeName_movzx:
+            case kOpcodeName_movsx:
+            case kOpcodeName_movsxd:
+            case kOpcodeName_lea:
+            case kOpcodeName_nop:
+                ok = build_guest_int(ctx, instr, op);
                 break;
 
             // ── Bail on everything else ─────────────────────────────────

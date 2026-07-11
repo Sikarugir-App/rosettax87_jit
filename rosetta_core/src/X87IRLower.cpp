@@ -224,6 +224,21 @@ static bool addr_uses_rax(const IROperand* op) {
     return false;
 }
 
+// True if the operand's base or index register is written by an inlined
+// Guest* node anywhere in the run. Such operands cannot go through the
+// base-address cache: the base is materialized in the preamble, before the
+// guest write, but accesses after the write need the new address.
+static bool addr_uses_written_reg(const IROperand* op, uint16_t written_mask) {
+    if (!written_mask) return false;
+    if ((op->mem.mem_flags & 1) &&
+        ((written_mask >> (op->mem.base_reg & 0xF)) & 1))
+        return true;
+    if ((op->mem.mem_flags & 2) &&
+        ((written_mask >> (op->mem.index_reg & 0xF)) & 1))
+        return true;
+    return false;
+}
+
 // ── LDP/STP pair planning ───────────────────────────────────────────────────
 //
 // Pair two f64/f32 accesses through the same guest base into one LDP/STP.
@@ -271,6 +286,13 @@ static bool pair_node_skippable(Op op, bool lead_is_load) {
         case Op::LoadF64: case Op::LoadF32Raw:
         case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
             return lead_is_load;
+        // Inlined guest integer instructions write registers, never memory.
+        // Pairs only form through cached-base operands, and plan_addr_cache
+        // excludes every base/index register these nodes write — so a paired
+        // access's address and value are unaffected by crossing one.
+        case Op::GuestMovRR: case Op::GuestMovRI:
+        case Op::GuestLea: case Op::GuestExt:
+            return true;
         default:
             return false;
     }
@@ -378,6 +400,7 @@ static int plan_addr_cache(Context& ctx) {
         const IROperand* mo = n.mem_operand;
         if (!addr_operand_base_cacheable(mo)) continue;
         if (has_fstsw && addr_uses_rax(mo)) continue;
+        if (addr_uses_written_reg(mo, ctx.guest_written_mask)) continue;
         if (!addr_disp_foldable(mo, is_f64)) continue;
         int k = 0;
         for (; k < nkeys; k++) {
@@ -405,6 +428,93 @@ static int plan_addr_cache(Context& ctx) {
         keys[best].count = 0;
     }
     return picked;
+}
+
+// ── Guest* node emission (opt-in TRANSPARENT_INT) ───────────────────────────
+//
+// Flag-free encodings only: Guest nodes may sit between an FCmp/FComI and its
+// NZCV consumer (hoisted saves, FCSel, the TestFused TST), so nothing here
+// may write NZCV. They write guest GPRs (x0–x15) directly — disjoint from
+// the scratch pool (x22–x29), so pinned cache GPRs and held values (packed
+// CC, hoisted NZCV) are never clobbered.
+
+// dst = src + disp with dst==src allowed. Allocates one transient GPR only
+// when disp fits neither ADD/SUB imm12 form (mirrored in peak_live_gprs).
+static void emit_guest_add_disp(TranslationResult& result, AssemblerBuffer& buf,
+                                int is64, int dst, int src, int64_t disp) {
+    if (disp == 0) {
+        if (dst != src) emit_mov_reg(buf, is64, dst, src);
+        return;
+    }
+    const int is_sub = disp < 0;
+    const int64_t mag = is_sub ? -disp : disp;
+    if (mag < 4096) {
+        emit_add_imm(buf, is64, is_sub, 0, /*shift=*/0, mag, src, dst);
+        return;
+    }
+    if ((mag & 0xFFF) == 0 && (mag >> 12) < 4096) {
+        emit_add_imm(buf, is64, is_sub, 0, /*shift=*/1, mag >> 12, src, dst);
+        return;
+    }
+    const int tmp = alloc_free_gpr(result);
+    emit_load_immediate_no_xzr(result, is64, static_cast<uint64_t>(disp), tmp);
+    emit_add_sub_shifted_reg(buf, is64, /*is_sub=*/0, 0, /*LSL*/0, tmp, 0, src, dst);
+    free_gpr(result, tmp);
+}
+
+static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
+                            const Node& n) {
+    const GuestPayload p = guest_unpack(n.imm_bits);
+    switch (n.op) {
+        case Op::GuestMovRR:
+            emit_mov_reg(buf, p.is64 ? 1 : 0, p.dst, p.src);
+            break;
+        case Op::GuestMovRI:
+            // 32-bit dst only (build declines r64,imm): W-write zero-extends.
+            emit_load_immediate_no_xzr(result, 0, p.imm, p.dst);
+            break;
+        case Op::GuestExt: {
+            // cls: 0=8lo, 1=8hi, 2=16, 3=32 (movsxd)
+            const int lsb = (p.cls == 1) ? 8 : 0;
+            const int width = (p.cls >= 2) ? ((p.cls == 3) ? 32 : 16) : 8;
+            if (!p.sign) {
+                // UBFX Wd — zeroes the upper 32 bits too, covering r64 dsts.
+                emit_bitfield(buf, 0, /*UBFM*/2, 0, static_cast<int8_t>(lsb),
+                              static_cast<int8_t>(lsb + width - 1), p.src, p.dst);
+            } else {
+                // SBFX to the dst width (SXTB/SXTH/SXTW forms).
+                const int sf = p.is64 ? 1 : 0;
+                emit_bitfield(buf, sf, /*SBFM*/0, sf, static_cast<int8_t>(lsb),
+                              static_cast<int8_t>(lsb + width - 1), p.src, p.dst);
+            }
+            break;
+        }
+        case Op::GuestLea: {
+            // Compute in W unless both dst and address size are 64-bit:
+            // W-writes zero-extend (lea r64 with addr32) and W arithmetic
+            // truncates mod 2^32 (lea r32 with addr64) — both match x86.
+            const int is64 = (p.is64 && !p.addr32) ? 1 : 0;
+            const int64_t disp = static_cast<int32_t>(p.imm);
+            if (p.has_base && p.has_index) {
+                emit_add_sub_shifted_reg(buf, is64, 0, 0, /*LSL*/0, p.idx,
+                                         static_cast<int8_t>(p.cls), p.src, p.dst);
+                emit_guest_add_disp(result, buf, is64, p.dst, p.dst, disp);
+            } else if (p.has_base) {
+                emit_guest_add_disp(result, buf, is64, p.dst, p.src, disp);
+            } else if (p.has_index) {
+                // ADD dst, ZR, idx, LSL #s  (reg 31 = ZR in shifted-reg forms)
+                emit_add_sub_shifted_reg(buf, is64, 0, 0, /*LSL*/0, p.idx,
+                                         static_cast<int8_t>(p.cls), GPR::XZR, p.dst);
+                emit_guest_add_disp(result, buf, is64, p.dst, p.dst, disp);
+            } else {
+                emit_load_immediate_no_xzr(result, is64, static_cast<uint64_t>(disp),
+                                           p.dst);
+            }
+            break;
+        }
+        default:
+            break;
+    }
 }
 
 // ── RC preamble: load control_word and extract rounding-control bits ────────
@@ -1044,6 +1154,14 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
 
+        // ── Inlined guest integer instructions ─────────────────────────
+        case Op::GuestMovRR:
+        case Op::GuestMovRI:
+        case Op::GuestLea:
+        case Op::GuestExt:
+            emit_guest_node(*result, buf, n);
+            break;
+
         // ── FSTSW AX ───────────────────────────────────────────────────
         case Op::FStsw: {
             static constexpr int16_t kSwImm12 = kX87StatusWordOff / 2;  // = 1
@@ -1475,6 +1593,15 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
         // StoreCW/LoadCW: 2 GPRs (addr + Wd_cw)
         case Op::StoreCW: case Op::LoadCW:
             transient = 2;
+            break;
+
+        // Inlined guest integers write guest GPRs directly; only a lea with
+        // a disp fitting neither imm12 form allocates a temp — charge 1
+        // conservatively for every lea.
+        case Op::GuestMovRR: case Op::GuestMovRI: case Op::GuestExt:
+            break;
+        case Op::GuestLea:
+            transient = 1;
             break;
         }
 
