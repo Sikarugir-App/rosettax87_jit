@@ -86,11 +86,35 @@ static clock_t bench_f32_lea_split(void) {
     return clock() - start;
 }
 
+/* --------------------------------------------------------------------------
+ * f32 x87 compute split by SSE moves (whitelist v2) — the dominant breaker
+ * in mixed x87/SSE game code per run-break telemetry (movss/movsd).
+ * -------------------------------------------------------------------------- */
+static clock_t bench_f32_sse_mix(void) {
+    clock_t start = clock();
+    volatile float r;
+    volatile float s;
+    float a = 1.5f, b = 2.0f;
+    for (int i = 0; i < TIMES; i++)
+        __asm__ volatile (
+            "flds %2\n\t fmuls %3\n\t movss %2, %%xmm1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movss %%xmm1, %1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movss %2, %%xmm1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movss %%xmm1, %1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movss %2, %%xmm1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movss %%xmm1, %1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movss %2, %%xmm1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movss %%xmm1, %1\n\t fstps %0\n\t"
+            : "=m"(r), "=m"(s) : "m"(a), "m"(b) : "xmm1");
+    return clock() - start;
+}
+
 int main(void) {
     struct { const char *name; clock_t (*fn)(void); } benches[] = {
         {"f32_mov_unrelated", bench_f32_mov_unrelated},
         {"f64_mov_base",      bench_f64_mov_base},
         {"f32_lea_split",     bench_f32_lea_split},
+        {"f32_sse_mix",       bench_f32_sse_mix},
     };
     int n = (int)(sizeof(benches) / sizeof(benches[0]));
     for (int i = 0; i < n; i++) {

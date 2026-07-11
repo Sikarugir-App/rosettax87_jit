@@ -120,6 +120,95 @@ static double split_mov_complex_ea(double a, double b, double *picked_out) {
     return r;
 }
 
+/* (f) SSE movsd between x87 ops — the dominant run breaker in mixed x87/SSE
+ *     code (whitelist v2). Both the x87 result and the SSE-copied value must
+ *     be intact. */
+static double split_movsd_sse(double a, double b, double *sse_out) {
+    double sse_src = 99.5;
+    double r;
+    __asm__ volatile(
+        "fldl %2\n"              /* ST(0) = a */
+        "movsd %3, %%xmm1\n"     /* SSE load — bridged under whitelist v2 */
+        "fmull %4\n"             /* ST(0) = a*b */
+        "movsd %%xmm1, %1\n"     /* SSE store — also bridged */
+        "fstpl %0\n"
+        : "=m"(r), "=m"(*sse_out)
+        : "m"(a), "m"(sse_src), "m"(b)
+        : "xmm1");
+    return r;
+}
+
+/* (g) integer ALU (add/inc — flag definers) between x87 ops. */
+static double split_alu(double a, double b, long *ctr_out) {
+    long ctr = 5;
+    double r;
+    __asm__ volatile(
+        "fldl %2\n"
+        "addq $10, %1\n"         /* flag-defining ALU — bridged */
+        "fmull %3\n"
+        "incq %1\n"              /* bridged */
+        "fstpl %0\n"
+        : "=m"(r), "+r"(ctr)
+        : "m"(a), "m"(b)
+        : "cc");
+    *ctr_out = ctr; /* 5 + 10 + 1 = 16 */
+    return r;
+}
+
+/* (h) push/pop pair between x87 ops (guest RSP traffic mid-run). */
+static double split_push_pop(double a, double b, long *rt_out) {
+    double r;
+    __asm__ volatile(
+        "fldl %2\n"
+        "pushq $42\n"            /* bridged */
+        "fmull %3\n"
+        "popq %%rcx\n"           /* bridged */
+        "fstpl %0\n"
+        "movq %%rcx, %1\n"
+        : "=m"(r), "=m"(*rt_out)
+        : "m"(a), "m"(b)
+        : "rcx");
+    return r;
+}
+
+/* (i) setcc between x87 ops, reading flags from a cmp BEFORE the run, with
+ *     an fcomp in between — the x87 compare must save/restore guest NZCV so
+ *     the bridged setcc still sees the cmp's flags (and the nzcv-dead elision
+ *     must stay off: setcc is a reader). */
+static double split_setcc_after_fcomp(double a, double b, long *flag_out) {
+    unsigned char sc = 0;
+    double r;
+    __asm__ volatile(
+        "cmpq $7, %3\n"          /* guest flags: 8 > 7 → above */
+        "fldl %2\n"
+        "fldl %4\n"
+        "fcomp %%st(1)\n"        /* x87 compare — must not destroy guest NZCV */
+        "seta %1\n"              /* bridged; must read the cmp's flags */
+        "fmull %4\n"             /* ST(0) = a*b */
+        "fstpl %0\n"
+        : "=m"(r), "=m"(sc)
+        : "m"(a), "r"(8L), "m"(b)
+        : "cc");
+    *flag_out = sc;
+    return r;
+}
+
+/* (j) shift (internal-branch translation path) between x87 ops. */
+static double split_shift(double a, double b, long *sh_out) {
+    long v = 3;
+    double r;
+    __asm__ volatile(
+        "fldl %2\n"
+        "shlq $4, %1\n"          /* bridged; translation patches an internal branch */
+        "fmull %3\n"
+        "fstpl %0\n"
+        : "=m"(r), "+r"(v)
+        : "m"(a), "m"(b)
+        : "cc");
+    *sh_out = v; /* 3 << 4 = 48 */
+    return r;
+}
+
 int main(void) {
     check("split_mov_unrelated: a*b intact across mov ecx",
           split_mov_unrelated(3.0, 4.0), 12.0);
@@ -139,6 +228,46 @@ int main(void) {
               split_mov_complex_ea(3.0, 7.0, &picked), 21.0);
         check("split_mov_complex_ea: complex-EA mov loaded arr[3]",
               picked, 3.0);
+    }
+
+    {
+        double sse = 0.0;
+        check("split_movsd_sse: a*b intact across SSE movsd",
+              split_movsd_sse(3.5, 2.0, &sse), 7.0);
+        check("split_movsd_sse: SSE round-trip value",
+              sse, 99.5);
+    }
+
+    {
+        long ctr = 0;
+        check("split_alu: a*b intact across add/inc",
+              split_alu(6.0, 7.0, &ctr), 42.0);
+        if (ctr != 16) { printf("FAIL  split_alu: ctr=%ld expected 16\n", ctr); failures++; }
+        else           { printf("PASS  split_alu: ctr==16\n"); }
+    }
+
+    {
+        long rt = 0;
+        check("split_push_pop: a*b intact across push/pop",
+              split_push_pop(2.5, 4.0, &rt), 10.0);
+        if (rt != 42) { printf("FAIL  split_push_pop: popped=%ld expected 42\n", rt); failures++; }
+        else          { printf("PASS  split_push_pop: popped==42\n"); }
+    }
+
+    {
+        long flag = -1;
+        check("split_setcc_after_fcomp: a*b intact",
+              split_setcc_after_fcomp(3.0, 5.0, &flag), 15.0);
+        if (flag != 1) { printf("FAIL  split_setcc_after_fcomp: seta=%ld expected 1 (cmp flags survived fcomp)\n", flag); failures++; }
+        else           { printf("PASS  split_setcc_after_fcomp: seta==1\n"); }
+    }
+
+    {
+        long sh = 0;
+        check("split_shift: a*b intact across shl",
+              split_shift(1.5, 8.0, &sh), 12.0);
+        if (sh != 48) { printf("FAIL  split_shift: v=%ld expected 48\n", sh); failures++; }
+        else          { printf("PASS  split_shift: v==48\n"); }
     }
 
     printf("\n%d failure(s)\n", failures);
