@@ -8,6 +8,7 @@
 #   2. runtime_loader (IR + fusions enabled, default config)
 #   3. runtime_loader with ROSETTA_X87_DISABLE_IR=1 (direct translator only)
 #   4. runtime_loader with ROSETTA_X87_DISABLE_IR=1 + ROSETTA_X87_DISABLE_ALL_FUSIONS=1
+#   5. runtime_loader with ROSETTA_X87_RUN_BRIDGE=1 + ROSETTA_X87_EXTENDED_FPR_SCRATCH=1
 #
 # Usage:
 #   bash scripts/run_tests.sh                # build + test (all phases)
@@ -200,6 +201,26 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
             continue
         fi
         OUT=$(ROSETTA_X87_DISABLE_IR=1 ROSETTA_X87_DISABLE_ALL_FUSIONS=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
+        check_output "$t" "$OUT"
+    done
+fi
+
+# ── Phase 5: runtime_loader, candidate default-on flags ──────────────────────
+# Exercises the opt-in flags that are candidates for default-on (run bridging
+# + extended FPR scratch pool) so regressions in those paths are caught by
+# the standard suite, not only by a game soak test.
+if [[ $NATIVE_ONLY -eq 0 ]]; then
+    echo ""
+    echo -e "${BOLD}=== Phase 5: runtime_loader (RUN_BRIDGE + EXTENDED_FPR_SCRATCH) ===${NC}"
+
+    for t in "${TESTS[@]}"; do
+        BINARY="$BIN/$t"
+        if [[ ! -x "$BINARY" ]]; then
+            echo -e "${YELLOW}SKIP${NC}  $t  (binary not found)"
+            ERRORS=$((ERRORS + 1))
+            continue
+        fi
+        OUT=$(ROSETTA_X87_RUN_BRIDGE=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
         check_output "$t" "$OUT"
     done
 fi
