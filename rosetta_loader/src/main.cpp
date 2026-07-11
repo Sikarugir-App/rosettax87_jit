@@ -1,6 +1,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
 #include <mach/mach_vm.h>
+#include <mach/vm_attributes.h>
 #include <rosetta_config/Config.h>
 #include <stdint.h>
 #include <sys/mman.h>
@@ -9,6 +10,7 @@
 #include <sys/wait.h>
 #include <sched.h>
 
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "mach_exception.hpp"
 #include "macho_loader.hpp"
 #include "offset_finder.hpp"
 #include "types.h"
@@ -47,29 +50,75 @@ private:
     task_t taskPort_ = MACH_PORT_NULL;
     std::map<uint64_t, uint32_t> breakpoints_;  // addr -> original instruction
 
-    // Wait for the traced process to stop. If expectedSignal is non-zero,
-    // loop and suppress any other signals until the expected one arrives.
+    // Debug events arrive as Mach exception messages on a port we own (see
+    // mach_exception.hpp). While an event is held (unreplied) the tracee is
+    // stopped; replying resumes it. This replaces the PT_ATTACH +
+    // waitpid/WSTOPSIG signal path, whose EXC_BREAKPOINT delivery raced
+    // libRosettaRuntime's own handler and leaked our planted BRK to the parent
+    // as a fatal SIGTRAP (the flaky exit=133).
+    MachExceptionSession exc_;
+    MachExceptionSession::Event lastEvent_{};
+
+    // Receive the next event, suppressing soft-signal stops other than
+    // expectedSignal (0 = return on any stop), mirroring the old
+    // suppress-and-continue loop. An EXC_BREAKPOINT is always a stop. An
+    // unexpected non-signal exception is a genuine fault: forward it to the
+    // task's default disposition and fail.
     bool waitForStopped(int expectedSignal = 0) {
         while (true) {
-            int status;
-            if (waitpid(childPid_, &status, 0) == -1) {
-                perror("waitpid");
+            lastEvent_ = exc_.waitForEvent();
+            if (!lastEvent_.valid) {
                 return false;
             }
-            if (!WIFSTOPPED(status)) {
-                return false;
-            }
-            int sig = WSTOPSIG(status);
-            LOG("Process stopped signal=%d\n", sig);
-            if (expectedSignal == 0 || sig == expectedSignal) {
+            if (lastEvent_.isBreakpoint()) {
+                LOG("Stopped at EXC_BREAKPOINT\n");
                 return true;
             }
-            // Spurious signal; suppress it and continue
-            LOG("Suppressing unexpected signal %d (waiting for %d)\n", sig, expectedSignal);
-            if (ptrace(PT_CONTINUE, childPid_, (caddr_t)1, 0) < 0) {
-                perror("ptrace(PT_CONTINUE suppress)");
+            int sig = lastEvent_.softSignal();
+            if (sig != 0) {
+                LOG("Process stopped signal=%d\n", sig);
+                if (expectedSignal == 0 || sig == expectedSignal) {
+                    return true;
+                }
+                LOG("Suppressing unexpected signal %d (waiting for %d)\n", sig, expectedSignal);
+                if (!exc_.reply(0)) {
+                    return false;
+                }
+                continue;
+            }
+            fprintf(stderr, "Unexpected exception type=%d during setup; forwarding\n",
+                    lastEvent_.type);
+            exc_.forward();
+            return false;
+        }
+    }
+
+    // Wait specifically for the planted BRK (EXC_BREAKPOINT), suppressing any
+    // soft signals that arrive first. Under PT_ATTACHEXC a hardware breakpoint
+    // is delivered as EXC_BREAKPOINT directly (the old code caught it as
+    // SIGTRAP via ptrace).
+    bool waitForBreakpoint() {
+        while (true) {
+            lastEvent_ = exc_.waitForEvent();
+            if (!lastEvent_.valid) {
                 return false;
             }
+            if (lastEvent_.isBreakpoint()) {
+                LOG("Stopped at EXC_BREAKPOINT\n");
+                return true;
+            }
+            int sig = lastEvent_.softSignal();
+            if (sig != 0) {
+                LOG("Suppressing signal %d while waiting for breakpoint\n", sig);
+                if (!exc_.reply(0)) {
+                    return false;
+                }
+                continue;
+            }
+            fprintf(stderr, "Unexpected exception type=%d before breakpoint; forwarding\n",
+                    lastEvent_.type);
+            exc_.forward();
+            return false;
         }
     }
 
@@ -80,26 +129,56 @@ public:
         }
     }
 
+    task_t taskPort() const { return taskPort_; }
+    mach_port_t stoppedThread() const { return lastEvent_.thread; }
+
+    // Arm/disarm the thread-level EXC_BREAKPOINT catcher on the currently
+    // stopped thread — the one that will execute (and later re-execute) the
+    // planted BRK. Must be armed before continuing into the BRK and disarmed
+    // after the original instruction is restored. Catching the BRK at thread
+    // level keeps us off libRosettaRuntime's task-level EXC_BREAKPOINT port.
+    bool armThreadBreakpoint() { return exc_.installThreadBreakpoint(lastEvent_.thread); }
+    void disarmThreadBreakpoint() { exc_.removeThreadBreakpoint(); }
+
     bool attach(pid_t pid) {
         childPid_ = pid;
         LOG("Attempting to attach to %d\n", childPid_);
 
-        // Attach to the target via PT_ATTACH (sends SIGSTOP).
-        if (ptrace(PT_ATTACH, childPid_, nullptr, 0) == -1) {
-            perror("ptrace(PT_ATTACH)");
+        // Grab the task port up front (pre-exec) so we can install our Mach
+        // exception port before attaching. The loader already holds the
+        // debugger entitlement / runs as root, and already task_for_pid's the
+        // harder post-exec Rosetta process below.
+        if (task_for_pid(mach_task_self(), childPid_, &taskPort_) != KERN_SUCCESS) {
+            fprintf(stderr, "attach: task_for_pid(%d) failed\n", childPid_);
             return false;
         }
-        if (!waitForStopped()) {
+        // Install the exception port BEFORE attaching so every debug event is
+        // routed to us and can never fall through to the parent's fatal signal
+        // disposition.
+        if (!exc_.install(childPid_, taskPort_)) {
             return false;
         }
-        LOG("Attached to %d (SIGSTOP)\n", childPid_);
+        // PT_ATTACHEXC: a ptrace attach (sibling of PT_ATTACH) that delivers
+        // debug events as Mach exceptions to our port instead of as BSD
+        // signals. Sends SIGSTOP, delivered as EXC_SOFT_SIGNAL(SIGSTOP).
+        if (ptrace(PT_ATTACHEXC, childPid_, nullptr, 0) == -1) {
+            perror("ptrace(PT_ATTACHEXC)");
+            return false;
+        }
+        if (!waitForStopped()) {  // consume the attach-stop
+            return false;
+        }
+        LOG("Attached to %d (attach-stop)\n", childPid_);
         return true;
     }
 
-    // Continue the traced process and wait for it to stop at execv (SIGTRAP).
+    // Resume from the attach-stop, let the parent execv, and stop at the exec
+    // SIGTRAP. execve can hand back a different task port and resets thread
+    // state, so re-fetch the task port and make sure our exception port covers
+    // the post-exec task before the breakpoint window.
     bool waitForExecStop() {
-        if (ptrace(PT_CONTINUE, childPid_, (caddr_t)1, 0) < 0) {
-            perror("ptrace(PT_CONTINUE for exec)");
+        if (!exc_.reply(0)) {  // resume, suppressing SIGSTOP
+            fprintf(stderr, "waitForExecStop: failed to resume from attach-stop\n");
             return false;
         }
         if (!waitForStopped(SIGTRAP)) {
@@ -111,28 +190,56 @@ public:
             fprintf(stderr, "Failed to get task port for pid %d\n", childPid_);
             return false;
         }
+        if (!exc_.reinstall(taskPort_) || !exc_.verifyInstalled()) {
+            fprintf(stderr, "Failed to (re)install exception port after exec\n");
+            return false;
+        }
         LOG("Started debugging process %d using port %d\n", childPid_, taskPort_);
         return true;
     }
 
     bool continueExecution() {
-        if (ptrace(PT_CONTINUE, childPid_, (caddr_t)1, 0) < 0) {
-            perror("ptrace(PT_CONTINUE)");
+        if (!exc_.reply(0)) {  // resume from the held stop
+            fprintf(stderr, "continueExecution: resume failed\n");
             return false;
         }
-
         LOG("continueExecution...\n");
-
-        return waitForStopped(SIGTRAP);
+        // ARM64 BRK does not advance PC; removeBreakpoint restores the original
+        // instruction, so replying (in detach) later re-executes it correctly.
+        return waitForBreakpoint();
     }
 
     bool detach() {
-        if (ptrace(PT_DETACH, childPid_, (caddr_t)1, 0) < 0) {
-            perror("ptrace(PT_DETACH)");
+        // PT_DETACH requires the tracee to be in a BSD signal-stop. Under
+        // PT_ATTACHEXC our stops arrive as Mach exceptions (the BRK is a bare
+        // EXC_BREAKPOINT carrying no signal), which PT_DETACH rejects with
+        // EBUSY. So drive the tracee into a SIGSTOP job-control stop and hold
+        // it — the approach debugserver takes. SIGSTOP can't be caught or
+        // ignored, and PT_DETACH only accepts a held signal-stop like this one
+        // (a bare EXC_BREAKPOINT or a running process both give EBUSY).
+        kill(childPid_, SIGSTOP);
+        if (!exc_.reply(0)) {  // release the held stop; run into the SIGSTOP
             return false;
         }
-        LOG("Debugger detached.\n");
-        return true;
+        if (!waitForStopped(SIGSTOP)) {
+            fprintf(stderr, "detach: failed to reach SIGSTOP stop\n");
+            return false;
+        }
+        // Restore the task's exception ports, PT_DETACH from the held SIGSTOP
+        // stop, then release the exception (unblocking the thread). Order
+        // matters: PT_DETACH must run while the SIGSTOP exception is still held,
+        // and the release must run after (ptrace is no longer valid post-detach).
+        exc_.restoreAndTearDown();
+        bool ok = true;
+        if (ptrace(PT_DETACH, childPid_, (caddr_t)1, 0) < 0) {
+            perror("ptrace(PT_DETACH)");
+            ok = false;
+        }
+        exc_.release();
+        if (ok) {
+            LOG("Debugger detached.\n");
+        }
+        return ok;
     }
 
     bool setBreakpoint(uint64_t address) {
@@ -233,60 +340,39 @@ public:
         CPSR
     };
 
-    uint64_t readRegister(Register reg) {
-        thread_act_port_array_t threadList;
-        mach_msg_type_number_t threadCount;
-
-        kern_return_t kr = task_threads(taskPort_, &threadList, &threadCount);
-        if (kr != KERN_SUCCESS) {
-            fprintf(stderr, "Failed to get threads (error 0x%x: %s)\n", kr, mach_error_string(kr));
-            return 0;
-        }
-
+    // Read a register from a specific thread port. Used to read X19 from the
+    // exact thread reported by the breakpoint exception message — correct even
+    // if libRosettaRuntime has spawned other threads by then (task_threads[0]
+    // is not guaranteed to be the one that hit the BRK).
+    uint64_t readRegister(mach_port_t thread, Register reg) {
         arm_thread_state64_t state;
         mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
-        kr = thread_get_state(threadList[0], ARM_THREAD_STATE64, (thread_state_t)&state, &count);
-
+        kern_return_t kr =
+            thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count);
         if (kr != KERN_SUCCESS) {
             fprintf(stderr, "Failed to get thread state (error 0x%x: %s)\n", kr,
                     mach_error_string(kr));
             return 0;
         }
 
-        uint64_t value = 0;
         if (reg >= X0 && reg <= X28) {
-            value = state.__x[reg];
-        } else {
-            switch (reg) {
-                case FP:
-                    value = state.__fp;
-                    break;
-                case LR:
-                    value = state.__lr;
-                    break;
-                case SP:
-                    value = state.__sp;
-                    break;
-                case PC:
-                    value = state.__pc;
-                    break;
-                case CPSR:
-                    value = state.__cpsr;
-                    break;
-                default: {
-                    fprintf(stderr, "Invalid register\n");
-                    return 0;
-                }
-            }
+            return state.__x[reg];
         }
-
-        // Cleanup
-        for (unsigned int i = 0; i < threadCount; i++) {
-            mach_port_deallocate(mach_task_self(), threadList[i]);
+        switch (reg) {
+            case FP:
+                return state.__fp;
+            case LR:
+                return state.__lr;
+            case SP:
+                return state.__sp;
+            case PC:
+                return state.__pc;
+            case CPSR:
+                return state.__cpsr;
+            default:
+                fprintf(stderr, "Invalid register\n");
+                return 0;
         }
-        vm_deallocate(mach_task_self(), (vm_address_t)threadList, sizeof(thread_t) * threadCount);
-
-        return value;
     }
 
     bool setRegister(Register reg, uint64_t value) {
@@ -394,6 +480,26 @@ public:
             fprintf(stderr, "Failed to write memory at 0x%llx (error 0x%x: %s)\n", address, kr,
                     mach_error_string(kr));
             return false;
+        }
+
+        // Flush the target's instruction cache for the written range. ARM64 I/D
+        // caches are not coherent: mach_vm_write lands in the D-cache path only,
+        // so a core that has already executed (and cached) this line keeps
+        // running the stale bytes. That is fatal for the one breakpoint we plant
+        // at exports_fetch: we plant a BRK, catch it, restore the original
+        // instruction, then RESUME the held thread — which re-fetches the same
+        // PC (ARM64 BRK does not advance PC). If the stale BRK is still in the
+        // I-cache at that re-fetch, it re-traps after we have detached and torn
+        // down our exception handler → an unhandled SIGTRAP kills the tracee
+        // (the flaky post-detach exit=133). Flushing here makes the restore (and
+        // every __TEXT patch) coherent, exactly as lldb's debugserver does after
+        // writing to a tracee. Best-effort: a failure only regresses to the old
+        // behaviour, so log and continue.
+        vm_machine_attribute_val_t flush = MATTR_VAL_ICACHE_FLUSH;
+        kern_return_t fkr = mach_vm_machine_attribute(taskPort_, address, size, MATTR_CACHE, &flush);
+        if (fkr != KERN_SUCCESS) {
+            LOG("Warning: i-cache flush at 0x%llx failed (error 0x%x: %s)\n", address, fkr,
+                mach_error_string(fkr));
         }
 
         return true;
@@ -635,11 +741,26 @@ int main(int argc, char* argv[]) {
     dbg.writeMemory(runtimeBase + offsetFinder.offsetDisableAot_, &g_disable_aot_value,
                     sizeof(g_disable_aot_value));
 
+    // Catch the one planted BRK at THREAD level on the currently stopped thread
+    // (the single init thread that will execute exports_fetch). Thread-level
+    // exception ports out-rank task-level ones, so we still receive the BRK, but
+    // we never displace libRosettaRuntime's task-level EXC_BREAKPOINT handler —
+    // eliminating the detach-time restore race that leaked a fatal SIGTRAP to
+    // the parent (exit=133). Must be armed before continuing into the BRK.
+    if (!dbg.armThreadBreakpoint()) {
+        fprintf(stderr, "Failed to arm thread-level breakpoint catcher\n");
+        return 1;
+    }
     dbg.setBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
     dbg.continueExecution();
+    // Read X19 (Exports struct addr) from the thread that hit the BRK, then
+    // restore the original instruction and drop the thread-level catcher. The
+    // process stays stopped (we hold the breakpoint exception reply) through the
+    // stub install below until detach.
+    auto rosettaRuntimeExportsAddress =
+        dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X19);
     dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
-
-    auto rosettaRuntimeExportsAddress = dbg.readRegister(MuhDebugger::Register::X19);
+    dbg.disarmThreadBreakpoint();
     LOG("Rosetta runtime exports: 0x%llx\n", rosettaRuntimeExportsAddress);
 
     Exports exports;
@@ -682,12 +803,21 @@ int main(int argc, char* argv[]) {
 
     dbg.restoreThreadState(mmapThreadState);
 
-    // setup a breakpoint after mmap syscall
+    // setup a breakpoint after mmap syscall. Re-arm the thread-level
+    // EXC_BREAKPOINT catcher on the init thread (we disarmed it after
+    // exports_fetch, and we never hold the task-level EXC_BREAKPOINT port), so
+    // this second planted BRK is delivered to us rather than to
+    // libRosettaRuntime's task-level handler.
+    if (!dbg.armThreadBreakpoint()) {
+        fprintf(stderr, "Failed to arm thread-level breakpoint catcher for mmap\n");
+        return 1;
+    }
     dbg.setBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
     dbg.continueExecution();
-    dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
 
-    uint64_t machoBase = dbg.readRegister(MuhDebugger::Register::X0);
+    uint64_t machoBase = dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X0);
+    dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
+    dbg.disarmThreadBreakpoint();
 
     LOG("Allocated memory at 0x%llx\n", machoBase);
 
@@ -872,7 +1002,8 @@ int main(int argc, char* argv[]) {
     LOG("machoExports.runtimeExports: 0x%llx\n", machoExports.runtimeExports);
 
     // match the running system's Rosetta version and export count
-    auto libRosettaRuntimeExportsAddress = dbg.readRegister(MuhDebugger::Register::X19);
+    auto libRosettaRuntimeExportsAddress =
+        dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X19);
     Exports libRosettaRuntimeExports;
     dbg.readMemory(libRosettaRuntimeExportsAddress, &libRosettaRuntimeExports,
                    sizeof(libRosettaRuntimeExports));

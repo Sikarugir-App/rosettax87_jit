@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(rosetta_aot CXX)
+# C is needed for the MIG-generated mach_exc exception server used by the loader
+# (rosetta_loader build dir mach_excServer.c).
+project(rosetta_aot C CXX)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 foreach(cfg IN ITEMS Debug Release RelWithDebInfo MinSizeRel)
