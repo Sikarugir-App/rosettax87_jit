@@ -175,6 +175,27 @@ static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_
             case kOpcodeName_cdqe:
             case kOpcodeName_cwd:
             case kOpcodeName_cdq:
+            // Flag-neutral SSE/SSE2 data movement and conversions (mixed
+            // x87/SSE game code interleaves these with compare idioms).
+            // (u)comiss/sd are NOT here — they write EFLAGS.
+            case kOpcodeName_movss:
+            case kOpcodeName_movsd:      // SSE movsd (0F 10/11), not movsd-string
+            case kOpcodeName_movaps:
+            case kOpcodeName_movapd:
+            case kOpcodeName_movups:
+            case kOpcodeName_movupd:
+            case kOpcodeName_movlps:
+            case kOpcodeName_movhps:
+            case kOpcodeName_movdqa:
+            case kOpcodeName_movdqu:
+            case kOpcodeName_movd:
+            case kOpcodeName_movq:
+            case kOpcodeName_cvtsi2ss:
+            case kOpcodeName_cvtsi2sd:
+            case kOpcodeName_cvtss2sd:
+            case kOpcodeName_cvtsd2ss:
+            case kOpcodeName_cvttss2si:
+            case kOpcodeName_cvttsd2si:
                 continue;
             default:
                 return false;  // reader / partial definer / unknown
@@ -2103,6 +2124,26 @@ static bool no_parity_reader_after(IRInstr* instr_array, int64_t num_instrs,
             case kOpcodeName_cdqe:
             case kOpcodeName_cwd:
             case kOpcodeName_cdq:
+            // Flag-neutral SSE/SSE2 data movement and conversions — same
+            // set as nzcv_dead_after_run's neutral list.
+            case kOpcodeName_movss:
+            case kOpcodeName_movsd:      // SSE movsd (0F 10/11), not movsd-string
+            case kOpcodeName_movaps:
+            case kOpcodeName_movapd:
+            case kOpcodeName_movups:
+            case kOpcodeName_movupd:
+            case kOpcodeName_movlps:
+            case kOpcodeName_movhps:
+            case kOpcodeName_movdqa:
+            case kOpcodeName_movdqu:
+            case kOpcodeName_movd:
+            case kOpcodeName_movq:
+            case kOpcodeName_cvtsi2ss:
+            case kOpcodeName_cvtsi2sd:
+            case kOpcodeName_cvtss2sd:
+            case kOpcodeName_cvtsd2ss:
+            case kOpcodeName_cvttss2si:
+            case kOpcodeName_cvttsd2si:
                 continue;
             default:
                 return false;

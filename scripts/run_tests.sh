@@ -79,6 +79,7 @@ ALL_TESTS=(
     test_run_breaks
     test_transparent_int
     test_ir_fpr_pressure
+    test_sse_whitelist
 )
 
 RED='\033[0;31m'
