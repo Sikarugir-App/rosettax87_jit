@@ -54,6 +54,9 @@ All flags are set via environment variables and read at runtime.
 |----------|-------------|
 | `ROSETTA_X87_FAST_ROUND=1` | Skip rounding mode dispatch (faster but unsafe for FLDCW-heavy code) |
 | `ROSETTA_X87_EXTENDED_FPR_SCRATCH=1` | Expand FPR scratch register pool from 8 (V24–V31) to 16 (V16–V31) |
+| `ROSETTA_X87_RUN_BRIDGE=1` | Keep an active run's pinned cache GPRs across run-transparent integer instructions (`mov`/`lea`/…) instead of breaking the run |
+| `ROSETTA_X87_TRANSPARENT_INT=1` | Inline simple register-form `mov`/`lea`/`movzx`/`movsx` into IR runs (requires `ROSETTA_X87_RUN_BRIDGE`) |
+| `ROSETTA_X87_BRIDGE_CARRY=1` | Carry the base-address cache + rounding-control GPRs across bridged gaps (implies `ROSETTA_X87_RUN_BRIDGE`) |
 | `ROSETTA_X87_FUSE_FCOM_TEST=1` | Fuse `fcom`+`fnstsw ax`+`test` into FCMP+CSET+TST (~3× faster compares; leaves AX and status-word CC bits stale after the fused pattern) |
 | `ROSETTA_X87_F32_ARITH=1` | Keep f32-sourced arithmetic chains in f32 registers instead of widening intermediates to f64 (not bit-exact vs real x87 f64 intermediates) |
 | `ROSETTA_X87_FAST_RECIP_DIV=1` | Rewrite FDIV by *any* normal constant as FMUL by its reciprocal (up to 1 ulp off; exact power-of-two divisors are always rewritten regardless of this flag) |
@@ -77,6 +80,7 @@ These flags are primarily useful for narrowing down bugs by selectively disablin
 | `ROSETTA_X87_DISABLE_OPS=op1,op2,...` | Disable specific opcodes (comma-separated; names = `OpcodeId` entries in `rosetta_config/include/rosetta_config/Config.h`) |
 | `ROSETTA_X87_DISABLE_FUSIONS=f1,f2,...` | Disable specific fusions (comma-separated; names = `FusionId` entries in `rosetta_config/include/rosetta_config/Config.h`) |
 | `ROSETTA_X87_LOG_IR_DECLINES=1` | Log guest address + reason (`CompileError`) for every x87 run the IR pipeline declines — useful for finding translation gaps in real workloads |
+| `ROSETTA_X87_LOG_RUN_BREAKS=1` | Log length + breaking opcode + gap-to-next-x87 for every x87 run — useful for finding what terminates runs in real workloads |
 | `ROSETTA_X87_LOGS=1` | Enable verbose logging output from the loader |
 | `ROSETTA_FORCE_CPU_MODE32=1` | Force the decoder into 32-bit mode (test-only; lets `aotinvoke` reach legacy opcodes like ARPL) |
 

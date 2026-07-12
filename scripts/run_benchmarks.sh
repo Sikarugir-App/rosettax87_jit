@@ -5,7 +5,11 @@
 # Configurations:
 #   1. Native Rosetta    — binary run directly (baseline)
 #   2. Loader disabled   — runtime_loader + ROSETTA_X87_DISABLE_ALL_OPS=1 ROSETTA_X87_DISABLE_ALL_FUSIONS=1
-#   3. Loader optimized  — runtime_loader with all optimizations enabled
+#   3. Loader optimized  — runtime_loader with default JIT optimizations plus the
+#                          opt-in perf flags: EXTENDED_FPR_SCRATCH, RUN_BRIDGE,
+#                          TRANSPARENT_INT, BRIDGE_CARRY, F32_ARITH (see
+#                          OPTIMIZED_FLAGS below). Lossy/unsafe flags (FAST_ROUND,
+#                          FAST_RECIP_DIV, FUSE_FCOM_TEST) are intentionally excluded.
 #
 # Usage:
 #   bash scripts/run_benchmarks.sh              # build + run
@@ -51,6 +55,18 @@ ALL_BENCHMARKS=(
     bench_f32
     bench_interleaved_mov
     bench_const_promote
+)
+
+# Opt-in performance flags enabled for the "Loader optimized" (JIT) column.
+# Correctness-safe set plus F32_ARITH (game profile is f32-dominant). Lossy/unsafe
+# flags (FAST_ROUND, FAST_RECIP_DIV, FUSE_FCOM_TEST) are intentionally excluded;
+# FAST_ROUND has its own comparison section at the bottom of this script.
+OPTIMIZED_FLAGS=(
+    ROSETTA_X87_EXTENDED_FPR_SCRATCH=1
+    ROSETTA_X87_RUN_BRIDGE=1
+    ROSETTA_X87_TRANSPARENT_INT=1
+    ROSETTA_X87_BRIDGE_CARRY=1
+    ROSETTA_X87_F32_ARITH=1
 )
 
 RED='\033[0;31m'
@@ -123,7 +139,7 @@ for bench in "${ALL_BENCHMARKS[@]}"; do
     while IFS=' ' read -r keyword name ticks; do
         [[ "$keyword" == "BENCH" ]] || continue
         OPTIMIZED["$bench.$name"]="$ticks"
-    done < <(run_bench "$binary" 1)
+    done < <(run_bench "$binary" 1 "${OPTIMIZED_FLAGS[@]}")
 
     echo -e "${GREEN}done${NC}"
 done
@@ -246,12 +262,12 @@ if [[ -x "$ROUND_BIN" ]]; then
     while IFS=' ' read -r keyword name ticks; do
         [[ "$keyword" == "BENCH" ]] || continue
         ROUND_DEFAULT["$name"]="$ticks"
-    done < <(run_bench "$ROUND_BIN" 1)
+    done < <(run_bench "$ROUND_BIN" 1 "${OPTIMIZED_FLAGS[@]}")
 
     while IFS=' ' read -r keyword name ticks; do
         [[ "$keyword" == "BENCH" ]] || continue
         ROUND_FAST["$name"]="$ticks"
-    done < <(run_bench "$ROUND_BIN" 1 ROSETTA_X87_FAST_ROUND=1)
+    done < <(run_bench "$ROUND_BIN" 1 "${OPTIMIZED_FLAGS[@]}" ROSETTA_X87_FAST_ROUND=1)
 
     DIVIDER2=$(printf '─%.0s' $(seq 1 $((COL_NAME + COL_NUM*2 + COL_SPD + 8))))
     printf "${BOLD}%-${COL_NAME}s %${COL_NUM}s %${COL_NUM}s %${COL_SPD}s${NC}\n" \
