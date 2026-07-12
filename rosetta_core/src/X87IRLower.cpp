@@ -421,6 +421,20 @@ static int plan_addr_cache(Context& ctx) {
                            classify_ldst_disp(n.mem_operand->mem.disp,
                                               guest_mem_size_log2(n.mem_operand)) != 0;
                 break;
+            // Integer x87 nodes: classify at the access width.
+            case Op::LoadI16: case Op::StoreI16:
+            case Op::StoreCW: case Op::LoadCW:
+                foldable = n.mem_operand->kind == IROperandKind::MemRef &&
+                           classify_ldst_disp(n.mem_operand->mem.disp, 1) != 0;
+                break;
+            case Op::LoadI32: case Op::StoreI32:
+                foldable = n.mem_operand->kind == IROperandKind::MemRef &&
+                           classify_ldst_disp(n.mem_operand->mem.disp, 2) != 0;
+                break;
+            case Op::LoadI64: case Op::StoreI64:
+                foldable = n.mem_operand->kind == IROperandKind::MemRef &&
+                           classify_ldst_disp(n.mem_operand->mem.disp, 3) != 0;
+                break;
             default: continue;
         }
         const IROperand* mo = n.mem_operand;
@@ -854,21 +868,26 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::LoadI16: {
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            const OperandAccess acc =
-                compute_operand_access(*result, /*is_64bit=*/1, n.mem_operand,
-                                       /*size_log2=*/1);
             int Wd_val = alloc_free_gpr(*result);
-            if (acc.enc == OperandAccess::Enc::Unscaled9) {
-                // LDURH + SXTH (no sign-extending LDUR form in the emitter)
-                emit_ldur_stur(buf, /*size=*/1, /*is_load=*/1,
-                               (int16_t)acc.offset, acc.base, Wd_val);
+            if (emit_cached_gpr_access(n, /*size_log2=*/1, /*is_load=*/1, Wd_val)) {
+                // LDRH through the cached base, then SXTH
                 emit_bitfield(buf, 0, 0 /*SBFM*/, 0, 0, 15, Wd_val, Wd_val);
             } else {
-                // LDRSH Wd_val, [base, #disp] — sign-extending load
-                emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDRSH→W*/3,
-                                 (int16_t)(acc.offset >> 1), acc.base, Wd_val);
+                const OperandAccess acc =
+                    compute_operand_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                           /*size_log2=*/1);
+                if (acc.enc == OperandAccess::Enc::Unscaled9) {
+                    // LDURH + SXTH (no sign-extending LDUR form in the emitter)
+                    emit_ldur_stur(buf, /*size=*/1, /*is_load=*/1,
+                                   (int16_t)acc.offset, acc.base, Wd_val);
+                    emit_bitfield(buf, 0, 0 /*SBFM*/, 0, 0, 15, Wd_val, Wd_val);
+                } else {
+                    // LDRSH Wd_val, [base, #disp] — sign-extending load
+                    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDRSH→W*/3,
+                                     (int16_t)(acc.offset >> 1), acc.base, Wd_val);
+                }
+                free_gpr(*result, acc.base);
             }
-            free_gpr(*result, acc.base);
             // SCVTF Dd, Wd_val
             emit_scvtf(buf, /*is_64_int=*/0, /*ftype=f64*/1, Dd, Wd_val);
             free_gpr(*result, Wd_val);
@@ -878,8 +897,9 @@ void lower(Context& ctx, TranslationResult* result) {
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             int Wd_val = alloc_free_gpr(*result);
-            emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
-                                /*size_log2=*/2, /*is_load=*/1, Wd_val);
+            if (!emit_cached_gpr_access(n, /*size_log2=*/2, /*is_load=*/1, Wd_val))
+                emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                    /*size_log2=*/2, /*is_load=*/1, Wd_val);
             // SCVTF W-form treats the 32-bit source as signed
             emit_scvtf(buf, /*is_64_int=*/0, /*ftype=f64*/1, Dd, Wd_val);
             free_gpr(*result, Wd_val);
@@ -1091,8 +1111,9 @@ void lower(Context& ctx, TranslationResult* result) {
                 emit_rcmode_dispatch(buf, Wd_int, Dd_val, is_64bit_int, Xbase, Wd_tmp);
             }
 
-            emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
-                                store_size, /*is_load=*/0, Wd_int);
+            if (!emit_cached_gpr_access(n, store_size, /*is_load=*/0, Wd_int))
+                emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                    store_size, /*is_load=*/0, Wd_int);
             free_gpr(*result, Wd_int);
             break;
         }
@@ -1224,8 +1245,9 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::StoreCW: {
             // FLDCW: load u16 from memory, write to X87State.control_word.
             int Wd_cw = alloc_free_gpr(*result);
-            emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
-                                /*size_log2=*/1, /*is_load=*/1, Wd_cw);
+            if (!emit_cached_gpr_access(n, /*size_log2=*/1, /*is_load=*/1, Wd_cw))
+                emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                    /*size_log2=*/1, /*is_load=*/1, Wd_cw);
             // STRH Wd_cw, [Xbase, #0]  — control_word is at offset 0x00 → imm12=0
             emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0, /*imm12=*/0, Xbase, Wd_cw);
             // Re-cache RC from the just-written control word.
@@ -1244,8 +1266,9 @@ void lower(Context& ctx, TranslationResult* result) {
             int Wd_cw = alloc_free_gpr(*result);
             // LDRH Wd_cw, [Xbase, #0]  — control_word is at offset 0x00 → imm12=0
             emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1, /*imm12=*/0, Xbase, Wd_cw);
-            emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
-                                /*size_log2=*/1, /*is_load=*/0, Wd_cw);
+            if (!emit_cached_gpr_access(n, /*size_log2=*/1, /*is_load=*/0, Wd_cw))
+                emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                    /*size_log2=*/1, /*is_load=*/0, Wd_cw);
             free_gpr(*result, Wd_cw);
             break;
         }
