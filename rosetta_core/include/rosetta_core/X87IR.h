@@ -232,7 +232,8 @@ struct Context {
     // Base-address cache plan (filled by compile_run after the pressure gate,
     // consumed by lower()): node IDs whose mem_operand is the representative
     // operand of a cached guest base; addr_cache_n = how many are enabled.
-    int16_t addr_cache_rep[2];
+    static constexpr int kAddrCacheSlots = 3;
+    int16_t addr_cache_rep[kAddrCacheSlots];
     int8_t  addr_cache_n;
 
     // Guest EFLAGS are provably dead after this run (the next flag-relevant
@@ -256,8 +257,7 @@ struct Context {
         consumed = 0;
         last_fcmp = -1;
         last_fcomi = -1;
-        addr_cache_rep[0] = -1;
-        addr_cache_rep[1] = -1;
+        for (int i = 0; i < kAddrCacheSlots; i++) addr_cache_rep[i] = -1;
         addr_cache_n = 0;
         nzcv_dead = 0;
         const_promote = 0;

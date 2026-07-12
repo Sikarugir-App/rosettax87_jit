@@ -443,7 +443,7 @@ static int plan_addr_cache(Context& ctx) {
     }
 
     int picked = 0;
-    for (int round = 0; round < 2; round++) {
+    for (int round = 0; round < Context::kAddrCacheSlots; round++) {
         int best = -1;
         for (int k = 0; k < nkeys; k++) {
             if (keys[k].count >= 2 && (best < 0 || keys[k].count > keys[best].count))
@@ -629,9 +629,9 @@ void lower(Context& ctx, TranslationResult* result) {
     auto& xc = result->x87_cache;
     const bool carry_on = g_rosetta_config && g_rosetta_config->bridge_carry;
     const int addr_n = ctx.addr_cache_n;
-    IROperand* addr_rep[2] = {nullptr, nullptr};
-    int addr_reg[2] = {-1, -1};
-    bool addr_owned[2] = {false, false};
+    IROperand* addr_rep[Context::kAddrCacheSlots] = {};
+    int addr_reg[Context::kAddrCacheSlots] = {-1, -1, -1};
+    bool addr_owned[Context::kAddrCacheSlots] = {};
     for (int k = 0; k < addr_n; k++) {
         addr_rep[k] = ctx.nodes[ctx.addr_cache_rep[k]].mem_operand;
         if (carry_on) {
@@ -1548,7 +1548,7 @@ void lower(Context& ctx, TranslationResult* result) {
     // Dropped GPRs return to the pool when the caller recomputes
     // free_gpr_mask from pinned_mask().
     {
-        bool base_carried[2] = {false, false};
+        bool base_carried[Context::kAddrCacheSlots] = {};
         bool rc_carried = false;
         const bool stays_active = xc.run_remaining > ctx.consumed;
         if (carry_on && stays_active) {
