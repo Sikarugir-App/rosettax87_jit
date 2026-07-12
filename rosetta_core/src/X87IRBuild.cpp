@@ -1123,9 +1123,10 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                     instr->operands[0].reg.reg.index());
                 // inputs[2] = top_delta snapshot (for TOP patching in lowering)
                 ctx.nodes[id].inputs[2] = ctx.top_delta;
-                // The AX write may change a cached operand's address (EAX/RAX
-                // as base/index) — conservatively drop all CSE entries.
-                ctx.mem_cse_clear();
+                // The AX write may change a cached operand's address — evict
+                // only entries whose address uses RAX/EAX as base/index;
+                // entries through other registers (and AbsMem) stay valid.
+                mem_cse_evict_reg(ctx, 0);
                 break;
             }
 

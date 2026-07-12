@@ -194,8 +194,9 @@ struct Context {
 
     // Memory CSE table: recent load results (and forwardable f64 stores)
     // keyed by operand identity. Within a run, guest GPRs cannot change
-    // (only x87 instructions — the sole exception, FSTSW AX, clears the
-    // table), so identical operands always address the same location.
+    // (only x87 instructions — the sole exception, FSTSW AX, evicts
+    // RAX-addressed entries), so identical operands always address the
+    // same location.
     // Cleared conservatively on any memory write (Store*, FNSTCW).
     static constexpr int kMemCSESlots = 8;
     IROperand* mem_cse_op[kMemCSESlots];   // operand identity (compared by value)
