@@ -197,7 +197,7 @@ struct Context {
     // (only x87 instructions — the sole exception, FSTSW AX, clears the
     // table), so identical operands always address the same location.
     // Cleared conservatively on any memory write (Store*, FNSTCW).
-    static constexpr int kMemCSESlots = 4;
+    static constexpr int kMemCSESlots = 8;
     IROperand* mem_cse_op[kMemCSESlots];   // operand identity (compared by value)
     Op         mem_cse_kind[kMemCSESlots]; // the Load* op an entry satisfies
     int16_t    mem_cse_val[kMemCSESlots];  // node ID holding the f64 value
