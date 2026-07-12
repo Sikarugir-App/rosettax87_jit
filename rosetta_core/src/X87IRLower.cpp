@@ -854,11 +854,21 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::LoadI16: {
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
+            const OperandAccess acc =
+                compute_operand_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                       /*size_log2=*/1);
             int Wd_val = alloc_free_gpr(*result);
-            // LDRSH Wd_val, [addr] — sign-extending load
-            emit_ldrs(buf, /*is_64=*/0, /*size=S16*/1, Wd_val, addr);
-            free_gpr(*result, addr);
+            if (acc.enc == OperandAccess::Enc::Unscaled9) {
+                // LDURH + SXTH (no sign-extending LDUR form in the emitter)
+                emit_ldur_stur(buf, /*size=*/1, /*is_load=*/1,
+                               (int16_t)acc.offset, acc.base, Wd_val);
+                emit_bitfield(buf, 0, 0 /*SBFM*/, 0, 0, 15, Wd_val, Wd_val);
+            } else {
+                // LDRSH Wd_val, [base, #disp] — sign-extending load
+                emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDRSH→W*/3,
+                                 (int16_t)(acc.offset >> 1), acc.base, Wd_val);
+            }
+            free_gpr(*result, acc.base);
             // SCVTF Dd, Wd_val
             emit_scvtf(buf, /*is_64_int=*/0, /*ftype=f64*/1, Dd, Wd_val);
             free_gpr(*result, Wd_val);
@@ -867,10 +877,9 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::LoadI32: {
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
             int Wd_val = alloc_free_gpr(*result);
-            emit_ldr_imm(buf, /*size=S32*/2, Wd_val, addr, 0);
-            free_gpr(*result, addr);
+            emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                /*size_log2=*/2, /*is_load=*/1, Wd_val);
             // SCVTF W-form treats the 32-bit source as signed
             emit_scvtf(buf, /*is_64_int=*/0, /*ftype=f64*/1, Dd, Wd_val);
             free_gpr(*result, Wd_val);
@@ -1082,9 +1091,8 @@ void lower(Context& ctx, TranslationResult* result) {
                 emit_rcmode_dispatch(buf, Wd_int, Dd_val, is_64bit_int, Xbase, Wd_tmp);
             }
 
-            int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-            emit_str_imm(buf, store_size, Wd_int, addr, /*imm12=*/0);
-            free_gpr(*result, addr);
+            emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                store_size, /*is_load=*/0, Wd_int);
             free_gpr(*result, Wd_int);
             break;
         }
@@ -1215,10 +1223,9 @@ void lower(Context& ctx, TranslationResult* result) {
         // ── Control word ────────────────────────────────────────────────
         case Op::StoreCW: {
             // FLDCW: load u16 from memory, write to X87State.control_word.
-            int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
             int Wd_cw = alloc_free_gpr(*result);
-            emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1, /*imm12=*/0, addr, Wd_cw);
-            free_gpr(*result, addr);
+            emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                /*size_log2=*/1, /*is_load=*/1, Wd_cw);
             // STRH Wd_cw, [Xbase, #0]  — control_word is at offset 0x00 → imm12=0
             emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0, /*imm12=*/0, Xbase, Wd_cw);
             // Re-cache RC from the just-written control word.
@@ -1237,9 +1244,8 @@ void lower(Context& ctx, TranslationResult* result) {
             int Wd_cw = alloc_free_gpr(*result);
             // LDRH Wd_cw, [Xbase, #0]  — control_word is at offset 0x00 → imm12=0
             emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1, /*imm12=*/0, Xbase, Wd_cw);
-            int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-            emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0, /*imm12=*/0, addr, Wd_cw);
-            free_gpr(*result, addr);
+            emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                /*size_log2=*/1, /*is_load=*/0, Wd_cw);
             free_gpr(*result, Wd_cw);
             break;
         }

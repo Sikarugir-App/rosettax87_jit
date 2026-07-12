@@ -138,6 +138,57 @@ int main(void) {
         CHECK("ficomp_m32_regbase", sw == 0x0100, (double)sw);  /* 10 < 100 → C0 */
     }
 
+    /* IR-shaped variants: consecutive x87 runs (length >= 2) so the IR
+       pipeline lowers the integer load/store nodes — zero-disp regbase must
+       survive the disp-folding path there too. */
+    {
+        int32_t v32[2] = {4, 0};
+        __asm__ volatile(
+            "movq    %1, %%rax\n\t"
+            "fildl   (%%rax)\n\t"
+            "fildl   (%%rax)\n\t"
+            "faddp\n\t"
+            "fistpl  4(%%rax)\n\t"
+            "movq    %%rax, %0\n\t"
+            : "=r"(base)
+            : "r"((uintptr_t)v32)
+            : "rax", "memory");
+        CHECK("fild_fistp_m32_ir_regbase", v32[1] == 8, (double)v32[1]);
+        CHECK_BASE("fild_fistp_m32_ir_regbase", base, v32);
+    }
+    {
+        int64_t v64[2] = {(1LL << 40) + 3, 0};
+        __asm__ volatile(
+            "movq    %1, %%rax\n\t"
+            "fildll  (%%rax)\n\t"
+            "fildll  (%%rax)\n\t"
+            "faddp\n\t"
+            "fistpll 8(%%rax)\n\t"
+            "movq    %%rax, %0\n\t"
+            : "=r"(base)
+            : "r"((uintptr_t)v64)
+            : "rax", "memory");
+        CHECK("fild_fistp_m64_ir_regbase", v64[1] == 2 * ((1LL << 40) + 3),
+              (double)v64[1]);
+        CHECK_BASE("fild_fistp_m64_ir_regbase", base, v64);
+    }
+    {
+        int16_t v16 = 4;
+        int32_t out = 0;
+        __asm__ volatile(
+            "movq    %2, %%rax\n\t"
+            "filds   (%%rax)\n\t"
+            "filds   (%%rax)\n\t"
+            "faddp\n\t"
+            "fistpl  %1\n\t"
+            "movq    %%rax, %0\n\t"
+            : "=r"(base), "=m"(out)
+            : "r"((uintptr_t)&v16)
+            : "rax", "memory");
+        CHECK("fild_m16_ir_regbase", out == 8, (double)out);
+        CHECK_BASE("fild_m16_ir_regbase", base, &v16);
+    }
+
     if (failures == 0)
         printf("ALL PASS (test_int_regbase)\n");
     return failures != 0;
