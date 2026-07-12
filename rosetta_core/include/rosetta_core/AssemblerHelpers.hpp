@@ -248,6 +248,8 @@ auto emit_fcmp_zero_f64(AssemblerBuffer& buf, int Dn) -> void;
 // ftype:        0=f32  1=f64
 auto emit_scvtf(AssemblerBuffer& buf, int is_64bit_int, int ftype, int Rd, int Rn) -> void;
 auto emit_scvtf_x_to_d(AssemblerBuffer& buf, int Dd, int Xn) -> void;
+// SCVTF (vector, integer) scalar 64-bit — int64 held in an FPR → f64 in place
+auto emit_scvtf_d_from_d(AssemblerBuffer& buf, int Dd, int Dn) -> void;
 
 // FCVTZS — FP → signed integer GPR, truncate toward zero
 // ftype:        0=f32  1=f64

@@ -123,23 +123,26 @@ static void emit_fld_value(AssemblerBuffer& buf, TranslationResult& a1,
             break;
         }
 
+        case kFildM64:
+            // LDR Dd_val (int64 into the FPR) + SCVTF Dd, Dd — no GPR,
+            // no cross-domain move.
+            emit_fp_mem_access(a1, /*is_64bit=*/1, &fld_instr->operands[0],
+                               /*size=*/3, /*is_load=*/1, Dd_val);
+            emit_scvtf_d_from_d(buf, Dd_val, Dd_val);
+            break;
+
         case kFildM16:
-        case kFildM32:
-        case kFildM64: {
+        case kFildM32: {
             const int Wd_int = alloc_free_gpr(a1);
             if (cls.source == kFildM16) {
                 emit_gpr_mem_access(a1, /*is_64bit=*/1, &fld_instr->operands[0],
                                     /*size_log2=*/1, /*is_load=*/1, Wd_int);   // LDRH
                 emit_bitfield(buf, 0, 0, 0, 0, 15, Wd_int, Wd_int);            // SXTH
-            } else if (cls.source == kFildM32) {
-                emit_gpr_mem_access(a1, /*is_64bit=*/1, &fld_instr->operands[0],
-                                    /*size_log2=*/2, /*is_load=*/1, Wd_int);   // LDR W
             } else {
                 emit_gpr_mem_access(a1, /*is_64bit=*/1, &fld_instr->operands[0],
-                                    /*size_log2=*/3, /*is_load=*/1, Wd_int);   // LDR X
+                                    /*size_log2=*/2, /*is_load=*/1, Wd_int);   // LDR W
             }
-            const int is_64 = (cls.source == kFildM64) ? 1 : 0;
-            emit_scvtf(buf, is_64, 1 /*f64*/, Dd_val, Wd_int);
+            emit_scvtf(buf, /*is_64bit_int=*/0, 1 /*f64*/, Dd_val, Wd_int);
             free_gpr(a1, Wd_int);
             break;
         }

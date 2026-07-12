@@ -633,6 +633,13 @@ auto emit_scvtf_x_to_d(AssemblerBuffer& buf, int Dd, int Xn) -> void {
     emit_scvtf(buf, /*is_64bit_int=*/1, /*ftype=*/1, Dd, Xn);
 }
 
+auto emit_scvtf_d_from_d(AssemblerBuffer& buf, int Dd, int Dn) -> void {
+    // SCVTF (vector, integer), scalar 64-bit: converts int64 held in an FPR
+    // to f64 in place — no GPR involved, avoids the cross-domain move.
+    // [31:10]=0101111001100001110110 [9:5]=Dn [4:0]=Dd
+    buf.emit(0x5E61D800u | ((uint32_t)(Dn & 0x1F) << 5) | (uint32_t)(Dd & 0x1F));
+}
+
 auto emit_fcvtzs(AssemblerBuffer& buf, int ftype, int is_64bit_int, int Rd, int Rn) -> void {
     // FCVTZS (scalar, integer): FP to signed GPR, truncate toward zero
     // [31]=sf [30:24]=0011110 [23:22]=ftype [21]=1 [20:19]=11 [18:16]=000

@@ -350,12 +350,14 @@ auto translate_fild(TranslationResult* a1, IRInstr* a2) -> void {
 
     const int Wd_tmp = alloc_gpr(*a1, 2);
     const int Wd_tmp2 = alloc_gpr(*a1, 3);
-    const int Wd_int = alloc_free_gpr(*a1);  // survives emit_x87_push
+    const int Wd_int =
+        (int_size == IROperandSize::S64) ? -1 : alloc_free_gpr(*a1);  // survives emit_x87_push
     const int Dd_val = alloc_free_fpr(*a1);
 
-    // Steps 1–3: load integer from memory into Wd_int (disp folded into the
-    // load when possible), sign-extending as needed. Wd_int is a free-pool
+    // Steps 1–3: load the integer (disp folded into the load when possible),
+    // sign-extending as needed. m16/m32 go through Wd_int — a free-pool
     // register distinct from Wd_tmp, so emit_x87_push cannot clobber it.
+    // m64 loads straight into Dd_val (no GPR, no cross-domain move).
     if (int_size == IROperandSize::S16) {
         // LDRH Wd_int, [base, #disp] + SXTH — sign-extend bits[15:0] → W
         emit_gpr_mem_access(*a1, /*is_64bit=*/1, &a2->operands[0], /*size_log2=*/1,
@@ -367,22 +369,22 @@ auto translate_fild(TranslationResult* a1, IRInstr* a2) -> void {
         emit_gpr_mem_access(*a1, /*is_64bit=*/1, &a2->operands[0], /*size_log2=*/2,
                             /*is_load=*/1, Wd_int);
     } else {
-        // LDR Xd_int, [base, #disp] — 64-bit load (m64int, DF /5)
-        emit_gpr_mem_access(*a1, /*is_64bit=*/1, &a2->operands[0], /*size_log2=*/3,
-                            /*is_load=*/1, Wd_int);
+        // LDR Dd_val, [base, #disp] — 64-bit load into the FPR (m64int, DF /5)
+        emit_fp_mem_access(*a1, /*is_64bit=*/1, &a2->operands[0], /*size=*/3,
+                           /*is_load=*/1, Dd_val);
     }
 
     // Step 4: push — allocates a new ST(0) slot, decrements TOP.
-    // Clobbers Wd_tmp and Wd_tmp2.  Wd_int is unaffected (separate
-    // free-pool register).
+    // Clobbers Wd_tmp and Wd_tmp2.  Wd_int / Dd_val are unaffected.
     x87_push(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
     free_gpr(*a1, Wd_tmp2);
 
-    // Step 5: SCVTF — convert signed integer in Wd_int/Xd_int to f64.
-    // m16 and m32 use a W (32-bit) source register: is_64bit_int=0
-    // m64 uses an X (64-bit) source register:        is_64bit_int=1
-    const int is_64bit_int = (int_size == IROperandSize::S64) ? 1 : 0;
-    emit_scvtf(buf, is_64bit_int, /*ftype=*/1 /*f64*/, Dd_val, Wd_int);
+    // Step 5: SCVTF — convert the signed integer to f64.
+    // m16/m32: W (32-bit) GPR source; m64: int64 already in Dd_val.
+    if (int_size == IROperandSize::S64)
+        emit_scvtf_d_from_d(buf, Dd_val, Dd_val);
+    else
+        emit_scvtf(buf, /*is_64bit_int=*/0, /*ftype=*/1 /*f64*/, Dd_val, Wd_int);
 
     // Step 6: store the converted value into the freshly pushed ST(0).
     // Wd_tmp is now clean (emit_x87_push is done with it) and used here
@@ -391,7 +393,7 @@ auto translate_fild(TranslationResult* a1, IRInstr* a2) -> void {
 
     // Step 7: free in reverse allocation order
     free_fpr(*a1, Dd_val);
-    free_gpr(*a1, Wd_int);
+    if (Wd_int >= 0) free_gpr(*a1, Wd_int);
     x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
     free_gpr(*a1, Wd_tmp);
 }

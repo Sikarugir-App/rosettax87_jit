@@ -879,12 +879,13 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::LoadI64: {
             int Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-            int Xd_val = alloc_free_gpr(*result);
-            emit_ldr_imm(buf, /*size=S64*/3, Xd_val, addr, 0);
-            free_gpr(*result, addr);
-            emit_scvtf_x_to_d(buf, Dd, Xd_val);
-            free_gpr(*result, Xd_val);
+            // Load the int64 straight into the D register and convert in
+            // place — no value GPR, no cross-domain GPR→FPR move.
+            if (!emit_cached_access(n, /*size=*/3, /*is_load=*/1, Dd)) {
+                emit_fp_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                   /*size=*/3, /*is_load=*/1, Dd);
+            }
+            emit_scvtf_d_from_d(buf, Dd, Dd);
             break;
         }
         case Op::ConstZero: {
@@ -1742,8 +1743,13 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
             break;
 
         // 2 GPRs: addr + Wd_val
-        case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
+        case Op::LoadI16: case Op::LoadI32:
             transient = 2;
+            break;
+
+        // 1 GPR: addr only — the int64 is loaded into the FPR directly
+        case Op::LoadI64:
+            transient = 1;
             break;
 
         // 2 GPRs: Wd_int + addr
