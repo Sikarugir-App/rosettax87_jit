@@ -336,6 +336,9 @@ bool X87Cache::is_transparent(uint16_t op) {
         case kOpcodeName_movsxd:
         case kOpcodeName_lea:
         case kOpcodeName_nop:
+        // FWAIT: no case in translate_insn — falls to the default label,
+        // which emits nothing and allocates nothing (audited 2026-07-12).
+        case kOpcodeName_wait:
         // Integer ALU (flag definers — Rosetta materializes flags itself)
         case kOpcodeName_add:
         case kOpcodeName_sub:

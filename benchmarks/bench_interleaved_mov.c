@@ -109,12 +109,37 @@ static clock_t bench_f32_sse_mix(void) {
     return clock() - start;
 }
 
+/* --------------------------------------------------------------------------
+ * f32 compute split by guest MEMORY movs (Phase 3 target): mov r32←m,
+ * mov m←r, mov m←i — 63% of the game's in-run non-x87 per soak telemetry.
+ * -------------------------------------------------------------------------- */
+static clock_t bench_f32_mem_mov(void) {
+    clock_t start = clock();
+    volatile float r;
+    float a = 1.5f, b = 2.0f;
+    volatile long cell = 42, sink = 0;
+    for (int i = 0; i < TIMES; i++)
+        __asm__ volatile (
+            "flds %2\n\t fmuls %3\n\t movl %4, %%ecx\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movl %%ecx, %1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movl $7, %1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movl %4, %%edx\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movl %%edx, %1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movl $9, %1\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movzbl %4, %%ecx\n\t fstps %0\n\t"
+            "flds %2\n\t fmuls %3\n\t movl %%ecx, %1\n\t fstps %0\n\t"
+            : "=m"(r), "=m"(sink) : "m"(a), "m"(b), "m"(cell)
+            : "ecx", "edx");
+    return clock() - start;
+}
+
 int main(void) {
     struct { const char *name; clock_t (*fn)(void); } benches[] = {
         {"f32_mov_unrelated", bench_f32_mov_unrelated},
         {"f64_mov_base",      bench_f64_mov_base},
         {"f32_lea_split",     bench_f32_lea_split},
         {"f32_sse_mix",       bench_f32_sse_mix},
+        {"f32_mem_mov",       bench_f32_mem_mov},
     };
     int n = (int)(sizeof(benches) / sizeof(benches[0]));
     for (int i = 0; i < n; i++) {

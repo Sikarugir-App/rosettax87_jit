@@ -606,16 +606,101 @@ static bool build_fcmov(Context& ctx, IRInstr* instr, int aarch64_cond) {
 // A declined instruction ends IR consumption there; the run bridge still
 // carries the pinned GPRs across it and the IR re-enters mid-run after.
 
+// Memory operand admissible for a Guest load/store: no segment override
+// (compute_operand_address's GS/TLS fallback fixed-allocates pool slot 7 and
+// blows the pressure model) and a width the LDR/STR forms cover.
+static bool guest_mem_operand_ok(const IROperand& m, bool allow64) {
+    if (m.kind == IROperandKind::MemRef) {
+        if (m.mem.seg_override != 0) return false;
+        switch (m.mem.size) {
+            case IROperandSize::S8: case IROperandSize::S16:
+            case IROperandSize::S32: return true;
+            case IROperandSize::S64: return allow64;
+            default: return false;
+        }
+    }
+    if (m.kind == IROperandKind::AbsMem) {
+        switch (m.abs_mem.size) {
+            case IROperandSize::S8: case IROperandSize::S16:
+            case IROperandSize::S32: return true;
+            case IROperandSize::S64: return allow64;
+            default: return false;
+        }
+    }
+    return false;
+}
+
+static IROperandSize guest_mem_size(const IROperand& m) {
+    return m.kind == IROperandKind::AbsMem ? m.abs_mem.size : m.mem.size;
+}
+
 static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
     if (!(g_rosetta_config && g_rosetta_config->transparent_int)) return false;
-    if (op == kOpcodeName_nop) return true;  // consume; no node, no effect
+    // nop consumes nothing; fwait checks pending FP exceptions, which this
+    // JIT does not model anywhere — Rosetta itself translates `wait` to
+    // nothing at all (translate_insn default case, binary-verified).
+    if (op == kOpcodeName_nop || op == kOpcodeName_wait) return true;
 
     if (instr->num_operands < 2) return false;
     const IROperand& dst = instr->operands[0];
     const IROperand& src = instr->operands[1];
+
+    // ── Memory-destination forms: mov m←r / mov m←i ────────────────────
+    if (op == kOpcodeName_mov && (dst.kind == IROperandKind::MemRef ||
+                                  dst.kind == IROperandKind::AbsMem)) {
+        int16_t id;
+        if (src.kind == IROperandKind::Register) {
+            if (!src.reg.reg.is_gpr()) return false;
+            // High-byte sources (AH/CH/DH/BH, class nibble 0x1X) would need
+            // an extra shift — decline; low 8/16/32/64 store the low bits
+            // of the guest register directly (no partial-register merge on
+            // the register side for stores).
+            if ((src.reg.reg.value & 0xF0) == 0x10) return false;
+            if (!guest_mem_operand_ok(dst, /*allow64=*/true)) return false;
+            id = ctx.add_node(Op::GuestStoreR);
+            if (id < 0) return false;
+            ctx.nodes[id].aux = src.reg.reg.index();
+        } else if (src.kind == IROperandKind::MemRef ||
+                   src.kind == IROperandKind::AbsMem) {
+            return false;
+        } else {
+            if (src.kind == IROperandKind::Immediate && src.imm.mem_flags != 0)
+                return false;
+            // mov m64, imm32 sign-extends — decline 64-bit imm stores.
+            if (!guest_mem_operand_ok(dst, /*allow64=*/false)) return false;
+            id = ctx.add_node(Op::GuestStoreI);
+            if (id < 0) return false;
+            ctx.nodes[id].aux = static_cast<uint32_t>(src.imm.value);
+        }
+        ctx.nodes[id].mem_operand = &instr->operands[0];
+        // Memory write: cached loads it may alias are stale.
+        mem_cse_evict_may_alias(ctx, &instr->operands[0]);
+        return true;
+    }
+
     if (dst.kind != IROperandKind::Register || !dst.reg.reg.is_gpr()) return false;
     const bool dst64 = dst.reg.size == IROperandSize::S64;
     if (!dst64 && dst.reg.size != IROperandSize::S32) return false;
+
+    // ── Memory-source forms: mov r←m, movzx/movsx r32←m ────────────────
+    if ((src.kind == IROperandKind::MemRef || src.kind == IROperandKind::AbsMem) &&
+        (op == kOpcodeName_mov || op == kOpcodeName_movzx ||
+         op == kOpcodeName_movsx)) {
+        // Widths: plain mov loads exactly the dst width (mem size == reg
+        // size); movzx/movsx load a narrower mem size into r32. 64-bit
+        // loads only for plain mov r64←m64.
+        if (!guest_mem_operand_ok(src, /*allow64=*/op == kOpcodeName_mov && dst64))
+            return false;
+        if (op != kOpcodeName_mov && dst64) return false;
+        auto id = ctx.add_node(Op::GuestLoad);
+        if (id < 0) return false;
+        ctx.nodes[id].mem_operand = &instr->operands[1];
+        ctx.nodes[id].aux = static_cast<uint64_t>(dst.reg.reg.index()) |
+                            (op == kOpcodeName_movsx ? (1u << 4) : 0);
+        ctx.guest_written_mask |= static_cast<uint16_t>(1u << dst.reg.reg.index());
+        mem_cse_evict_reg(ctx, dst.reg.reg.index());
+        return true;
+    }
 
     GuestPayload p = {};
     p.dst = dst.reg.reg.index();
@@ -629,9 +714,6 @@ static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
                     return false;
                 p.src = src.reg.reg.index();
                 node_op = Op::GuestMovRR;
-            } else if (src.kind == IROperandKind::MemRef ||
-                       src.kind == IROperandKind::AbsMem) {
-                return false;
             } else {
                 // Immediate-like kinds share the payload offset (see
                 // try_fuse_fcom_test); kind Immediate may carry a fixup.
@@ -1077,6 +1159,7 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             case kOpcodeName_movsxd:
             case kOpcodeName_lea:
             case kOpcodeName_nop:
+            case kOpcodeName_wait:
                 ok = build_guest_int(ctx, instr, op);
                 break;
 

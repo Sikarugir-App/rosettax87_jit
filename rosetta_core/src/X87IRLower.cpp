@@ -239,6 +239,18 @@ static bool addr_uses_written_reg(const IROperand* op, uint16_t written_mask) {
     return false;
 }
 
+// Access width of a Guest load/store node's memory operand.
+static int guest_mem_size_log2(const IROperand* m) {
+    const IROperandSize s =
+        m->kind == IROperandKind::AbsMem ? m->abs_mem.size : m->mem.size;
+    switch (s) {
+        case IROperandSize::S8: return 0;
+        case IROperandSize::S16: return 1;
+        case IROperandSize::S32: return 2;
+        default: return 3;
+    }
+}
+
 // ── LDP/STP pair planning ───────────────────────────────────────────────────
 //
 // Pair two f64/f32 accesses through the same guest base into one LDP/STP.
@@ -285,11 +297,14 @@ static bool pair_node_skippable(Op op, bool lead_is_load) {
         // sunk past them (the load could read the stored location).
         case Op::LoadF64: case Op::LoadF32Raw:
         case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
+        case Op::GuestLoad:
             return lead_is_load;
-        // Inlined guest integer instructions write registers, never memory.
+        // Register-only inlined guest instructions never touch memory.
         // Pairs only form through cached-base operands, and plan_addr_cache
         // excludes every base/index register these nodes write — so a paired
         // access's address and value are unaffected by crossing one.
+        // (GuestLoad above writes a register too — same argument — but reads
+        // memory; GuestStoreR/GuestStoreI write memory and fall to default.)
         case Op::GuestMovRR: case Op::GuestMovRI:
         case Op::GuestLea: case Op::GuestExt:
             return true;
@@ -391,17 +406,28 @@ static int plan_addr_cache(Context& ctx) {
     for (int i = 0; i < ctx.num_nodes; i++) {
         const auto& n = ctx.nodes[i];
         if (n.flags & kDead) continue;
-        bool is_f64;
+        bool foldable;
         switch (n.op) {
-            case Op::LoadF64: case Op::StoreF64: is_f64 = true; break;
-            case Op::LoadF32Raw: case Op::StoreF32Raw: is_f64 = false; break;
+            case Op::LoadF64: case Op::StoreF64:
+                foldable = addr_disp_foldable(n.mem_operand, /*is_f64=*/true);
+                break;
+            case Op::LoadF32Raw: case Op::StoreF32Raw:
+                foldable = addr_disp_foldable(n.mem_operand, /*is_f64=*/false);
+                break;
+            case Op::GuestLoad: case Op::GuestStoreR: case Op::GuestStoreI:
+                // Width varies (8/16/32/64) — classify at the exact size so a
+                // counted access is one the cached path can actually emit.
+                foldable = n.mem_operand->kind == IROperandKind::MemRef &&
+                           classify_ldst_disp(n.mem_operand->mem.disp,
+                                              guest_mem_size_log2(n.mem_operand)) != 0;
+                break;
             default: continue;
         }
         const IROperand* mo = n.mem_operand;
         if (!addr_operand_base_cacheable(mo)) continue;
         if (has_fstsw && addr_uses_rax(mo)) continue;
         if (addr_uses_written_reg(mo, ctx.guest_written_mask)) continue;
-        if (!addr_disp_foldable(mo, is_f64)) continue;
+        if (!foldable) continue;
         int k = 0;
         for (; k < nkeys; k++) {
             if (addr_base_key_equal(ctx.nodes[keys[k].node].mem_operand, mo)) {
@@ -640,6 +666,30 @@ void lower(Context& ctx, TranslationResult* result) {
             if (try_emit_fp_ldst_disp(buf, size, is_load, Vt, addr_reg[k],
                                       n.mem_operand->mem.disp))
                 return true;
+        }
+        return false;
+    };
+
+    // GPR counterpart for Guest load/store nodes. The kind guard matters:
+    // an AbsMem operand's bytes must not be compared as MemRef fields.
+    auto emit_cached_gpr_access = [&](const Node& n, int size_log2, int is_load,
+                                      int Rt) -> bool {
+        if (n.mem_operand->kind != IROperandKind::MemRef) return false;
+        for (int k = 0; k < addr_n; k++) {
+            if (!addr_base_key_equal(n.mem_operand, addr_rep[k])) continue;
+            const int64_t disp = n.mem_operand->mem.disp;
+            const int cls = classify_ldst_disp(disp, size_log2);
+            if (cls == 1) {
+                emit_ldr_str_imm(buf, size_log2, /*is_fp=*/0, /*opc=*/is_load,
+                                 static_cast<int16_t>(disp >> size_log2),
+                                 addr_reg[k], Rt);
+                return true;
+            }
+            if (cls == 2) {
+                emit_ldur_stur(buf, size_log2, is_load,
+                               static_cast<int16_t>(disp), addr_reg[k], Rt);
+                return true;
+            }
         }
         return false;
     };
@@ -1201,6 +1251,47 @@ void lower(Context& ctx, TranslationResult* result) {
             emit_guest_node(*result, buf, n);
             break;
 
+        // ── Inlined guest memory movs (Phase 3) ────────────────────────
+        case Op::GuestLoad: {
+            const int Rt = static_cast<int>(n.aux & 0xF);
+            const bool sign = (n.aux >> 4) & 1;
+            const int sz = guest_mem_size_log2(n.mem_operand);
+            // LDR W/B/H zero-extends into the full register — exactly the
+            // x86 mov r32 / movzx write. Rt as base (mov eax,[eax+8]) is
+            // fine: the base is read before the destination is written.
+            if (!emit_cached_gpr_access(n, sz, /*is_load=*/1, Rt))
+                emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand, sz,
+                                    /*is_load=*/1, Rt);
+            if (sign) {
+                // movsx m8/m16 → r32: SXTB/SXTH the loaded value in place
+                // (W-form keeps the upper 32 bits zero, matching x86).
+                emit_bitfield(buf, /*is_64=*/0, /*SBFM*/0, /*N=*/0, /*immr=*/0,
+                              /*imms=*/static_cast<int8_t>(sz == 0 ? 7 : 15),
+                              Rt, Rt);
+            }
+            break;
+        }
+        case Op::GuestStoreR: {
+            const int Rt = static_cast<int>(n.aux & 0xF);
+            const int sz = guest_mem_size_log2(n.mem_operand);
+            if (!emit_cached_gpr_access(n, sz, /*is_load=*/0, Rt))
+                emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand, sz,
+                                    /*is_load=*/0, Rt);
+            break;
+        }
+        case Op::GuestStoreI: {
+            const int sz = guest_mem_size_log2(n.mem_operand);
+            // XZR return for imm==0 encodes as STR WZR — stores zero.
+            const int Rt = emit_load_immediate(*result, /*is_64bit=*/0,
+                                               static_cast<uint32_t>(n.aux),
+                                               GPR::XZR);
+            if (!emit_cached_gpr_access(n, sz, /*is_load=*/0, Rt))
+                emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand, sz,
+                                    /*is_load=*/0, Rt);
+            free_gpr(*result, Rt);
+            break;
+        }
+
         // ── FSTSW AX ───────────────────────────────────────────────────
         case Op::FStsw: {
             static constexpr int16_t kSwImm12 = kX87StatusWordOff / 2;  // = 1
@@ -1718,6 +1809,16 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
             break;
         case Op::GuestLea:
             transient = 1;
+            break;
+
+        // Guest memory movs: data register is the guest GPR (loads/reg
+        // stores) — only the uncached address computation allocates, so 1.
+        // Imm stores also materialize the value into a scratch: 2.
+        case Op::GuestLoad: case Op::GuestStoreR:
+            transient = 1;
+            break;
+        case Op::GuestStoreI:
+            transient = 2;
             break;
         }
 

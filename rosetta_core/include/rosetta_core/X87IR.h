@@ -82,6 +82,14 @@ enum class Op : uint8_t {
     GuestMovRI,     // mov r32, imm32 (64-bit imm dst declined at build)
     GuestLea,       // lea r32/r64, [base + index<<shift + disp32]
     GuestExt,       // movzx/movsx/movsxd r32/r64, r8/r16/r32 (register source)
+
+    // Guest GPR memory traffic (Phase 3): mov r32←m (incl. movzx/movsx from
+    // memory), mov m←r, mov m←i consumed mid-run. mem_operand holds the
+    // memory operand (access width = its size field); reg / sign / imm live
+    // in Node::aux (see the aux packing comments below).
+    GuestLoad,      // load [mem] into guest GPR (zero- or sign-extended)
+    GuestStoreR,    // store guest GPR (low `size` bits) to [mem]
+    GuestStoreI,    // store immediate to [mem]
 };
 
 enum NodeFlags : uint8_t {
@@ -154,12 +162,20 @@ struct Node {
     uint8_t  flags;
     int16_t  inputs[3];         // SSA references (node indices); -1 = unused
     union {
-        uint64_t   imm_bits;        // ConstF64
+        uint64_t   imm_bits;        // ConstF64 / Guest* packed payload
         IROperand* mem_operand;     // Load*/Store*: pointer into original IRInstr
         int16_t    initial_depth;   // ReadSt: depth relative to initial TOP
     };
+    // Secondary payload for nodes that need both a mem_operand and small
+    // metadata (metadata must NOT live in inputs[]: the optimizer's
+    // use-count and input-rewrite loops treat every non-negative input as a
+    // node reference).
+    //   GuestLoad:   bits[3:0] dst guest reg, bit[4] sign-extend
+    //   GuestStoreR: bits[3:0] src guest reg
+    //   GuestStoreI: bits[31:0] immediate (truncated to the access width)
+    uint64_t aux;
 };
-static_assert(sizeof(Node) == 16, "X87IR::Node should be 16 bytes");
+static_assert(sizeof(Node) == 24, "X87IR::Node should be 24 bytes");
 
 // ── IR context (all state for one run, lives on the stack) ──────────────────
 
@@ -275,6 +291,7 @@ struct Context {
         n.inputs[1] = in1;
         n.inputs[2] = in2;
         n.imm_bits = 0;
+        n.aux = 0;
         return id;
     }
 

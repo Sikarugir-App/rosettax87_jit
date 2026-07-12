@@ -294,6 +294,141 @@ static void carry_rc_fldcw(double v, int *near1, int *near2, int *trunc1, int *t
     *near1 = a; *near2 = b; *trunc1 = c; *trunc2 = d;
 }
 
+/* ── Phase 3 fixtures: inlined guest memory movs ──────────────────────────
+ *
+ *   (k) mov r32←m / mov m←r roundtrip (incl. a 16-bit store) mid-run
+ *   (l) FP-store → int-load → FP-store ordering through one base: the two
+ *       f64 stores at disp 0/8 are an STP pair candidate, but the guest
+ *       load between them reads the first store's bytes — sinking the
+ *       first store past it would return stale memory
+ *   (m) GuestStoreI evicts mem-CSE: flds x / mov $imm,(x) / fadds x must
+ *       reload; also the imm==0 (STR WZR) path
+ *   (n) movzx/movsx from memory, 8- and 16-bit
+ *   (o) GuestLoad overwriting its own base register (mov (%rsi),%esi)
+ *   (p) fwait consumed mid-run as a nop
+ */
+
+/* (k) memory-mov roundtrip inside one run. */
+static double inline_mem_mov_roundtrip(long *dst_out, long *dstw_out) {
+    long src = 0x11223344, dst = 0, dstw = -1;
+    double a = 1.5, r;
+    __asm__ volatile(
+        "fldl %3\n"
+        "movl (%4), %%ecx\n"   /* GuestLoad */
+        "fmull %3\n"
+        "movl %%ecx, (%5)\n"   /* GuestStoreR, 32-bit */
+        "movw %%cx, (%6)\n"    /* GuestStoreR, 16-bit */
+        "fstpl %0\n"
+        : "=m"(r), "+m"(dst), "+m"(dstw)
+        : "m"(a), "r"(&src), "r"(&dst), "r"(&dstw), "m"(src)
+        : "rcx");
+    *dst_out = dst; *dstw_out = dstw;
+    return r; /* 2.25 */
+}
+
+/* (l) pair-sink hazard: guest load between two pairable f64 stores. */
+static double inline_fpstore_intload(long *hi_out) {
+    double buf[2] = {0.0, 0.0};
+    double a = 2.5, b = 3.5;
+    long hi = 0;
+    double r;
+    __asm__ volatile(
+        "movq %3, %%rdi\n"
+        "fldl %4\n"                /* 2.5 */
+        "fldl %5\n"                /* 3.5 */
+        "fstpl (%%rdi)\n"          /* buf[0] = 3.5 */
+        "movl 4(%%rdi), %%ecx\n"   /* high word of 3.5 = 0x400C0000 */
+        "fstpl 8(%%rdi)\n"         /* buf[1] = 2.5 — STP partner of the first */
+        "fldl (%%rdi)\n"
+        "faddl 8(%%rdi)\n"
+        "fstpl %0\n"
+        "movq %%rcx, %1\n"
+        : "=m"(r), "=&r"(hi), "+m"(buf)
+        : "r"(buf), "m"(a), "m"(b)
+        : "rdi", "rcx");
+    *hi_out = hi;
+    return r; /* 6.0 */
+}
+
+/* (m) GuestStoreI mem-CSE eviction + zero-imm (STR WZR) path. */
+static double inline_storei_evict(void) {
+    float slotA = 2.0f, slotB = 123.0f;
+    float r;
+    __asm__ volatile(
+        "movq %3, %%rsi\n"
+        "movq %4, %%rdi\n"
+        "flds (%%rsi)\n"              /* 2.0f; CSE caches (%rsi) */
+        "movl $0x40800000, (%%rsi)\n" /* GuestStoreI: slotA = 4.0f — evict */
+        "fadds (%%rsi)\n"             /* must reload → +4.0 */
+        "movl $0, (%%rdi)\n"          /* GuestStoreI imm==0: slotB = 0.0f */
+        "fadds (%%rdi)\n"             /* +0.0 */
+        "fstps %0\n"
+        : "=m"(r), "+m"(slotA), "+m"(slotB)
+        : "r"(&slotA), "r"(&slotB)
+        : "rsi", "rdi");
+    return (double)r; /* 6.0 */
+}
+
+/* (n) movzx/movsx from memory. */
+static double inline_mem_ext(long *zb, long *sb, long *zw, long *sw_) {
+    unsigned char b8 = 0x99;
+    unsigned short h16 = 0x8899;
+    double a = 3.0, b = 5.0;
+    long z8 = 0, s8 = 0, z16 = 0, s16 = 0;
+    double r;
+    __asm__ volatile(
+        "fldl %5\n"
+        "movzbl (%7), %%ecx\n"   /* 0x99 */
+        "movsbl (%7), %%edx\n"   /* -103 */
+        "fmull %6\n"
+        "movzwl (%8), %%esi\n"   /* 0x8899 */
+        "movswl (%8), %%edi\n"   /* -30567 */
+        "fstpl %0\n"
+        "movq %%rcx, %1\n"
+        "movslq %%edx, %2\n"
+        "movq %%rsi, %3\n"
+        "movslq %%edi, %4\n"
+        : "=m"(r), "=&r"(z8), "=&r"(s8), "=&r"(z16), "=&r"(s16)
+        : "m"(a), "m"(b), "r"(&b8), "r"(&h16), "m"(b8), "m"(h16)
+        : "rcx", "rdx", "rsi", "rdi");
+    *zb = z8; *sb = s8; *zw = z16; *sw_ = s16;
+    return r; /* 15.0 */
+}
+
+/* (o) GuestLoad whose destination IS its base register. */
+static double inline_load_own_base(long *out) {
+    long cell = 0x1234;
+    double a = 2.0;
+    long got = 0;
+    double r;
+    __asm__ volatile(
+        "movq %3, %%rsi\n"
+        "fldl %2\n"
+        "movl (%%rsi), %%esi\n"  /* rsi ← [rsi]: base read before dst write */
+        "fmull %2\n"
+        "fstpl %0\n"
+        "movq %%rsi, %1\n"
+        : "=m"(r), "=&r"(got)
+        : "m"(a), "r"(&cell), "m"(cell)
+        : "rsi");
+    *out = got;
+    return r; /* 4.0 */
+}
+
+/* (p) fwait mid-run must be consumed as a nop. */
+static double inline_fwait_nop(double a, double b) {
+    double r;
+    __asm__ volatile(
+        "fldl %1\n"
+        "fwait\n"
+        "fmull %2\n"
+        "wait\n"
+        "fstpl %0\n"
+        : "=m"(r)
+        : "m"(a), "m"(b));
+    return r;
+}
+
 /* (i) deep x87 stack with guest movs interleaved — exercises the pressure
  *     models with Guest nodes present. */
 static double inline_deep_stack(void) {
@@ -377,6 +512,49 @@ int main(void) {
         check_long("inline_movzx_movsx: movsbl+movsxd", s8, -103);
         check_long("inline_movzx_movsx: movzwl", z16, 0x8899);
         check_long("inline_movzx_movsx: movzbl from AH", ah, 0x88);
+    });
+
+    GUARDED("inline_mem_mov_roundtrip", {
+        long dst = 0, dstw = 0;
+        check("inline_mem_mov_roundtrip: a*a intact",
+              inline_mem_mov_roundtrip(&dst, &dstw), 2.25);
+        check_long("inline_mem_mov_roundtrip: 32-bit store", dst, 0x11223344L);
+        check_long("inline_mem_mov_roundtrip: 16-bit store merges",
+                   dstw, (long)0xFFFFFFFFFFFF3344L);
+    });
+
+    GUARDED("inline_fpstore_intload", {
+        long hi = 0;
+        check("inline_fpstore_intload: sum intact",
+              inline_fpstore_intload(&hi), 6.0);
+        check_long("inline_fpstore_intload: load saw first store (no sink)",
+                   hi, 0x400C0000L);
+    });
+
+    GUARDED("inline_storei_evict", {
+        check("inline_storei_evict: imm store evicts CSE + zero store",
+              inline_storei_evict(), 6.0);
+    });
+
+    GUARDED("inline_mem_ext", {
+        long z8 = 0, s8 = 0, z16 = 0, s16 = 0;
+        check("inline_mem_ext: a*b intact",
+              inline_mem_ext(&z8, &s8, &z16, &s16), 15.0);
+        check_long("inline_mem_ext: movzbl mem", z8, 0x99);
+        check_long("inline_mem_ext: movsbl mem", s8, -103);
+        check_long("inline_mem_ext: movzwl mem", z16, 0x8899);
+        check_long("inline_mem_ext: movswl mem", s16, -30567);
+    });
+
+    GUARDED("inline_load_own_base", {
+        long got = 0;
+        check("inline_load_own_base: a*a intact",
+              inline_load_own_base(&got), 4.0);
+        check_long("inline_load_own_base: dst==base load", got, 0x1234);
+    });
+
+    GUARDED("inline_fwait_nop", {
+        check("inline_fwait_nop: fwait consumed", inline_fwait_nop(3.0, 4.0), 12.0);
     });
 
     GUARDED("inline_deep_stack", {
