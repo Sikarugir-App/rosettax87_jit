@@ -708,25 +708,26 @@ int main(int argc, char* argv[]) {
     }
     LOG("Attached successfully\n");
 
-    // Set up offsets dynamically
     OffsetFinder offsetFinder;
-    // Set default offsets temporarily (or just in case we need to fall back)
-    offsetFinder.setDefaultOffsets();
-    // Search the rosetta runtime binary for offsets.
-    if (offsetFinder.determineOffsets()) {
-        LOG("Found rosetta runtime offsets successfully!\n");
-        LOG("offset_exports_fetch=%llx offset_svc_call_entry=%llx offset_svc_call_ret=%llx "
-            "offset_classify_arm_pc=%llx\n",
-            offsetFinder.offsetExportsFetch_, offsetFinder.offsetSvcCallEntry_,
-            offsetFinder.offsetSvcCallRet_, offsetFinder.offsetClassifyArmPc_);
+    if (!offsetFinder.scanRuntime()) {
+        fprintf(stderr, "Fatal: failed to scan rosetta runtime for offsets.\n");
+        return 1;
     }
-    if (offsetFinder.determineRuntimeOffsets()) {
-        LOG("Found additional rosetta runtime offsets successfully!\n");
-        LOG("offset_translate_insn=%llx offset_transaction_result_size=%llx "
-            "offset_decode_opcode=%llx\n",
-            offsetFinder.offsetTranslateInsn_, offsetFinder.offsetTransactionResultSize_,
-            offsetFinder.offsetDecodeOpcode_);
+    LOG("Found rosetta runtime offsets successfully!\n");
+    LOG("offset_exports_fetch=%llx offset_svc_call_entry=%llx offset_svc_call_ret=%llx "
+        "offset_classify_arm_pc=%llx\n",
+        offsetFinder.offsetExportsFetch_, offsetFinder.offsetSvcCallEntry_,
+        offsetFinder.offsetSvcCallRet_, offsetFinder.offsetClassifyArmPc_);
+
+    if (!offsetFinder.scanLibRosettaRuntime()) {
+        fprintf(stderr, "Fatal: failed to scan libRosettaRuntime for offsets.\n");
+        return 1;
     }
+    LOG("Found libRosettaRuntime offsets successfully!\n");
+    LOG("offset_translate_insn=%llx offset_transaction_result_size=%llx "
+        "offset_decode_opcode=%llx\n",
+        offsetFinder.offsetTranslateInsn_, offsetFinder.offsetTransactionResultSize_,
+        offsetFinder.offsetDecodeOpcode_);
 
     const auto runtimeBase = dbg.findRuntime();
 
@@ -1037,16 +1038,6 @@ int main(int argc, char* argv[]) {
 
     // replace the exports in X19 register with the address of the mapped macho
     dbg.setRegister(MuhDebugger::Register::X19, machoExportsAddress);
-
-    // calculate base of rosetta  libRosettaRuntime
-    uint64_t rosettaRuntimeBase = libRosettaRuntimeExportsAddress - 0x6A4F8;
-    LOG("Calculated rosetta runtime base: 0x%llx\n", rosettaRuntimeBase);
-
-    // calculate address of where our trampoline jumps to
-    uint64_t trampolineTarget = rosettaRuntimeBase + 0x1a664;
-    // 64 c6 f8 0a 01 00 00 00
-    // dbg.setBreakpoint(trampolineTarget);
-
     dbg.detach();
 
     // Block until the parent (wine) exits. We can't use waitpid since
