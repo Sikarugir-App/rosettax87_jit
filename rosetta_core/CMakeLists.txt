@@ -9,6 +9,7 @@ set(ROSETTA_CORE_SOURCES
     src/IRBlock.cpp
     src/IRInstr.cpp
     src/IROperand.cpp
+    src/IRTerminator.cpp
     src/ModuleResult.cpp
     src/ThreadContextOffsets.cpp
     src/TranslationResult.cpp
