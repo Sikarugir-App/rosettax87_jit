@@ -279,6 +279,66 @@ static double gap_sse_cvt(double a, double b, double c, uint64_t *cvt_out) {
     return r;
 }
 
+/* ── sse-arith scalar chain: add/sub/mul/div/sqrt (sd) + ss approx ops ─────
+ * Gap shapes per the sse-arith audit: reg,reg source (demand 0), SIB +
+ * non-encodable-disp MemRef source (1), RIP Immediate source (2). The sd
+ * chain is exact IEEE arithmetic (perfect square); rsqrtss/rcpss are
+ * approximate by spec, so main() bounds their error instead. */
+static double g_sse_arith_one = 1.0;
+__attribute__((noinline))
+static double gap_sse_arith(double a, double b, double c, uint64_t *d_out,
+                            uint64_t *sqrt_out, float *f5_out, float *f6_out,
+                            float *f4_out) {
+    double r;
+    double v1 = 100.75, v2 = 41.5;
+    float f1 = 0.25f, f2 = 1.5f;
+    uint64_t d = 0, s = 0;
+    memcpy(SLOT(0), &v1, 8);
+    memcpy(SLOT(8), &v2, 8);
+    memcpy((uint8_t *)SLOT(16), &f1, 4);
+    memcpy((uint8_t *)SLOT(16) + 4, &f2, 4);
+    __asm__ volatile(
+        "movq %[p], %%rsi\n"
+        "movq $2, %%rdx\n"
+        "fldl %[a]\n"
+        "fmull %[b]\n"
+        /* gap 1: double chain — SIB non-enc-disp loads + reg,reg */
+        "movsd 0x12345(%%rsi,%%rdx,8), %%xmm1\n"
+        "addsd 0x1234d(%%rsi,%%rdx,8), %%xmm1\n"   /* 142.25 */
+        "mulsd %%xmm1, %%xmm1\n"                   /* 20235.0625 */
+        "sqrtsd %%xmm1, %%xmm2\n"                  /* 142.25 exact */
+        "divsd %%xmm2, %%xmm1\n"                   /* 142.25 exact */
+        "subsd 0x1234d(%%rsi,%%rdx,8), %%xmm1\n"   /* 100.75 */
+        "faddl %[c]\n"
+        /* gap 2: float chain — S32-size mem srcs + approx recip ops */
+        "movss 0x12355(%%rsi,%%rdx,8), %%xmm3\n"   /* 0.25f */
+        "rsqrtss %%xmm3, %%xmm4\n"                 /* ~2.0f */
+        "rcpss 0x12355(%%rsi,%%rdx,8), %%xmm5\n"   /* ~4.0f */
+        "addss %%xmm4, %%xmm5\n"                   /* ~6.0f */
+        "mulss 0x12359(%%rsi,%%rdx,8), %%xmm5\n"   /* ~9.0f */
+        "sqrtss %%xmm3, %%xmm6\n"                  /* 0.5f exact */
+        "fmull %[b]\n"
+        /* gap 3: RIP Immediate src + exact divss */
+        "addsd %[one], %%xmm1\n"                   /* 101.75 */
+        "divss %%xmm3, %%xmm6\n"                   /* 2.0f exact */
+        "addss %%xmm6, %%xmm4\n"                   /* ~4.0f */
+        "fstpl %[r]\n"
+        "movq %%xmm1, %[d]\n"
+        "movq %%xmm2, %[s]\n"
+        "movss %%xmm5, %[f5]\n"
+        "movss %%xmm6, %[f6]\n"
+        "movss %%xmm4, %[f4]\n"
+        : [r] "=m"(r), [d] "=&r"(d), [s] "=&r"(s), [f5] "=m"(*f5_out),
+          [f6] "=m"(*f6_out), [f4] "=m"(*f4_out)
+        : [a] "m"(a), [b] "m"(b), [c] "m"(c), [p] "r"(arena),
+          [one] "m"(g_sse_arith_one)
+        : "rsi", "rdx", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6",
+          "cc", "memory");
+    *d_out = d;
+    *sqrt_out = s;
+    return r;
+}
+
 /* ── mov heavies: imm64, m64←r store, movzx from SIB mem, movnti ───────── */
 __attribute__((noinline))
 static double gap_mov_heavy(double a, double b, double c,
@@ -740,6 +800,20 @@ int main(void) {
         check("gap_sse_cvt: x87 result", gap_sse_cvt(a, b, c, &cvt),
               x87_expected);
         check_u64("gap_sse_cvt: addsd+cvttsd2si", cvt, 142); /* 100.75+41.5 */
+    }
+    {
+        uint64_t d = 0, s = 0;
+        float f5 = 0, f6 = 0, f4 = 0;
+        check("gap_sse_arith: x87 result",
+              gap_sse_arith(a, b, c, &d, &s, &f5, &f6, &f4),
+              (a * b + c) * b); /* 58.0 — three-gap run */
+        check_u64("gap_sse_arith: sd chain + RIP addsd", d, as_u64(101.75));
+        check_u64("gap_sse_arith: sqrtsd exact", s, as_u64(142.25));
+        check("gap_sse_arith: sqrtss+divss exact", (double)f6, 2.0);
+        check_u64("gap_sse_arith: rcpss+rsqrtss+mulss ~9.0",
+                  f5 > 8.98f && f5 < 9.02f, 1);
+        check_u64("gap_sse_arith: rsqrtss + 2.0 ~4.0",
+                  f4 > 3.98f && f4 < 4.02f, 1);
     }
     {
         uint64_t store = 0, zx = 0, nti = 0;

@@ -2480,6 +2480,82 @@ int demand_mul_imul(const IRInstr* instr) {
     return events;
 }
 
+// =============================================================================
+// family: sse-arith  — kOpcodeName_addss/_addsd/_subss/_subsd/_mulss/_mulsd/
+//                      _divss/_divsd/_sqrtss/_sqrtsd/_rsqrtss/_rcpss
+// Audit: research/bridge_demand/families/sse-arith/AUDIT.md (2026-07-17)
+//
+// SPLIT REQUIRED? — NO. All twelve reach one of four thin translate functions
+// (translate_addsd_..._subss 33597 / translate_rcpss 34138 / translate_rsqrtss
+// 34195 / translate_sqrtsd_sqrtss 34261) that share one GPR-relevant skeleton:
+//   prepare_xmm_scalar_operands(a1, &op[0], _, &op[1], _, &op[2], _, _, _) (33608/34144/34201/34271)
+//   <emit one scalar-FP word>
+//   emit_xmm_scalar_writeback(a1, _, fpr_info)                             (33618/34148/34205/34279)
+// The opcode only selects the emitted FP word — no allocation difference.
+//
+// operands[1] is asserted Register (27495) — never memory. The ONLY GPR path
+// is read_xmm_scalar_src_fpr(result, &operands[2], scalar_kind) (27505), the
+// folded scalar SOURCE. Everything else in prepare_xmm_scalar_operands
+// (translate_vector_low 27506/27507, copy_xmm_state 27526, maybe_spill_xmm_state
+// 27542, alloc_tmp_fpr 27554, set_xmm_state 27564) is FPR/state-side only.
+//
+// read_xmm_scalar_src_fpr → read_xmm_operand_to_fpr (26753) → per-kind
+// read_xmm_operand_to_fpr_maybe_alloc with address hint 0x1F (XZR):
+//   Register/XMM src: 0 GPR (27607 return translate_vector_low).
+//   MemRef  src: translate_prefetch_impl(...,0x1F) (26956) — XZR-hint prefetch,
+//                per-shape count (mov_prefetch_allocs; 1 for every S32 shape),
+//                held to LABEL_705.
+//   AbsMem  src: compute_operand_address(...,0x1F) AbsMem (26940→25930-25941) — 1, held.
+//   Immediate src (RIP/data-page): aligned adr temp (26929) OR compute_operand_address
+//                Immediate (26940→25944-25972) peak 2; alignment not IR-decidable
+//                (operand_addr_is_aligned reads runtime text_base_align_offset 25516)
+//                → fold to peak 2, held 1.
+// Scalar source size is S32/S64, so read_xmm_operand_to_fpr's per-kind loop runs
+// once (26788 v5==2 only for S256); the S256 double-read does not occur.
+//
+// Writeback flush tail (27638-27639) fires only when fpr_info[5]==1, set iff
+// src1 (operands[0], the dst XMM) has register class 0x90/0xA0 (27567-27571) —
+// i.e. a YMM-class dst. flush_xmm_to_thread_context (27095-27111) allocs one
+// GPR (27105) and frees it (27110) → transient {1,0}. For these SSE (non-VEX)
+// opcodes the dst is XMM class 0x50, so the flush term is 0; modeled anyway on
+// the YMM-class dst for completeness.
+//
+// rep_prefix / flag_liveness: NO access anywhere in the package (grep-clean;
+// no LOCK/REP form, not in lockable_rmw; SSE arith writes MXCSR not EFLAGS).
+// GS fixed-slot-7 (25901) / get_tls_base BL (25904-25906) sit behind
+// seg_override (25882), refused by the common prefix. Table v3.1; discrepancy
+// flags: NONE.
+// -----------------------------------------------------------------------------
+
+int demand_sse_arith(const IRInstr* instr) {
+    const IROperand& dst = instr->operands[0];   // 33608 src1 / dst XMM
+    const IROperand& src = instr->operands[2];   // 33608 dst-param = folded scalar source
+
+    Seq seq;
+    // 27505 read_xmm_scalar_src_fpr(result, &operands[2], scalar_kind): the
+    // non-Register kinds route to read_xmm_operand_to_fpr (27591), the SAME
+    // shared callee the sse-mov-scalar load path prices — reuse its cost
+    // helper (Register src differs only in the 0-GPR return site, 27607
+    // translate_vector_low vs 26962-26970).
+    seq.step(movs_read_xmm_cost(src));
+
+    // 27638-27639 emit_xmm_scalar_writeback flush tail: fires only for a
+    // YMM-class dst (27567-27571 src1.reg & 0xF0 ∈ {0x90,0xA0}). One transient
+    // {1,0} on top of any held source-address temp. XMM dst (class 0x50) → 0.
+    // For an Immediate (RIP) source, charge the read's freed addend transient
+    // as if still held under the total-event convention (alu PEAK-vs-TOTAL
+    // note; same corner as demand_sse_mov_scalar's flush): adr temp held +
+    // addend + flush = 3 total events, true concurrent peak 2 (matrix:
+    // vaddss 0x100(%rip),%xmm2 actual=3).
+    const unsigned dst_cls = dst.reg.reg.value & 0xF0;
+    if (dst_cls == 0x90 || dst_cls == 0xA0) {
+        const bool imm_src = src.kind == IROperandKind::Immediate;
+        seq.step(Cost{static_cast<int8_t>(imm_src ? 2 : 1), 0});  // 27105
+    }
+
+    return seq.demand();
+}
+
 }  // namespace
 
 // =============================================================================
@@ -2755,6 +2831,27 @@ std::optional<int> X87Cache::gap_gpr_demand(const IRInstr* instr) {
         case kOpcodeName_mul:
         case kOpcodeName_imul:
             return demand_mul_imul(instr);
+
+        // ========================== family: sse-arith ======================
+        // Audit: research/bridge_demand/families/sse-arith/AUDIT.md (2026-07-17)
+        // One skeleton (prepare_xmm_scalar_operands + emit + writeback) for all
+        // twelve; the folded scalar SOURCE (operands[2]) is the only GPR axis
+        // (operands[1] asserted Register). read hint is XZR: MemRef/AbsMem 1
+        // (S32 always 1), Immediate(RIP) 2; +1 transient only for a YMM-class
+        // dst flush (XMM dst → 0). Peak demand 2; never refused.
+        case kOpcodeName_addss:
+        case kOpcodeName_addsd:
+        case kOpcodeName_subss:
+        case kOpcodeName_subsd:
+        case kOpcodeName_mulss:
+        case kOpcodeName_mulsd:
+        case kOpcodeName_divss:
+        case kOpcodeName_divsd:
+        case kOpcodeName_sqrtss:
+        case kOpcodeName_sqrtsd:
+        case kOpcodeName_rsqrtss:
+        case kOpcodeName_rcpss:
+            return demand_sse_arith(instr);
 
         // ---- un-audited opcodes: refuse outright, no guessing ----
         default:

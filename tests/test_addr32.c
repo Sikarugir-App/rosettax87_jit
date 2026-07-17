@@ -141,6 +141,31 @@ static double gap_addr32_movsd(double a, double b, double c, uint64_t *lo,
     return r;
 }
 
+/* ── 0x67 scalar SSE arith inside an x87 gap (sse-arith S32 rows) ───────── */
+__attribute__((noinline))
+static double gap_addr32_sse_arith(double a, double b, double c, uint64_t *lo,
+                                   uint64_t *sq_out) {
+    double r;
+    lo[4] = as_u64(40.5);
+    lo[5] = 0;
+    __asm__ volatile(
+        "movq %[p], %%rsi\n"
+        "fldl %[a]\n"
+        "fmull %[b]\n"
+        /* gap: addr32 addsd mem src + reg,reg sqrtsd + addr32 store */
+        "movsd 0x20(%%esi), %%xmm4\n"
+        "addsd 0x20(%%esi), %%xmm4\n"   /* 81.0 */
+        "sqrtsd %%xmm4, %%xmm5\n"       /* 9.0 exact */
+        "movsd %%xmm5, 0x28(%%esi)\n"
+        "faddl %[c]\n"
+        "fstpl %[r]\n"
+        : [r] "=m"(r)
+        : [a] "m"(a), [b] "m"(b), [c] "m"(c), [p] "r"(lo)
+        : "rsi", "xmm4", "xmm5", "cc", "memory");
+    *sq_out = lo[5];
+    return r;
+}
+
 int main(void) {
     const double a = 3.0, b = 4.0, c = 2.5;
     const double x87_expected = a * b + c; /* 14.5 */
@@ -166,6 +191,12 @@ int main(void) {
         check("gap_addr32_movsd: x87 result",
               gap_addr32_movsd(a, b, c, lo, &rt), x87_expected);
         check_u64("gap_addr32_movsd: movsd round-trip", rt, as_u64(41.5));
+    }
+    {
+        uint64_t sq = 0;
+        check("gap_addr32_sse_arith: x87 result",
+              gap_addr32_sse_arith(a, b, c, lo, &sq), x87_expected);
+        check_u64("gap_addr32_sse_arith: addsd+sqrtsd", sq, as_u64(9.0));
     }
     {
         uint64_t rmw = 0, reg = 0;
