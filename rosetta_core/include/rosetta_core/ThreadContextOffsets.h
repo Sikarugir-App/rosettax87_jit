@@ -3,8 +3,7 @@
 #include <cstdint>
 
 struct ThreadContextOffsets {
-    uint32_t field_0;
-    uint32_t field_4;
+    uintptr_t runtime_pointers; // points to a function table
     uint32_t field_8;
     uint32_t field_C;
     uint32_t field_10;
