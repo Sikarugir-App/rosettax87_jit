@@ -1,16 +1,25 @@
 #include <sys/mman.h>
 
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <print>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "RosettaAotApi.h"
 #include "rosetta_core/CoreConfig.h"
+#include "rosetta_core/CustomTranslationHook.h"
+#include "rosetta_core/IRBlock.h"
+#include "rosetta_core/IRInstr.h"
+#include "rosetta_core/ModuleResult.h"
 #include "rosetta_core/RosettaCore.h"
+#include "rosetta_core/TranslationResult.h"
+#include "rosetta_core/X87Cache.h"
 #include "rosetta_core/hook.h"
 #include <rosetta_config/Config.h>
 
@@ -30,6 +39,29 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // free_gpr_mask captured around each IRInstr's translation, keyed by the
+    // stable IRInstr* address (the same storage annotate_instr later sees).
+    struct GprMaskSample {
+        uint32_t before;
+        uint32_t after;
+    };
+    std::unordered_map<const IRInstr*, GprMaskSample> gpr_mask_samples;
+
+    // Observer fired around each instruction's translation. Must outlive
+    // translate() below — hence a stack local in main.
+    CustomTranslationHook translation_hook;
+    if (verbose) {
+        translation_hook.before = [&](TranslationResult* result, IRBlock*,
+                                      IRInstr* instrs, int64_t, int64_t idx) {
+            gpr_mask_samples[&instrs[idx]].before = result->free_gpr_mask;
+        };
+        translation_hook.after = [&](TranslationResult* result, IRBlock*,
+                                     IRInstr* instrs, int64_t, int64_t idx,
+                                     int64_t /*new_idx*/) {
+            gpr_mask_samples[&instrs[idx]].after = result->free_gpr_mask;
+        };
+    }
+
     auto version = g_rosetta_aot.version();
     rosetta_core_init({
         .runtime_version = version,
@@ -37,8 +69,11 @@ int main(int argc, char** argv) {
         .transaction_result_size_addr = g_rosetta_aot.transaction_result_size_addr,
         .classify_arm_pc_addr = 0,
         .decode_opcode_addr = g_rosetta_aot.decode_opcode_addr,
+        .default_free_gpr_mask_addr = g_rosetta_aot.default_free_gpr_mask_addr,
+        .free_temporary_gpr_addr = g_rosetta_aot.free_temporary_gpr_addr,
         .rosettax87_base = 0,
         .rosettax87_size = 0,
+        .translation_hook = &translation_hook,
     });
 
     int offset_size = version >= kAotVersion ? g_runtime_routine_offsets.size() : g_runtime_routine_offsets.size() - 2;
@@ -97,11 +132,31 @@ int main(int argc, char** argv) {
                                 inst_targets, data_in_code);
 
 
-    if (verbose) {
-        g_rosetta_aot.module_print(module_result, 1);
-    }
-
     auto translate_result = g_rosetta_aot.translate(module_result);
+
+    if (verbose) {
+        // g_rosetta_aot.module_print(module_result, 1);
+        ModulePrintHooks hooks;
+        hooks.annotate_block = [](const IRBlock& block) {
+            return std::format("; code_size={}", block.code_size);
+        };
+        hooks.annotate_instr = [&](const IRBlock&, const IRInstr& instr,
+                                   uint32_t) {
+            auto it = gpr_mask_samples.find(&instr);
+            if (it == gpr_mask_samples.end())
+                return std::string{};
+            // Actual GPR demand = scratch regs free before but consumed after
+            // (bit set in `before`, cleared in `after`).
+            uint32_t consumed = it->second.before & ~it->second.after;
+            int actual = std::popcount(consumed);
+            // Estimated demand from the bridge-demand model (nullopt = refuse
+            // to bridge, i.e. no audited estimate for this form).
+            std::optional<int> est = X87Cache::gap_gpr_demand(&instr);
+            std::string est_str = est ? std::to_string(*est) : "refuse";
+            return std::format("; gpr_demand actual={} est={}", actual, est_str);
+        };
+        module_print(module_result, &hooks);
+    }
 
 
     auto translate_data_size = g_rosetta_aot.translator_get_size(translate_result);

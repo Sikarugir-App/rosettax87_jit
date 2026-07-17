@@ -24,6 +24,8 @@ struct RosettaAotApi {
     uintptr_t translate_insn_addr = 0;
     uintptr_t transaction_result_size_addr = 0;
     uintptr_t decode_opcode_addr = 0;
+    uintptr_t default_free_gpr_mask_addr = 0;
+    uintptr_t free_temporary_gpr_addr = 0;
 
     using version_fn = std::uint64_t (*)();
     using translate_fn = TranslationResult* (*)(ModuleResult const*);
