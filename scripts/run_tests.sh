@@ -80,6 +80,8 @@ ALL_TESTS=(
     test_transparent_int
     test_ir_fpr_pressure
     test_sse_whitelist
+    test_bridge_pressure
+    test_addr32
 )
 
 RED='\033[0;31m'

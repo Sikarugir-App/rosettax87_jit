@@ -219,8 +219,9 @@ static double split_shift(double a, double b, long *sh_out) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
- * Whitelist-v2 coverage: one fixture per opcode group in
- * X87Cache::is_transparent. Gaps are kept ≤ kMaxBridgeGap (4) so the bridge
+ * Whitelist-v2 coverage: one fixture per opcode group in the audit-eligible
+ * set (research/bridge_demand/families.py TRANSPARENT; the former
+ * X87Cache::is_transparent). Gaps are kept ≤ kMaxBridgeGap (4) so the bridge
  * actually engages — x87 anchors (fld/fadd/fmul/fstp) every few instructions.
  * NOT coverable from a 64-bit fixture: pushd/popd (32-bit-mode encodings).
  * ───────────────────────────────────────────────────────────────────────── */
