@@ -305,116 +305,14 @@ bool X87Cache::is_handled(uint16_t op) {
     return is_handled_x87(op);
 }
 
-// OPT-RB: instructions Rosetta may translate mid-run without invalidating the
-// pinned base/TOP/st_base GPRs. Safety criterion (verified by an exhaustive
-// audit of translate_insn in research/libRosettaAot.dylib.c — see
-// research/optimizations/01-run-transparent-integers.md, "allocator
-// contract"): the opcode's translation path allocates scratch GPRs only via
-// the first-free mask allocator (which adapts to the pinned bits), never via
-// allocate_temporary_gpr_num with a fixed pool slot in {0,1,6}, and emits no
-// runtime-routine BL other than compute_operand_address's GS/TLS fallback
-// (which preserves scratch — Rosetta calls it with its own scratch live).
-// Flag semantics are Rosetta's problem — it translates the instruction fully;
-// the nzcv_dead/parity scans operate on the raw instruction stream and treat
-// unknown readers conservatively, so flag-writers and flag-readers are both
-// admissible.
-//
-// Deliberately EXCLUDED:
-//   - test: consumed as a fused tail by the fcom+fnstsw+test fusion without
-//     ticking the run — counting it in the run would desync run_remaining
-//     and drop deferred TOP/tag state.
-//   - segment forms (mov_segment/pop_segment/...): distinct opcodes; their
-//     translations fixed-allocate pool slots 0/1.
-//   - string/rep ops, cmpxchg family: fixed slots / runtime BLs.
-bool X87Cache::is_transparent(uint16_t op) {
-    switch (op) {
-        // Data movement / address computation (v1 set)
-        case kOpcodeName_mov:
-        case kOpcodeName_movnti:
-        case kOpcodeName_movzx:
-        case kOpcodeName_movsx:
-        case kOpcodeName_movsxd:
-        case kOpcodeName_lea:
-        case kOpcodeName_nop:
-        // FWAIT: no case in translate_insn — falls to the default label,
-        // which emits nothing and allocates nothing (audited 2026-07-12).
-        case kOpcodeName_wait:
-        // Integer ALU (flag definers — Rosetta materializes flags itself)
-        case kOpcodeName_add:
-        case kOpcodeName_sub:
-        case kOpcodeName_and:
-        case kOpcodeName_or:
-        case kOpcodeName_xor:
-        case kOpcodeName_inc:
-        case kOpcodeName_dec:
-        case kOpcodeName_neg:
-        case kOpcodeName_not:
-        case kOpcodeName_cmp:
-        case kOpcodeName_adc:
-        case kOpcodeName_sbb:
-        case kOpcodeName_imul:
-        case kOpcodeName_mul:
-        case kOpcodeName_shl:
-        case kOpcodeName_shr:
-        case kOpcodeName_sar:
-        case kOpcodeName_rol:
-        case kOpcodeName_ror:
-        case kOpcodeName_bswap:
-        // Sign/zero extension (allocate nothing at all)
-        case kOpcodeName_cbw:
-        case kOpcodeName_cwde:
-        case kOpcodeName_cdqe:
-        case kOpcodeName_cwd:
-        case kOpcodeName_cdq:
-        // Flag consumers (scans stay conservative around them)
-        case kOpcodeName_cmovcc:
-        case kOpcodeName_setcc:
-        // Stack (plain forms; RSP updates handled by Rosetta)
-        case kOpcodeName_push:
-        case kOpcodeName_pop:
-        case kOpcodeName_pushd:
-        case kOpcodeName_popd:
-        case kOpcodeName_xchg:
-        // SSE data movement — the dominant run breaker in mixed x87/SSE code
-        case kOpcodeName_movss:
-        case kOpcodeName_movsd:
-        case kOpcodeName_movaps:
-        case kOpcodeName_movapd:
-        case kOpcodeName_movups:
-        case kOpcodeName_movupd:
-        case kOpcodeName_movdqa:
-        case kOpcodeName_movdqu:
-        case kOpcodeName_movd:
-        case kOpcodeName_movq:
-        case kOpcodeName_xorps:
-        case kOpcodeName_xorpd:
-        case kOpcodeName_pxor:
-        // SSE scalar arithmetic / conversions / compares
-        case kOpcodeName_addss:
-        case kOpcodeName_addsd:
-        case kOpcodeName_subss:
-        case kOpcodeName_subsd:
-        case kOpcodeName_mulss:
-        case kOpcodeName_mulsd:
-        case kOpcodeName_divss:
-        case kOpcodeName_divsd:
-        case kOpcodeName_cvtsi2ss:
-        case kOpcodeName_cvtsi2sd:
-        case kOpcodeName_cvtss2sd:
-        case kOpcodeName_cvtsd2ss:
-        case kOpcodeName_cvttss2si:
-        case kOpcodeName_cvttsd2si:
-        case kOpcodeName_cvtss2si:
-        case kOpcodeName_cvtsd2si:
-        case kOpcodeName_ucomiss:
-        case kOpcodeName_ucomisd:
-        case kOpcodeName_comiss:
-        case kOpcodeName_comisd:
-            return true;
-        default:
-            return false;
-    }
-}
+// OPT-RB: gap_gpr_demand — the per-opcode-family peak scratch-GPR demand
+// model, and the SINGLE bridging gate — lives in X87BridgeDemand.cpp (built
+// by the audit workflow in research/bridge_demand/WORKFLOW.md). A non-nullopt
+// return certifies both that the opcode's family audit landed (safe in kind:
+// first-free allocations only, no fixed pool slots, no runtime BLs) and that
+// this shape's peak demand fits the reduced pool. The former is_transparent
+// whitelist is subsumed by it; the audit-eligible opcode set is tracked in
+// research/bridge_demand/families.py.
 
 static bool op_disabled_for_run(uint16_t op, uint64_t disabled_ops_mask) {
     if (!disabled_ops_mask)
@@ -445,7 +343,8 @@ int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
         int gap = 0;
         int64_t j = i;
         while (j < num_instrs && gap < kMaxBridgeGap &&
-               is_transparent(instr_array[j].opcode())) {
+               gap_gpr_demand(&instr_array[j]).value_or(kMaxBridgeDemand + 1) <=
+                   kMaxBridgeDemand) {
             j++;
             gap++;
         }

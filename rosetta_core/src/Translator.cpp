@@ -480,14 +480,44 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                 // survives. lookahead guarantees a run never ENDS on a bridged
                 // instruction, so pending deferred TOP/tag state is always
                 // flushed by a later x87 instruction's x87_end / IR epilogue.
-                if (cache.active() && g_rosetta_config && g_rosetta_config->run_bridge &&
-                    X87Cache::is_transparent(opcode)) {
+                std::optional<int> bridge_need;
+                if (cache.active() && g_rosetta_config && g_rosetta_config->run_bridge)
+                    bridge_need = X87Cache::gap_gpr_demand(cur_instr);
+                if (bridge_need && *bridge_need <= X87Cache::kMaxBridgeDemand) {
                     // OPT-BC: the gap instruction may redefine a guest GPR a
                     // carried base was derived from. Freed bits return via
                     // the pinned_mask() recompute below.
                     if (cache.carried_any())
                         cache.carried_drop_written(
                             X87Cache::gap_written_gpr_mask(cur_instr));
+                    // Rosetta translates this instruction from the reduced
+                    // pool. If the pins leave too few free temps for its
+                    // translation, release the carried pins — the 3 fixed cache
+                    // GPRs alone leave 5 free, which covers every demand
+                    // lookahead admits (≤ kMaxBridgeDemand = 4) with a spare.
+                    // Release on have <= need (not <): keep ≥1 register of
+                    // headroom above the estimate so an admitted demand-4 op
+                    // never runs the pool to exactly zero.
+                    {
+                        const int need = *bridge_need;
+                        // GPR-only popcount: __builtin_popcount lowers to NEON
+                        // CNT, and this hook runs lazy translation on the
+                        // guest thread with guest SIMD state live in the host
+                        // vector registers — clobbering one corrupts it.
+                        uint32_t v = kGprScratchMask & ~cache.pinned_mask();
+                        int have = 0;
+                        while (v) { v &= v - 1; have++; }
+                        const bool release = have <= need && cache.carried_any();
+                        if (release)
+                            cache.carried_release(translation_result->free_gpr_mask);
+                        if (g_rosetta_config->log_run_breaks)
+                            CORE_LOG("X87 bridge-gap alloc: op=%u at %lx need=%d have=%d%s",
+                                     opcode,
+                                     static_cast<uintptr_t>(
+                                         translation_result->ir_module_data
+                                             ->text_vmaddr_range + cur_instr->pc),
+                                     need, have, release ? " (carried released)" : "");
+                    }
                     cache.tick();
                     if (cache.active()) {
                         translation_result->free_gpr_mask =

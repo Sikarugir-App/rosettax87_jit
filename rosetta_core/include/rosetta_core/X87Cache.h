@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
 struct IRBlock;
 struct IRInstr;
@@ -81,21 +82,38 @@ struct X87Cache {
     // True if the opcode has a translate_* handler (participates in x87 runs).
     static bool is_handled(uint16_t op);
 
-    // OPT-RB: run-transparent integer instructions (mov/movzx/movsx/movsxd/
-    // lea/nop). With ROSETTA_X87_RUN_BRIDGE=1, an active run's pinned GPRs
-    // survive across them: Rosetta translates the instruction itself, but the
-    // pinned registers stay excluded from free_gpr_mask.
-    static bool is_transparent(uint16_t op);
+    // OPT-RB: peak scratch-GPR demand of Rosetta's own translation of a
+    // run-transparent instruction, from the per-family audited model in
+    // X87BridgeDemand.cpp (built via research/bridge_demand/WORKFLOW.md
+    // against the labeled decompilation).
+    //
+    // Returns std::nullopt when the instruction must NOT be bridged — no
+    // guessing: opcodes whose family audit hasn't landed, refused shapes
+    // (segment overrides, non-64-bit addressing, LOCKed RMW memory forms,
+    // shapes not decidable from IR fields). Returns the HONEST demand total —
+    // which may exceed kMaxBridgeDemand; callers compare against the ceiling
+    // themselves (Translator.cpp bridge check, x87_run_length lookahead). On
+    // nullopt (or a total over the ceiling) the run breaks and Rosetta
+    // translates the instruction at a run boundary with all 8 scratch GPRs
+    // free.
+    //
+    // A gap is only bridgeable when demand ≤ kMaxBridgeDemand: after a carried
+    // release the cache pins only its 3 fixed GPRs, so 5 of the 8 scratch GPRs
+    // are free — a demand-4 op then leaves 1 spare. Anything that could need 5
+    // refuses (nullopt), not squeezed into a zero-headroom pool.
+    static constexpr int kMaxBridgeDemand = 4;
+    static std::optional<int> gap_gpr_demand(const IRInstr* instr);
 
     // Scan forward from insn_idx counting consecutive handled x87 instructions.
     // disabled_ops_mask: bitmask of OpcodeId bits for disabled opcodes — stops
     // counting when a disabled opcode is encountered (it will fall back to Rosetta,
     // breaking the run from our perspective).
     // bridge (OPT-RB): additionally count short gaps (≤ kMaxBridgeGap) of
-    // run-transparent instructions between x87 groups. A gap is only counted
-    // when another enabled x87 instruction follows it — a run NEVER ends on a
-    // bridged instruction (the deferred TOP/tag flush in x87_end / the IR
-    // epilogue relies on the last counted instruction being x87).
+    // bridgeable instructions (gap_gpr_demand admits — the single gate for
+    // both opcode safety and GPR pressure) between x87 groups. A gap is only
+    // counted when another enabled x87 instruction follows it — a run NEVER
+    // ends on a bridged instruction (the deferred TOP/tag flush in x87_end /
+    // the IR epilogue relies on the last counted instruction being x87).
     static constexpr int kMaxBridgeGap = 4;
     static int lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
                          uint64_t disabled_ops_mask = 0, bool bridge = false);
