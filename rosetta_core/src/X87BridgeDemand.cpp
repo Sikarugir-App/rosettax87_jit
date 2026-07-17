@@ -29,12 +29,14 @@
 //
 // PERMANENTLY EXCLUDED — never give these a family (from the whitelist-v2
 // binary audit; recorded here because this switch is now the only gate):
-//   - test: consumed as a fused tail by the fcom+fnstsw+test fusion without
-//     ticking the run — bridging it would desync run_remaining and drop
-//     deferred TOP/tag state.
 //   - segment forms (mov_segment/pop_segment/...): fixed-allocate pool
 //     slots 0/1.
 //   - string/rep ops, cmpxchg family: fixed slots / runtime BLs.
+// test left this list 2026-07-17 (user decision): the fcom+fnstsw+test
+// fusion consumes an fstsw-adjacent test as an untick'd tail, so lookahead
+// carries an fnstsw-adjacency guard (X87Cache.cpp) that never counts that
+// shape as a gap op — closing the run_remaining desync hazard. All other
+// test shapes bridge via the audited test family below.
 //
 // Execution constraints: this runs inside the lazy-translation hook on the
 // guest thread with guest SIMD state live in the host vector registers — no
@@ -2130,6 +2132,354 @@ int demand_extends(const IRInstr* instr) {
     }
 }
 
+// =============================================================================
+// family: test  — kOpcodeName_test
+// Audit: research/bridge_demand/families/test/AUDIT.md (2026-07-17)
+//
+// SPLIT REQUIRED? — NO. One handler translate_test (decomp 28152-28286).
+// test is cmp's sibling: TWO reads (operands[0] = r/m, operands[1] = reg or
+// imm), NO writeback, pure flag write → the demand is just the two reads'
+// composed peak. Every read uses an XZR hint (28261/28281), so each first-free
+// allocates exactly like alu-binary's alu_read_cost; the handler contains NO
+// explicit free_temporary_gpr, so both value regs are held to the LABEL_705
+// epilogue and their peaks stack. All emitters (emit_logical_imm 2759,
+// emit_ands_imm 2792, emit_logical_shifted_reg 2699, is_bitmask_immediate 3552)
+// are pure AssemblerBuffer::emit / arithmetic — 0 alloc.
+//
+// Handler branch structure (all IR-decidable):
+//   * Aliased-reg fast path (28180-28226): only-ZF-live (flag mask == FLAG_ZF)
+//     AND op0,op1 both Register AND op0.reg == op1.reg → a single
+//     emit_logical_imm (LABEL_48, 28206-28207), NO read → demand 0. This is
+//     the hot `test eax,eax`/`test rax,rax` idiom. Non-aliased → LABEL_19.
+//   * High-byte-imm bitmask fast path (28227-28249): op0 is a class-1 high-byte
+//     Register ((reg & 0xF0)==0x10) AND only-ZF-live AND op1 is BranchOffset
+//     AND is_bitmask_immediate(value<<8) → a single emit_ands_imm (28246), NO
+//     read → demand 0. Non-encodable → falls into the general path.
+//   * General path (LABEL_22, 28260-28285):
+//       operand_to_gpr = read_operand_to_gpr(op0, extend_mode v12, XZR)  (28261)
+//       second read of op1 fires (LABEL_30, 28281) UNLESS op0,op1 are the SAME
+//       register (28274-28279 reuse operand_to_gpr) or op1 is a BranchOffset
+//       that is_bitmask_immediate-encodable (28263-28270, emit_ands_imm only).
+//       emit_logical_shifted_reg (28282) + optional CF emit (28285) — 0 alloc.
+//
+// extend_mode v12 ∈ {0,1,2} (28236 v12=0 / 28257 v12=1 SF-dead / 28259 v12=2
+// SF-live) — only its NONZERO-ness (plus is_64bit for a 32-bit reg src) changes
+// a Register read's alloc (translate_gpr 26662-26744; alu_reg_read_allocs).
+//
+// op1 (the reg/imm operand) is only ever Register or BranchOffset (x86 test has
+// no memory src); op0 (r/m) may be Register/MemRef/AbsMem/Immediate(RIP).
+//
+// DISPOSITIONS. rep_prefix: NO access anywhere in translate_test (28152-28286)
+// or the transitive closure (flags.txt "(none)"); test has no LOCK form and is
+// not in lockable_rmw. flag_liveness (28179-28283): read to select the fast
+// paths and to derive v12/em — every use IR-decidable, modeled per-bit below.
+// GS fixed-slot-7 (25901) + get_tls_base BL (25904-25906) live inside
+// compute_operand_address's seg_override branch, refused by the common prefix
+// (seg_override != 0) before this model runs. X22 read fast paths
+// (26440/26500/26566) never fire — every read hint is XZR. No fixed-slot
+// alloc, no runtime BL, every shape IR-decidable → NEVER refused.
+//
+// Immediate-kind (RIP) op0 shape: priced FIRST by TOTAL events (the Seq peak
+// forgets read op0's freed addend transient), matching verify's neutered-free
+// convention (alu Immediate precedent).
+// -----------------------------------------------------------------------------
+
+int demand_test(const IRInstr* instr) {
+    const IROperand& op0 = instr->operands[0];    // 28174 r/m operand
+    const IROperand& op1 = instr->operands[1];    // 28176-28177 reg/imm src
+    const uint8_t fl = instr->flag_liveness;      // 28179
+
+    // is_64bit = operand_size_is_64bit(op0) → op0.reg.size == S64 (17711/28175).
+    const bool is_64bit = op0.reg.size == IROperandSize::S64;
+
+    // Only-ZF-live mask test (28180/28229): (fl & (AF|PF_HI|OF|CF|ZF|SF)) == ZF.
+    const uint8_t zf_mask = static_cast<uint8_t>(FLAG_AF | FLAG_PF_HI | FLAG_OF |
+                                                 FLAG_CF | FLAG_ZF | FLAG_SF);
+    const bool only_zf = (fl & zf_mask) == FLAG_ZF;
+
+    const bool op0_reg = op0.kind == IROperandKind::Register;
+    const bool op1_reg = op1.kind == IROperandKind::Register;
+    const bool op1_branch = op1.kind == IROperandKind::BranchOffset;
+
+    // Aliased-reg fast path (28180-28225): only-ZF-live, both Register, same
+    // register → single emit_logical_imm, no read.
+    if (only_zf && op0_reg && op1_reg &&
+        op0.reg.reg.value == op1.reg.reg.value)                     // 28184-28185
+        return 0;
+
+    // High-byte-imm bitmask fast path (28227-28248): op0 is a class-1 high-byte
+    // register, only-ZF-live, op1 BranchOffset, imm<<8 is bitmask-encodable →
+    // single emit_ands_imm, no read.
+    if (op0_reg && (op0.reg.reg.value & 0xF0) == 0x10 &&            // 28227
+        only_zf && op1_branch &&                                   // 28229
+        alu_is_bitmask_immediate(
+            is_64bit,
+            (static_cast<uint64_t>(static_cast<uint8_t>(op1.imm.value)) << 8)))  // 28241
+        return 0;
+
+    // extend_mode v12 nonzero (28233-28259). v12 = 0 when fl < FLAG_OF (28233)
+    // or when op1 is a sign-clear BranchOffset (28253); else 1 (SF dead) / 2 (SF
+    // live) at LABEL_19 (28256-28259). Only nonzero-ness matters for a reg read.
+    bool em_nonzero;
+    if (fl < FLAG_OF) {                                            // 28233 v12=0
+        em_nonzero = false;
+    } else if (op1_branch &&
+               (static_cast<uint64_t>(op1.imm.value) & 0x8000000000000000ULL) == 0) {
+        em_nonzero = false;                                        // 28253 → v12=0
+    } else {
+        em_nonzero = true;                                         // 28257/28259 v12=1|2
+    }
+
+    // Does the general path's SECOND read of op1 fire (LABEL_30, 28281)?
+    //   - op1 BranchOffset: NO read iff bitmask-encodable (28265 emit_ands_imm),
+    //     else read (28272 → 28274/28276 → LABEL_30).
+    //   - op0,op1 both the SAME register: NO read (28278-28279 reuse op0 value).
+    //   - otherwise (op0 mem/abs/imm, or op1 a different register): read.
+    bool second_read;
+    if (op1_branch) {
+        second_read = !alu_is_bitmask_immediate(
+            is_64bit, static_cast<uint64_t>(op1.imm.value));      // 28265
+    } else if (op0_reg && op1_reg &&
+               op0.reg.reg.value == op1.reg.reg.value) {          // 28279
+        second_read = false;
+    } else {
+        second_read = true;                                       // 28274/28276 → 28281
+    }
+
+    // Immediate-kind (RIP/data-page) op0: honest TOTAL events (Seq peak forgets
+    // read op0's freed addend transient). read op0 = 2 events (adr+addend) +
+    // op1 second-read events. No writeback (unlike alu), so no +2 write term.
+    if (op0.kind == IROperandKind::Immediate) {                   // 26564-26633
+        const int src_events =
+            second_read ? alu_read_cost(op1, em_nonzero, is_64bit).peak : 0;
+        return 2 + src_events;
+    }
+
+    Seq seq;
+    // 1) read_operand_to_gpr(op0, v12, XZR) — the compared r/m value (28261).
+    //    Same helper/hint as alu-binary → alu_read_cost. Held to the epilogue
+    //    (no free_temporary_gpr in translate_test).
+    seq.step(alu_read_cost(op0, em_nonzero, is_64bit));
+    // 2) the SECOND read of op1 when it fires (28281). Also held to the epilogue,
+    //    so it stacks on op0's survivor (no free between the two reads).
+    if (second_read)
+        seq.step(alu_read_cost(op1, em_nonzero, is_64bit));
+    // 3) emit_logical_shifted_reg (28282) + optional CF emit (28285) — 0 alloc.
+    return seq.demand();
+}
+
+// =============================================================================
+// family: mul-imul  — kOpcodeName_mul, kOpcodeName_imul
+// Audit: research/bridge_demand/families/mul-imul/AUDIT.md (2026-07-17)
+//
+// SPLIT REQUIRED? — NO. ONE handler translate_imul_mul (decomp 28964-29243)
+// serves BOTH opcodes and ALL THREE x86 form classes, distinguished purely by
+// insn->num_operands (an IR field) and, within the flag block, by opcode:
+//   * form (a) one-operand widening `mul/imul r/m` (rDX:rAX ← rAX × r/m):
+//       num_operands == 1 → 29040. Also the fallback for num_operands ∉ {2,3}
+//       (29054 `(num_operands & 0xFE) != 2` → goto LABEL_24).
+//   * form (b) two-operand `imul r, r/m`:  num_operands == 2 → 29056 v13=1.
+//   * form (c) three-operand `imul r, r/m, imm`: num_operands == 3 → v13=2.
+//   forms (b)/(c) share the two-read path (29056-29071); only v13 (which of
+//   operands[1]/[2] is the second read) differs — a shape, not a split.
+//
+// COUNTING CONVENTION — TOTAL EVENTS (frees neutered), like the shifts / alu
+// PEAK-vs-TOTAL families: the S8/S16 imul flag path frees two temps
+// (free_temporary_gpr 29231-29232) that verify's neutered-free `actual` still
+// counts, and the handler has no other frees before the LABEL_705 epilogue
+// reset (15117-15121). So demand = the number of first-free
+// __clz(__rbit32(free_gpr_mask)) events reached on the shape's path, handler +
+// callees. Composed directly (not the Seq peak idiom, which models frees).
+//
+// First-free __clz sites in the handler (all others are emit-only helpers —
+// emit_madd 3260, emit_bitfield 2818, emit_mov_reg 3285, emit_add_imm 2525,
+// emit_add_sub_shifted_reg 2635, emit_logical_imm 2759, emit_movn 3295,
+// emit_csel 2922, emit_msr 3320 — verified verbatim, no free_gpr_mask/__clz):
+//   29070  product reg   (forms b/c only)          — held
+//   29078  madd-hi temp  (size ≤ S16, LABEL_25)    — held
+//   29102  madd-hi temp  (size == S32 && v9)        — held
+//   29129  alias temp    (size == S64 && v9 && v23) — held
+//   29163+29168  v45,v47 overflow movn/csel pair (LABEL_74, OF|CF live) — held
+//   29190+29195 / 29217+29222  v32,v34 (S8/S16 imul flag, LABEL_52) — FREED
+//                              29231-29232, but counted (neutered convention)
+//
+// Reads (all XZR hint → each first-free allocates like alu-binary's
+// alu_read_cost; the value regs are held to the epilogue):
+//   form (a): translate_gpr(accumulator, extend v7, XZR)   (29047) +
+//             read_operand_to_gpr(operands[0], extend v7, XZR) (29048)
+//   form (b/c): read_operand_to_gpr(op[num_operands!=2], 2, XZR) (29060) +
+//               read_operand_to_gpr(op[v13], 2, XZR)             (29061)
+// v7 = 2 (imul) / 1 (mul) (29033-29036); is_64bit arg v11: form (a)
+// `size==S32 && v9a || size==S64` (29043), form (b/c)
+// `(fl&(OF|CF))!=0 && size==S32 || size==S64` (29052).
+//
+// The accumulator read (29047) reads the implicit AL/AX/EAX/RAX arch register
+// (`qword_43BD8[size]`): translate_gpr under XZR + extend allocates 1 for the
+// S8 low-byte extract (26666) and the S16 extract (26688), 1 for S32 only when
+// is_64bit (26721), 0 for S64 passthrough (26746).
+//
+// The LABEL_25 mid-temp gate v9 and the LABEL_52 flag block are governed by
+// flag_liveness. Form (a)'s v9a (29042) folds in a `dword_4C9F0[size] &
+// insn->_pad08` term whose table is not in the package — NOT cleanly
+// IR-decidable, so per the demand rule ("others fold to max") the form-(a)
+// mid-temp is counted whenever it could fire. The LABEL_52 entry gate is the
+// clean `flag_liveness & (OF|CF)` (29145), fully decidable. The S64 alias
+// temp (29129) is gated on v23 = `v19==v14 || v19==operand_to_gpr` (29122) —
+// a run-time register-number comparison, NOT IR-decidable → folded to max.
+//
+// DISPOSITIONS. rep_prefix: NO access anywhere in translate_imul_mul
+// (28964-29243) or the transitive closure (flags.txt rep_prefix section:
+// (none), grep-confirmed); mul/imul have no LOCK form and are not in
+// lockable_rmw. flag_liveness (29037/29052/29145): (OF|CF) drives v9/v11 and
+// gates the LABEL_52 overflow block — every use IR-decidable, modeled per-bit
+// below (the S64-unconditional `|| size==S64` term of 29052 is honored). GS
+// fixed-slot-7 (25901) + get_tls_base BL (25904-25906) live inside
+// compute_operand_address's seg_override branch (25882), refused by the common
+// prefix (seg_override != 0) before this model runs — the excluded slot-7 path
+// is unreachable here. X22 read fast paths (26440/26500/26566) never fire —
+// every read hint is XZR. addr_size S32 handled by alu_read_cost's MemRef/
+// AbsMem rows (the held value reg absorbs the address, {1} every S32 shape,
+// ADDR32.md). NO shape refuses: no reachable fixed-slot alloc, no runtime BL,
+// every branch decidable from IRInstr/IROperand fields. Table v3.1;
+// discrepancy flags: NONE.
+// -----------------------------------------------------------------------------
+
+// read_operand_to_gpr(operand, extend, XZR) event count as invoked by
+// translate_imul_mul (29048/29060/29061). Same helper/hint as alu_read_cost,
+// EXCEPT one traced correction for a base-only MemRef with a NON-encodable disp:
+// read_operand_to_gpr first-free allocates the value reg (26449) and passes it
+// as the prefetch/compute address hint (26492) — a NON-XZR hint. For that shape
+// compute_mem_operand_address's LABEL_87 (26332-26343) cannot fold the disp
+// materialization into the (non-XZR) hint and allocates a SEPARATE scratch
+// (26336), so the read costs 2, not 1 (matrix fixture: `mul [rsi+0x12355]`
+// actual=2). Every other addressing shape (encodable disp, disp==0, SIB,
+// index-only, addr32 base) folds into the value reg → 1. Register/Immediate/
+// AbsMem/BranchOffset are identical to alu_read_cost.
+int mul_read_events(const IROperand& op, bool em_nonzero, bool is_64bit) {
+    if (op.kind == IROperandKind::MemRef) {
+        const bool has_base = (op.mem.mem_flags & 1) != 0;      // 26069-26070
+        const bool has_index = (op.mem.mem_flags & 2) != 0;
+        // base-only + non-encodable disp: value reg (26449) + disp temp (26336).
+        if (has_base && !has_index && op.mem.disp != 0 &&
+            !disp_add_encodable(op.mem.disp))                   // 26310-26343 LABEL_87
+            return 2;
+        return 1;                                              // value reg absorbs the address
+    }
+    return alu_read_cost(op, em_nonzero, is_64bit).peak;
+}
+
+// read_operand_to_gpr / translate_gpr of the implicit accumulator (form a,
+// 29047): AL/AX/EAX/RAX by `size`. XZR hint, extend v7 nonzero.
+int mul_acc_read_events(const IROperand& op0, bool is_64bit) {
+    switch (op0.reg.size) {
+        case IROperandSize::S8:                       // AL, class 0 extract (26666)
+        case IROperandSize::S16:                      // AX, class 2 extract (26688)
+            return 1;
+        case IROperandSize::S32:                      // EAX, class 3 (26721 a2==1)
+            return is_64bit ? 1 : 0;
+        default:                                      // RAX, S64 passthrough (26746)
+            return 0;
+    }
+}
+
+int demand_mul_imul(const IRInstr* instr) {
+    const uint16_t op = instr->opcode();          // mul 0x47 / imul 0x32
+    const IROperand& op0 = instr->operands[0];    // 29016-29024 dst / accumulator sizing
+    const uint8_t fl = instr->flag_liveness;      // 29037
+    const int nops = instr->num_operands;         // 29039
+
+    // size = operands[0].reg.size (29024). The union aliases .reg.size at +1
+    // for every operand kind, so this read is shape-safe.
+    const IROperandSize size = op0.reg.size;
+    const bool of_cf_live = (fl & (FLAG_OF | FLAG_CF)) != 0;   // 29037 v8 / 29145
+
+    // Form dispatch (29040 / 29054): num_operands==1 → form (a); ∈{2,3} → the
+    // two-read path; anything else falls back to the form-(a) path (LABEL_24).
+    const bool two_read = (nops == 2 || nops == 3);              // 29054 &0xFE==2
+    const bool imul = (op == kOpcodeName_imul);
+
+    // extend_mode v7 for the reads (29033-29036): imul 2, mul 1 — nonzero either
+    // way, so a Register read allocates per alu_reg_read_allocs.
+    const bool em_nonzero = true;
+
+    // is_64bit arg v11 to the reads. Form (a): 29043 `size==S32 && v9a ||
+    // size==S64`; form (b/c): 29052 `(fl&(OF|CF))!=0 && size==S32 || size==S64`.
+    // Only affects a class-3 (32-bit) Register read. For a class-3 read the
+    // form-(a) v9a term reduces to OF|CF liveness: the matrix confirms a
+    // flags-dead `mull r/m` allocates 0 (rows 10/34), so the `dword_4C9F0[S32] &
+    // _pad08` addend contributes nothing at S32. So both forms use of_cf_live.
+    const bool is_64bit =
+        size == IROperandSize::S64 ||
+        (size == IROperandSize::S32 && of_cf_live);
+
+    int events = 0;
+
+    // ---- Reads ----------------------------------------------------------------
+    if (!two_read) {
+        // Form (a) one-operand widening: accumulator read (29047) + operands[0]
+        // read (29048). operands[0] is the r/m factor (Register / MemRef /
+        // AbsMem / Immediate).
+        events += mul_acc_read_events(op0, is_64bit);            // 29047 translate_gpr
+        events += mul_read_events(op0, em_nonzero, is_64bit);    // 29048 read_operand_to_gpr
+    } else {
+        // Forms (b)/(c): two source reads (29060/29061) + the product register
+        // (29070, first-free, never freed). For num_operands==2 the reads are
+        // operands[0] and operands[1]; for ==3 they are operands[1] and
+        // operands[2] (the immediate).
+        const IROperand& ra = instr->operands[nops != 2 ? 1 : 0];   // 29060
+        const IROperand& rb = instr->operands[nops != 2 ? 2 : 1];   // 29061 v13
+        events += mul_read_events(ra, /*em_nonzero=*/true, is_64bit);
+        events += mul_read_events(rb, /*em_nonzero=*/true, is_64bit);
+        events += 1;                                              // 29070 product reg
+    }
+
+    // ---- LABEL_25 mid-temp (madd high half / alias) ---------------------------
+    // size ≤ S16: one temp always (29078, NOT gated on v9). size == S32: one iff
+    // v9 (29097→29102). size == S64: one iff v9 AND the v23 alias fires
+    // (29116→29122-29130). v9 is OF|CF liveness for every form (for the S32/S64
+    // sites the form-(a) 29042 table addend is 0 — matrix rows 10/14/34/38: a
+    // flags-dead `mul/imul r/m32|64 reg` allocates 0). The S64 alias v23 =
+    // `v19==v14 || v19==operand_to_gpr` (29122) is register-number-dependent;
+    // the matrix pins its IR-decidable shape:
+    //   two-operand (nops==2): fires — dst operands[0] (v19) is also the first
+    //     read (v14) (rows 60/68 reg+mem q, act 4/5).
+    //   three-operand (nops==3): never — the reads are operands[1]/[2] ≠ dst
+    //     (rows 74/86, act one below the two-operand analog).
+    //   one-operand widening (form a): v19=0 (29049) and the accumulator read
+    //     v14 passes through as RAX (index 0, 29047 S64 passthrough) so v19==v14
+    //     ⇒ the alias fires for a Register/Immediate/AbsMem operand — EXCEPT a
+    //     MemRef operand, whose address computation makes v14 non-zero so the
+    //     alias misses (matrix: reg q row 12 act 3 fires, RIP-Imm row 50 act 5
+    //     fires, mem q row 18 act 4 does NOT — read(2)+LABEL_52(2), no mid temp).
+    if (size <= IROperandSize::S16) {
+        events += 1;                                             // 29078
+    } else if (size == IROperandSize::S32) {
+        if (of_cf_live)                                         // 29097 v9
+            events += 1;                                         // 29102
+    } else {  // S64, 29116 v9 + 29122 v23
+        const bool alias = two_read ? (nops == 2)
+                                    : (op0.kind != IROperandKind::MemRef);
+        if (of_cf_live && alias)
+            events += 1;                                         // 29129 alias temp
+    }
+
+    // ---- LABEL_52 overflow flag block (only when OF|CF live, 29145) -----------
+    if (of_cf_live) {
+        if (size == IROperandSize::S32 || size == IROperandSize::S64) {
+            // `size - 2 < S32` (29147): the S32/S64 branch. Allocates v45+v47
+            // (29163/29168) then returns (29174).
+            events += 2;
+        } else {
+            // S8/S16 (29180 if(size) → S16 / else → S8): imul allocates v32+v34
+            // (29190+29195 / 29217+29222, freed 29231-29232 — counted) then
+            // falls to LABEL_74's v45+v47; mul emits (29152/29240) then LABEL_74.
+            events += imul ? 4 : 2;                             // 29190-29232 + 29163-29168
+        }
+    }
+
+    return events;
+}
+
 }  // namespace
 
 // =============================================================================
@@ -2373,6 +2723,38 @@ std::optional<int> X87Cache::gap_gpr_demand(const IRInstr* instr) {
         // seg_override, refused by the common prefix; every shape IR-decidable).
         case kOpcodeName_setcc:
             return demand_setcc(instr);
+
+        // =========================== family: test ==========================
+        // Audit: research/bridge_demand/families/test/AUDIT.md (2026-07-17)
+        // Single handler translate_test (decomp 28152-28286), cmp's sibling:
+        // two XZR-hint reads (op0 r/m, op1 reg/imm), NO writeback. Aliased-reg
+        // and high-byte-imm-bitmask fast paths cost 0; otherwise read op0 +
+        // (optional) second read of op1, both held to the epilogue. Peak ≤ 4;
+        // Immediate-kind (RIP) op0 priced by total events. Never refused (no
+        // fixed slot, no runtime BL, no rep_prefix, every shape IR-decidable;
+        // GS seg path behind the common prefix). The fnstsw-adjacent test tail
+        // is kept out of the gap scan by X87Cache::lookahead's guard — this
+        // model prices every test shape honestly with no adjacency logic.
+        case kOpcodeName_test:
+            return demand_test(instr);
+
+        // ========================= family: mul-imul ========================
+        // Audit: research/bridge_demand/families/mul-imul/AUDIT.md (2026-07-17)
+        // ONE handler translate_imul_mul (decomp 28964-29243) for both opcodes
+        // and all three x86 form classes, keyed on num_operands (1 = widening
+        // mul/imul r/m rDX:rAX; 2 = imul r,r/m; 3 = imul r,r/m,imm) — no split.
+        // Total-event count (frees neutered): reads (accumulator + r/m for the
+        // widening form; two sources + a product reg for the two-read forms) +
+        // a size-gated madd-high temp + the (OF|CF)-gated overflow block
+        // (S32/S64: +2; S8/S16: +2 mul / +4 imul). Honest totals can exceed the
+        // ceiling for narrow OF|CF-live imul (callers apply it). NEVER refused:
+        // no fixed-slot alloc, no runtime BL, every branch IR-decidable (the
+        // form-(a) v9a and the S64 v23 alias fold to max). rep_prefix unread (no
+        // LOCK form); GS fixed-slot/BL behind seg_override, refused by the common
+        // prefix.
+        case kOpcodeName_mul:
+        case kOpcodeName_imul:
+            return demand_mul_imul(instr);
 
         // ---- un-audited opcodes: refuse outright, no guessing ----
         default:

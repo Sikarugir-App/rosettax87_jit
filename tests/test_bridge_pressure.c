@@ -202,6 +202,35 @@ static double gap_cmp_setcc_cmov(double a, double b, double c,
     return r;
 }
 
+/* ── test reg,reg / mem,imm8 / reg,imm32 shapes inside x87 gaps ────────── */
+__attribute__((noinline))
+static double gap_test_shapes(double a, double b, double c, uint64_t *fl_out) {
+    double r;
+    uint64_t fl = 0;
+    *SLOT(0) = 0x80ull;   /* memory operand: bit 7 set → test m8,0x80 nonzero */
+    *((uint8_t *)SLOT(8)) = 0xFF;
+    __asm__ volatile(
+        "movq %[p], %%rsi\n"
+        "movq $2, %%rdx\n"
+        "xorq %%rcx, %%rcx\n"
+        "fldl %[a]\n"
+        "fmull %[b]\n"
+        "testq %%rdx, %%rdx\n"                   /* reg,reg: rdx=2 → ZF=0 */
+        "setne %%cl\n"
+        "testb $0x80, 0x12345(%%rsi,%%rdx,8)\n"  /* m8,imm8: 0x80 → ZF=0 */
+        "setne %%ch\n"
+        "faddl %[c]\n"
+        "testl $0x7fffffff, %%edx\n"             /* reg,imm32: 2 → ZF=0 */
+        "setne 0x1234d(%%rsi,%%rdx,8)\n"
+        "fstpl %[r]\n"
+        "movq %%rcx, %[fl]\n"
+        : [r] "=m"(r), [fl] "=&r"(fl)
+        : [a] "m"(a), [b] "m"(b), [c] "m"(c), [p] "r"(arena)
+        : "rsi", "rdx", "rcx", "cc", "memory");
+    *fl_out = (fl & 0xFFFF) | ((uint64_t)*((uint8_t *)SLOT(8)) << 16);
+    return r;
+}
+
 /* ── push m64 / pop m64 (memory forms, balanced inside one gap) ────────── */
 __attribute__((noinline))
 static double gap_push_pop_mem(double a, double b, double c, uint64_t *pop_out) {
@@ -693,6 +722,12 @@ int main(void) {
               gap_cmp_setcc_cmov(a, b, c, &set, &cmov), x87_expected);
         check_u64("gap_cmp_setcc_cmov: setbe m8 (false)", set, 0);
         check_u64("gap_cmp_setcc_cmov: cmova taken", cmov, 0x99999999ull);
+    }
+    {
+        uint64_t fl = 0;
+        check("gap_test_shapes: x87 result",
+              gap_test_shapes(a, b, c, &fl), x87_expected);
+        check_u64("gap_test_shapes: test rr/mi/ri flags", fl, 0x10101ull);
     }
     {
         uint64_t pop = 0;

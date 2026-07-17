@@ -114,7 +114,7 @@ struct X87Cache {
     // counted when another enabled x87 instruction follows it — a run NEVER
     // ends on a bridged instruction (the deferred TOP/tag flush in x87_end /
     // the IR epilogue relies on the last counted instruction being x87).
-    static constexpr int kMaxBridgeGap = 4;
+    static constexpr int kMaxBridgeGap = 8;
     static int lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
                          uint64_t disabled_ops_mask = 0, bool bridge = false);
 };

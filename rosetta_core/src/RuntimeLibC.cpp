@@ -332,7 +332,7 @@ int rt_printf(const char* fmt, ...) {
     va_start(ap, fmt);
     int r = _vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    _syscall3(SYS_write, STDERR_FILENO, (long)buf, r);
+    _syscall3(SYS_write, STDOUT_FILENO, (long)buf, r);
     return r;
 }
 
