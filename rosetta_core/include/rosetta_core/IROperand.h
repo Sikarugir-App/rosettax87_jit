@@ -160,3 +160,6 @@ union IROperand {  // sizeof = 16
 };
 
 static_assert(sizeof(IROperand) == 16, "IROperand must be 16 bytes");
+
+void IROperand_to_string(char* buf, IROperand operand);
+const char* condition_code_to_string(uint8_t cc);

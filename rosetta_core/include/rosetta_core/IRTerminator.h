@@ -137,16 +137,21 @@ static_assert(sizeof(IRTerminatorData) == 0x10);
 struct IRTerminator {
     TerminatorKind kind;     // +0x00
     uint8_t subkind;         // +0x01  overloaded per kind (see above)
-    uint16_t opcode;         // +0x02  x86 opcode index (same concept as IRInstr::opcode_)
+    uint16_t opcode_;        // +0x02  x86 opcode index (same concept as IRInstr::opcode_)
     uint32_t flags;          // +0x04
     IRTerminatorData data;   // +0x08
     IRBlock* extra;          // +0x18  continuation block ptr (bit 0 = flag)
+
+    auto opcode() const -> uint16_t;
+    auto set_opcode(uint16_t op) -> void;
 };
 
 static_assert(sizeof(IRTerminator) == 0x20, "IRTerminator must be 0x20 bytes");
 static_assert(offsetof(IRTerminator, kind) == 0x00, "IRTerminator::kind must be at offset 0x00");
 static_assert(offsetof(IRTerminator, subkind) == 0x01, "IRTerminator::subkind must be at offset 0x01");
-static_assert(offsetof(IRTerminator, opcode) == 0x02, "IRTerminator::opcode must be at offset 0x02");
+static_assert(offsetof(IRTerminator, opcode_) == 0x02, "IRTerminator::opcode_ must be at offset 0x02");
 static_assert(offsetof(IRTerminator, flags) == 0x04, "IRTerminator::flags must be at offset 0x04");
 static_assert(offsetof(IRTerminator, data) == 0x08, "IRTerminator::data must be at offset 0x08");
 static_assert(offsetof(IRTerminator, extra) == 0x18, "IRTerminator::extra must be at offset 0x18");
+
+void branch_target_to_string(char* buf, IRBranchTarget target);

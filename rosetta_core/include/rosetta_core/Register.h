@@ -127,3 +127,5 @@ struct Register {
     bool is_vector() const { return is_xmm() || is_avx(); }
     bool is_vector_or_mm() const { return is_vector() || is_mm(); }
 };
+
+const char* register_to_string(Register reg);

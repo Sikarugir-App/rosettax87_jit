@@ -15,6 +15,7 @@ set(ROSETTA_CORE_SOURCES
     src/TranslationResult.cpp
     src/AssemblerBuffer.cpp
     src/X87State.cpp
+    src/FlagEffects.cpp
     src/Opcode.cpp
     src/AssemblerBase.cpp
     src/TranslatorHelpers.cpp
