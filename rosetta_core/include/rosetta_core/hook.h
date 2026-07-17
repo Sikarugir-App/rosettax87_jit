@@ -51,6 +51,34 @@ int make_page_executable(void* addr);
  */
 int patch_movz_imm(void* addr, unsigned short new_imm);
 
+/**
+ * Overwrite one or more 4-byte AArch64 instructions in place with NOP
+ * (0xD503201F).
+ *
+ * @param addr   Exact address of the first 4-byte instruction to patch.
+ * @param count  Number of consecutive instructions to replace with NOP.
+ * @return       0 on success, -1 on failure (check errno).
+ *               EINVAL if addr is null or count is 0.
+ *               EPERM  if the memory protection change fails.
+ *
+ * Example:
+ *
+ *   // NOP out a single instruction:
+ *   patch_nop((void *)0x000000000001CDE8, 1);
+ */
+int patch_nop(void* addr, unsigned int count);
+
+/**
+ * Overwrite the 4-byte AArch64 instruction at `addr` with RET (0xD65F03C0),
+ * turning the function that begins there into an immediate return.
+ *
+ * @param addr   Exact address of the instruction to replace with RET.
+ * @return       0 on success, -1 on failure (check errno).
+ *               EINVAL if addr is null.
+ *               EPERM  if the memory protection change fails.
+ */
+int patch_ret(void* addr);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

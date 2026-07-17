@@ -177,3 +177,93 @@ int patch_movz_imm(void* addr, uint16_t new_imm) {
     flush_cache(addr, 4);
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// patch_nop
+//
+// Overwrite `count` consecutive 4-byte AArch64 instructions at `addr` with
+// NOP (0xD503201F). The range may span more than one page, so every page it
+// touches is switched to writable (COW) before the write and back to
+// executable afterwards.
+// ---------------------------------------------------------------------------
+int patch_nop(void* addr, unsigned int count) {
+    if (!addr || count == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const uint32_t nop = 0xD503201Fu;
+    const size_t len = (size_t)count * 4u;
+
+    // Compute the page-aligned range covering [addr, addr + len).
+    vm_address_t first_page = (vm_address_t)addr & ~((vm_address_t)AARCH64_PAGE_SIZE - 1);
+    vm_address_t last_page =
+        ((vm_address_t)addr + len - 1) & ~((vm_address_t)AARCH64_PAGE_SIZE - 1);
+    vm_size_t region = (last_page - first_page) + AARCH64_PAGE_SIZE;
+
+    // Make the target page(s) writable (COW).
+    kern_return_t kr = vm_protect(mach_task_self(), first_page, region, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        errno = EPERM;
+        CORE_LOG("patch_nop: vm_protect (write) failed");
+        return -1;
+    }
+
+    uint8_t* p = (uint8_t*)addr;
+    for (unsigned int i = 0; i < count; i++) {
+        memcpy(p + (size_t)i * 4u, &nop, 4);
+    }
+
+    // Restore execute permission.
+    kr = vm_protect(mach_task_self(), first_page, region, FALSE,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        errno = EPERM;
+        CORE_LOG("patch_nop: vm_protect (exec) failed");
+        return -1;
+    }
+
+    flush_cache(addr, len);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// patch_ret
+//
+// Overwrite the 4-byte AArch64 instruction at `addr` with RET (0xD65F03C0,
+// i.e. RET X30), turning the function that starts there into an immediate
+// return. Same COW-write / flush dance as patch_nop, single instruction.
+// ---------------------------------------------------------------------------
+int patch_ret(void* addr) {
+    if (!addr) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const uint32_t ret = 0xD65F03C0u;  // RET X30
+
+    // Make the target page writable (COW).
+    vm_address_t page = (vm_address_t)addr & ~((vm_address_t)AARCH64_PAGE_SIZE - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, AARCH64_PAGE_SIZE, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        errno = EPERM;
+        CORE_LOG("patch_ret: vm_protect (write) failed");
+        return -1;
+    }
+
+    memcpy(addr, &ret, 4);
+
+    // Restore execute permission.
+    kr = vm_protect(mach_task_self(), page, AARCH64_PAGE_SIZE, FALSE,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        errno = EPERM;
+        CORE_LOG("patch_ret: vm_protect (exec) failed");
+        return -1;
+    }
+
+    flush_cache(addr, 4);
+    return 0;
+}

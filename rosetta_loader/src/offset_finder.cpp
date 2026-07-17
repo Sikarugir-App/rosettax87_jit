@@ -175,18 +175,31 @@ auto OffsetFinder::scanLibRosettaRuntime() -> bool {
         return (*reinterpret_cast<uint64_t*>(loader.buffer_.data() + x87ExportsRva)) & 0xFFFFFFFF;
     };
 
+    auto findDefaultFreeGPRMask = [&]() -> std::optional<uint64_t> {
+        // BL sub_2DC78 (tail); MOV W8, #0x3FC00000; STR W8, [X19,#0x210];
+        // LDR W8, [X19,#0x218]  <-- we return the address of the STR W8, [X19,#0x210]
+        auto match = findPattern(loader.buffer_, "00 94 08 F8 A7 52 68 12 02 B9 68 1A 42 B9",
+                                 "defaultFreeGPRMask");
+        if (!match)
+            return std::nullopt;
+        return *match + 6;  // skip BL tail (2) + MOV (4) to reach the STR
+    };
+
     auto transactionResultSize = findTransactionResultSize();
     auto translateInsn = findTranslateInsn();
     auto decodeOpcode = findDecodeOpcode();
     auto initLibrary = findInitLibrary();
+    auto defaultFreeGPRMask = findDefaultFreeGPRMask();
 
-    if (!transactionResultSize || !translateInsn || !decodeOpcode || !initLibrary)
+    if (!transactionResultSize || !translateInsn || !decodeOpcode || !initLibrary ||
+        !defaultFreeGPRMask)
         return false;
 
     offsetTransactionResultSize_ = *transactionResultSize;
     offsetTranslateInsn_ = *translateInsn;
     offsetDecodeOpcode_ = *decodeOpcode;
     offsetInitLibrary_ = *initLibrary;
+    offsetDefaultFreeGPRMask_ = *defaultFreeGPRMask;
 
     return true;
 }

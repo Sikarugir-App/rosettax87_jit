@@ -75,6 +75,7 @@ void* init_library(SymbolList const* a1, uint64_t a2, ThreadContextOffsets const
         .transaction_result_size_addr = transaction_result_size_addr,
         .classify_arm_pc_addr = classify_arm_pc_ptr,
         .decode_opcode_addr = decode_opcode_ptr,
+        .default_free_gpr_mask_addr = 0,
         .rosettax87_base = kOffsets.rosettax87_base,
         .rosettax87_size = kOffsets.rosettax87_size,
     });

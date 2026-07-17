@@ -16,4 +16,5 @@ struct OffsetFinder {
     uint64_t offsetTranslateInsn_{};
     uint64_t offsetInitLibrary_{};
     uint64_t offsetDecodeOpcode_{};
+    uint64_t offsetDefaultFreeGPRMask_{};
 };
