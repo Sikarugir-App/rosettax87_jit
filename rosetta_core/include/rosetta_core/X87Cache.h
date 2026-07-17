@@ -82,6 +82,17 @@ struct X87Cache {
     // True if the opcode has a translate_* handler (participates in x87 runs).
     static bool is_handled(uint16_t op);
 
+    // OPT-KA (ROSETTA_X87_RUNTIME_KEEPALIVE): transcendentals Rosetta lowers as
+    // a runtime-routine BL whose round trip preserves the pinned cache GPRs
+    // (IDA-verified: only x27/x29 are clobbered; the transcendental entry
+    // chunks pass no args and write no results in x22–x24, unlike the
+    // arithmetic routines). Returns the op's fixed TOP delta in stack slots
+    // (-1 = helper pushes, +1 = helper pops, 0 = neutral) so the cached TOP
+    // register can be adjusted to match the memory TOP the helper writes;
+    // nullopt = not a keepalive op (fxtract is excluded: its push is
+    // conditional on the value and control word).
+    static std::optional<int> runtime_keepalive_top_delta(uint16_t op);
+
     // OPT-RB: peak scratch-GPR demand of Rosetta's own translation of a
     // run-transparent instruction, from the per-family audited model in
     // X87BridgeDemand.cpp (built via research/bridge_demand/WORKFLOW.md
@@ -114,7 +125,11 @@ struct X87Cache {
     // counted when another enabled x87 instruction follows it — a run NEVER
     // ends on a bridged instruction (the deferred TOP/tag flush in x87_end /
     // the IR epilogue relies on the last counted instruction being x87).
+    // runtime_keepalive (OPT-KA): additionally count keepalive transcendentals
+    // (runtime_keepalive_top_delta) as run members — both inside x87 groups
+    // and as the x87 instruction a gap must land on.
     static constexpr int kMaxBridgeGap = 8;
     static int lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
-                         uint64_t disabled_ops_mask = 0, bool bridge = false);
+                         uint64_t disabled_ops_mask = 0, bool bridge = false,
+                         bool runtime_keepalive = false);
 };

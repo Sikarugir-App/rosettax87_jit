@@ -2707,4 +2707,46 @@ auto translate_fnop(TranslationResult* a1, IRInstr* /*a2*/) -> void {
     free_gpr(*a1, Wd_tmp);
 }
 
+// =============================================================================
+// OPT-KA — keepalive prologue for runtime-routine transcendentals.
+//
+// The runtime helper (x87_fsin/…) reads and writes X87State MEMORY at
+// X18 + x87_state_offset, so every piece of deferred cache state must be
+// materialized before the BL: the FXCH permutation (the helper addresses
+// physical st slots), deferred push/pop tag updates, and a dirty TOP.
+//
+// The helper performs its own push/pop in memory (status word + tag word);
+// only the cached TOP register would go stale. Its stack delta is fixed
+// (X87Cache::runtime_keepalive_top_delta), so pre-adjust the register — the
+// value is not read by the helper, and after the call it equals the TOP the
+// helper wrote to memory (top_dirty stays 0, no deferred tag counts: the
+// helper updated the tag word itself).
+// =============================================================================
+auto runtime_keepalive_flush(TranslationResult* a1, int top_delta) -> void {
+    auto& xc = a1->x87_cache;
+    if (!xc.gprs_valid) {
+        // Nothing cached yet (the transcendental opens the run) — memory is
+        // already coherent and there is no TOP register to maintain.
+        return;
+    }
+    AssemblerBuffer& buf = a1->insn_buf;
+    const int Xbase = xc.base_gpr;
+    const int Wd_top = xc.top_gpr;
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+    perm_flush_before_stack_change(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    {
+        const int Wd_tmp2 = alloc_free_gpr(*a1);
+        x87_flush_tags(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+        free_gpr(*a1, Wd_tmp2);
+    }
+    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+
+    if (top_delta < 0)
+        emit_x87_push_fully_deferred(buf, Wd_top);  // TOP = (TOP - 1) & 7
+    else if (top_delta > 0)
+        emit_x87_pop_top_only(buf, Wd_top);  // TOP = (TOP + 1) & 7
+}
+
 };  // namespace TranslatorX87

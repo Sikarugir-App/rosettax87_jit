@@ -305,6 +305,32 @@ bool X87Cache::is_handled(uint16_t op) {
     return is_handled_x87(op);
 }
 
+// OPT-KA: TOP deltas match the runtime helpers' actual semantics
+// (rosetta_runtime/src/X87.cpp), which push/pop unconditionally — not the
+// Intel spec's conditional variants (e.g. hardware fptan skips the push when
+// C2 is set; the helper never does).
+std::optional<int> X87Cache::runtime_keepalive_top_delta(uint16_t op) {
+    switch (op) {
+        case kOpcodeName_f2xm1:
+        case kOpcodeName_fsin:
+        case kOpcodeName_fcos:
+        case kOpcodeName_fscale:
+        case kOpcodeName_fxam:
+        case kOpcodeName_fprem:
+        case kOpcodeName_fprem1:
+            return 0;
+        case kOpcodeName_fptan:
+        case kOpcodeName_fsincos:
+            return -1;  // helper pushes: TOP = (TOP - 1) & 7
+        case kOpcodeName_fyl2x:
+        case kOpcodeName_fyl2xp1:
+        case kOpcodeName_fpatan:
+            return 1;  // helper pops: TOP = (TOP + 1) & 7
+        default:
+            return std::nullopt;
+    }
+}
+
 // OPT-RB: gap_gpr_demand — the per-opcode-family peak scratch-GPR demand
 // model, and the SINGLE bridging gate — lives in X87BridgeDemand.cpp (built
 // by the audit workflow in research/bridge_demand/WORKFLOW.md). A non-nullopt
@@ -323,14 +349,21 @@ static bool op_disabled_for_run(uint16_t op, uint64_t disabled_ops_mask) {
 }
 
 int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
-                        uint64_t disabled_ops_mask, bool bridge) {
+                        uint64_t disabled_ops_mask, bool bridge, bool runtime_keepalive) {
+    // A run member is a handled+enabled x87 instruction, or (OPT-KA) a
+    // keepalive transcendental — Rosetta translates the latter as a runtime
+    // BL that preserves the pinned cache GPRs.
+    auto run_member = [&](uint16_t op) {
+        if (is_handled_x87(op))
+            return !op_disabled_for_run(op, disabled_ops_mask);
+        return runtime_keepalive && runtime_keepalive_top_delta(op).has_value();
+    };
     int count = 0;
     int64_t i = insn_idx;
     for (;;) {
-        // Consume a maximal group of handled, enabled x87 instructions.
+        // Consume a maximal group of run-member instructions.
         int group = 0;
-        while (i < num_instrs && is_handled_x87(instr_array[i].opcode()) &&
-               !op_disabled_for_run(instr_array[i].opcode(), disabled_ops_mask)) {
+        while (i < num_instrs && run_member(instr_array[i].opcode())) {
             i++;
             group++;
         }
@@ -358,9 +391,7 @@ int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
             j++;
             gap++;
         }
-        if (gap == 0 || j >= num_instrs ||
-            !is_handled_x87(instr_array[j].opcode()) ||
-            op_disabled_for_run(instr_array[j].opcode(), disabled_ops_mask))
+        if (gap == 0 || j >= num_instrs || !run_member(instr_array[j].opcode()))
             break;
         count += gap;
         i = j;

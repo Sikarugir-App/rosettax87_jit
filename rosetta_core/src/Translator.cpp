@@ -202,17 +202,22 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
             if (!cache_disabled) {
                 const uint64_t ops_mask = g_rosetta_config ? g_rosetta_config->disabled_ops_mask : 0;
                 const bool bridge = g_rosetta_config && g_rosetta_config->run_bridge;
+                const bool keepalive = g_rosetta_config && g_rosetta_config->runtime_keepalive;
                 const int run =
-                    X87Cache::lookahead(instr_array, num_instrs, insn_idx, ops_mask, bridge);
+                    X87Cache::lookahead(instr_array, num_instrs, insn_idx, ops_mask, bridge,
+                                        keepalive);
                 if (g_rosetta_config && g_rosetta_config->log_run_breaks && run > 0)
                     log_run_break(translation_result, instr_array, num_instrs, insn_idx, run);
                 cache.set_run(run);
             }
         }
-        // OPT-RB: after a bridged instruction, Rosetta's own translation ran.
-        // If it reset the scratch mask, re-exclude the pinned cache GPRs
-        // before anything here allocates from it.
-        if (g_rosetta_config && g_rosetta_config->run_bridge && cache.active())
+        // OPT-RB/OPT-KA: after a bridged gap or keepalive transcendental,
+        // Rosetta's own translation ran. If it reset the scratch mask,
+        // re-exclude the pinned cache GPRs before anything here allocates
+        // from it.
+        if (g_rosetta_config &&
+            (g_rosetta_config->run_bridge || g_rosetta_config->runtime_keepalive) &&
+            cache.active())
             translation_result->free_gpr_mask &= ~cache.pinned_mask();
     }
 
@@ -473,6 +478,34 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                 break;
 
             default:
+                // OPT-KA (opt-in ROSETTA_X87_RUNTIME_KEEPALIVE): a keepalive
+                // transcendental inside an active run. Rosetta translates it as
+                // a runtime-routine BL whose round trip preserves every pinned
+                // cache GPR (only x27/x29 are clobbered — IDA-verified, see
+                // X87Cache::runtime_keepalive_top_delta). Flush deferred state
+                // so the helper sees coherent X87State memory, pre-adjust the
+                // cached TOP by the op's fixed stack delta, and keep the pins
+                // excluded from the scratch pool. Carried pins are released
+                // first: one could live in x27, and releasing frees the flush's
+                // scratch slots (Rosetta's own translate_* for these ops is a
+                // pure fixup+BL with zero scratch-GPR demand, decomp-verified).
+                if (cache.active() && g_rosetta_config && g_rosetta_config->runtime_keepalive) {
+                    if (auto top_delta = X87Cache::runtime_keepalive_top_delta(opcode)) {
+                        if (cache.carried_any())
+                            cache.carried_release(translation_result->free_gpr_mask);
+                        TranslatorX87::runtime_keepalive_flush(translation_result, *top_delta);
+                        cache.tick();
+                        if (cache.active()) {
+                            translation_result->free_gpr_mask =
+                                kGprScratchMask & ~cache.pinned_mask();
+                        } else {
+                            translation_result->free_gpr_mask = kGprScratchMask;
+                        }
+                        translation_result->free_fpr_mask =
+                            translation_result->_unoccupied_temporary_fprs_for_xmm_scalars;
+                        return std::nullopt;
+                    }
+                }
                 // OPT-RB (opt-in ROSETTA_X87_RUN_BRIDGE): a run-transparent
                 // integer instruction inside an active run. Rosetta translates
                 // it itself; we only tick the run counter and keep the pinned

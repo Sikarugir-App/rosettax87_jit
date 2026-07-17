@@ -82,6 +82,7 @@ ALL_TESTS=(
     test_sse_whitelist
     test_bridge_pressure
     test_addr32
+    test_keepalive
 )
 
 RED='\033[0;31m'
@@ -245,6 +246,26 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
             continue
         fi
         OUT=$(ROSETTA_X87_TRANSPARENT_INT=1 ROSETTA_X87_BRIDGE_CARRY=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
+        check_output "$t" "$OUT"
+    done
+fi
+
+# ── Phase 7: runtime_loader, RUNTIME_KEEPALIVE (OPT-KA) ──────────────────────
+# Keeps the pinned x87 cache alive across runtime-routine transcendentals
+# (fsin/fcos/…), stacked on the full opt-in set so the keepalive prologue is
+# exercised with carried pins and bridged gaps in play.
+if [[ $NATIVE_ONLY -eq 0 ]]; then
+    echo ""
+    echo -e "${BOLD}=== Phase 7: runtime_loader (RUNTIME_KEEPALIVE + full opt-in stack) ===${NC}"
+
+    for t in "${TESTS[@]}"; do
+        BINARY="$BIN/$t"
+        if [[ ! -x "$BINARY" ]]; then
+            echo -e "${YELLOW}SKIP${NC}  $t  (binary not found)"
+            ERRORS=$((ERRORS + 1))
+            continue
+        fi
+        OUT=$(ROSETTA_X87_RUNTIME_KEEPALIVE=1 ROSETTA_X87_TRANSPARENT_INT=1 ROSETTA_X87_BRIDGE_CARRY=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
         check_output "$t" "$OUT"
     done
 fi

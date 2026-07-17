@@ -174,6 +174,12 @@ RosettaConfig parse_config_from_env() {
         if (cfg.bridge_carry) cfg.run_bridge = 1;
     }
 
+    // Keep the pinned cache GPRs alive across runtime-routine transcendentals
+    // (fsin/fcos/fptan/…). Independent of RUN_BRIDGE: it extends runs across
+    // x87 instructions Rosetta translates as runtime BLs, not integer gaps.
+    if (const char* v = std::getenv("ROSETTA_X87_RUNTIME_KEEPALIVE"))
+        cfg.runtime_keepalive = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')
             cfg.disabled_ops_mask = ~0ULL;

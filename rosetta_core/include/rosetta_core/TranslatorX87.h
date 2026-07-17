@@ -87,4 +87,13 @@ auto translate_fnstcw(TranslationResult* a1, IRInstr* a2) -> void;
 
 auto translate_fnop(TranslationResult* a1, IRInstr* a2) -> void;
 
+// OPT-KA: emitted before handing a keepalive transcendental back to Rosetta
+// (which lowers it as a runtime-routine BL). Flushes deferred perm/tag/TOP
+// state so the runtime helper sees coherent X87State memory, then adjusts the
+// cached TOP register by the op's fixed stack delta (the helper writes the
+// same new TOP to memory, so top_dirty stays clear). The caller must release
+// carried pins first (frees the flush scratch slots and evicts x27, which the
+// runtime round trip clobbers).
+auto runtime_keepalive_flush(TranslationResult* a1, int top_delta) -> void;
+
 };  // namespace TranslatorX87
