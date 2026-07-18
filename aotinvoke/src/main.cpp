@@ -27,12 +27,32 @@ int main(int argc, char** argv) {
     RosettaConfig cfg = parse_config_from_env();
     rosetta_set_config(&cfg);
 
-    if (argc < 3 || argc > 4) {
-        std::print("Usage: aotinvoke <input.bin> <output.bin> [--verbose]\n");
+    if (argc < 3 || argc > 5) {
+        std::print("Usage: aotinvoke <input.bin> <output.bin> [--verbose] [--demand]\n");
         return 1;
     }
 
-    const bool verbose = (argc == 4 && std::string_view(argv[3]) == "--verbose");
+    // --verbose: print the IR dump.
+    // --demand (implies --verbose): additionally instrument the translation
+    // for the bridge-demand workflow — binary-patch the allocator
+    // (free_temporary_gpr RET, free-GPR-mask reset NOP), sample the mask
+    // around every instruction, and annotate each IR row with
+    // `gpr_demand actual=N est=M|refuse`. Without it, aotinvoke translates
+    // with the same allocator behavior as the runtime hook path.
+    bool verbose = false;
+    bool demand = false;
+    for (int i = 3; i < argc; i++) {
+        const std::string_view arg(argv[i]);
+        if (arg == "--verbose") {
+            verbose = true;
+        } else if (arg == "--demand") {
+            demand = true;
+            verbose = true;
+        } else {
+            std::print("Unknown flag: {}\n", arg);
+            return 1;
+        }
+    }
 
     if (!load_rosetta_aot()) {
         std::print("Failed to load libRosettaAot.dylib\n");
@@ -50,7 +70,7 @@ int main(int argc, char** argv) {
     // Observer fired around each instruction's translation. Must outlive
     // translate() below — hence a stack local in main.
     CustomTranslationHook translation_hook;
-    if (verbose) {
+    if (demand) {
         translation_hook.before = [&](TranslationResult* result, IRBlock*,
                                       IRInstr* instrs, int64_t, int64_t idx) {
             gpr_mask_samples[&instrs[idx]].before = result->free_gpr_mask;
@@ -69,11 +89,11 @@ int main(int argc, char** argv) {
         .transaction_result_size_addr = g_rosetta_aot.transaction_result_size_addr,
         .classify_arm_pc_addr = 0,
         .decode_opcode_addr = g_rosetta_aot.decode_opcode_addr,
-        .default_free_gpr_mask_addr = g_rosetta_aot.default_free_gpr_mask_addr,
-        .free_temporary_gpr_addr = g_rosetta_aot.free_temporary_gpr_addr,
+        .default_free_gpr_mask_addr = demand ? g_rosetta_aot.default_free_gpr_mask_addr : 0,
+        .free_temporary_gpr_addr = demand ? g_rosetta_aot.free_temporary_gpr_addr : 0,
         .rosettax87_base = 0,
         .rosettax87_size = 0,
-        .translation_hook = &translation_hook,
+        .translation_hook = demand ? &translation_hook : nullptr,
     });
 
     int offset_size = version >= kAotVersion ? g_runtime_routine_offsets.size() : g_runtime_routine_offsets.size() - 2;
@@ -134,8 +154,7 @@ int main(int argc, char** argv) {
 
     auto translate_result = g_rosetta_aot.translate(module_result);
 
-    if (verbose) {
-        // g_rosetta_aot.module_print(module_result, 1);
+    if (demand) {
         ModulePrintHooks hooks;
         hooks.annotate_block = [](const IRBlock& block) {
             return std::format("; code_size={}", block.code_size);
@@ -156,6 +175,8 @@ int main(int argc, char** argv) {
             return std::format("; gpr_demand actual={} est={}", actual, est_str);
         };
         module_print(module_result, &hooks);
+    } else if (verbose) {
+        g_rosetta_aot.module_print(module_result, 1);
     }
 
 
