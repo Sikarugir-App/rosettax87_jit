@@ -1250,19 +1250,23 @@ void x87_fscale(X87State* state) {
     double st0 = state->getSt(0);
     double st1 = state->getSt(1);
 
-    // Round ST(1) to nearest integer
-    int scale = static_cast<int>(st1);
+    if (x87_is_nan(st1)) {
+        state->setSt(0, std::numeric_limits<double>::quiet_NaN());
+        return;
+    }
 
-    // Scale ST(0) by 2^scale using bit manipulation for integer powers
-    int32_t exponent = scale + 1023;  // IEEE-754 bias
-    uint64_t scaleFactor = static_cast<uint64_t>(exponent) << 52;
-    double factor = std::bit_cast<double>(scaleFactor);
+    // Truncate ST(1) toward zero; clamp so ±Inf and huge values stay in
+    // scalbn's well-defined saturation range instead of hitting UB in the cast.
+    int scale;
+    if (st1 >= 100000.0) {
+        scale = 100000;
+    } else if (st1 <= -100000.0) {
+        scale = -100000;
+    } else {
+        scale = static_cast<int>(st1);
+    }
 
-    // Multiply ST(0) by scale factor
-    double result = st0 * factor;
-
-    // Store result back in ST(0)
-    state->setSt(0, result);
+    state->setSt(0, openlibm_scalbn(st0, scale));
 }
 
 void x87_fsin(X87State* state) {
