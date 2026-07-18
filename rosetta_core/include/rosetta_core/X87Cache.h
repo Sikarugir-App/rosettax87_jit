@@ -128,7 +128,7 @@ struct X87Cache {
     // runtime_keepalive (OPT-KA): additionally count keepalive transcendentals
     // (runtime_keepalive_top_delta) as run members — both inside x87 groups
     // and as the x87 instruction a gap must land on.
-    static constexpr int kMaxBridgeGap = 8;
+    static constexpr int kMaxBridgeGap = 16;
     static int lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
                          uint64_t disabled_ops_mask = 0, bool bridge = false,
                          bool runtime_keepalive = false);
