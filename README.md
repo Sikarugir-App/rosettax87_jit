@@ -55,8 +55,9 @@ All flags are set via environment variables and read at runtime.
 | `ROSETTA_X87_FAST_ROUND=1` | Skip rounding mode dispatch (faster but unsafe for FLDCW-heavy code) |
 | `ROSETTA_X87_EXTENDED_FPR_SCRATCH=1` | Expand FPR scratch register pool from 8 (V24–V31) to 16 (V16–V31) |
 | `ROSETTA_X87_RUN_BRIDGE=1` | Keep an active run's pinned cache GPRs across run-transparent integer instructions (`mov`/`lea`/…) instead of breaking the run |
-| `ROSETTA_X87_TRANSPARENT_INT=1` | Inline simple register-form `mov`/`lea`/`movzx`/`movsx` into IR runs (requires `ROSETTA_X87_RUN_BRIDGE`) |
+| `ROSETTA_X87_TRANSPARENT_INT=1` | Inline simple register-form `mov`/`lea`/`movzx`/`movsx` into IR runs (implies `ROSETTA_X87_RUN_BRIDGE`) |
 | `ROSETTA_X87_BRIDGE_CARRY=1` | Carry the base-address cache + rounding-control GPRs across bridged gaps (implies `ROSETTA_X87_RUN_BRIDGE`) |
+| `ROSETTA_X87_RUNTIME_KEEPALIVE=1` | Keep the pinned x87 cache GPRs alive across runtime-routine transcendentals (`fsin`/`fcos`/`fptan`/…) instead of breaking the run; independent of `ROSETTA_X87_RUN_BRIDGE` |
 | `ROSETTA_X87_F32_ARITH=1` | Keep f32-sourced arithmetic chains in f32 registers instead of widening intermediates to f64 (not bit-exact vs real x87 f64 intermediates) |
 | `ROSETTA_X87_FAST_RECIP_DIV=1` | Rewrite FDIV by *any* normal constant as FMUL by its reciprocal (up to 1 ulp off; exact power-of-two divisors are always rewritten regardless of this flag) |
 
