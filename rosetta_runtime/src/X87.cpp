@@ -1530,6 +1530,9 @@ void x87_fxam(X87State* state) {
     }
     if (tag == X87TagState::kZero) {
         state->statusWord |= X87StatusWordFlag::kConditionCode3;  // C3=1 (100)
+        if (signbit(state->getSt(0))) {                           // C1 = sign (-0.0)
+            state->statusWord |= X87StatusWordFlag::kConditionCode1;
+        }
         return;
     }
 

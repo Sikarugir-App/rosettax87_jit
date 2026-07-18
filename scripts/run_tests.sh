@@ -12,6 +12,9 @@
 #   6. runtime_loader with ROSETTA_X87_TRANSPARENT_INT=1 + ROSETTA_X87_BRIDGE_CARRY=1
 #      + ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 + ROSETTA_X87_CONST_PROMOTE=1
 #      + ROSETTA_X87_F32_NARROW=1  (the full opt-in stack)
+#   7. runtime_loader with ROSETTA_X87_RUNTIME_KEEPALIVE=1 + the full opt-in stack
+#   8. runtime_loader with ROSETTA_X87_DISABLE_ALL_OPS=1 + ROSETTA_X87_DISABLE_ALL_FUSIONS=1
+#      + ROSETTA_X87_DISABLE_IR=1  (runtime routines only — pure X87.cpp coverage)
 #
 # Usage:
 #   bash scripts/run_tests.sh                # build + test (all phases)
@@ -266,6 +269,27 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
             continue
         fi
         OUT=$(ROSETTA_X87_RUNTIME_KEEPALIVE=1 ROSETTA_X87_TRANSPARENT_INT=1 ROSETTA_X87_BRIDGE_CARRY=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 ROSETTA_X87_CONST_PROMOTE=1 ROSETTA_X87_F32_NARROW=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
+        check_output "$t" "$OUT"
+    done
+fi
+
+# ── Phase 8: runtime_loader, all custom translation disabled ─────────────────
+# Apple's stock codegen BL-ing into the hooked x87_* runtime routines — the
+# purest exercise of the X87.cpp implementations (no custom singular
+# translators, fusions, or IR inlining masking them). DISABLE_IR is redundant
+# with ALL_OPS disabled but kept explicit.
+if [[ $NATIVE_ONLY -eq 0 ]]; then
+    echo ""
+    echo -e "${BOLD}=== Phase 8: runtime_loader (runtime routines only, custom translation disabled) ===${NC}"
+
+    for t in "${TESTS[@]}"; do
+        BINARY="$BIN/$t"
+        if [[ ! -x "$BINARY" ]]; then
+            echo -e "${YELLOW}SKIP${NC}  $t  (binary not found)"
+            ERRORS=$((ERRORS + 1))
+            continue
+        fi
+        OUT=$(ROSETTA_X87_DISABLE_ALL_OPS=1 ROSETTA_X87_DISABLE_ALL_FUSIONS=1 ROSETTA_X87_DISABLE_IR=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
         check_output "$t" "$OUT"
     done
 fi
