@@ -6,7 +6,7 @@ add_executable(aotinvoke
 
 target_include_directories(aotinvoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-target_link_libraries(aotinvoke PRIVATE rosetta_core)
+target_link_libraries(aotinvoke PRIVATE rosetta_core rosetta_shared)
 target_compile_options(aotinvoke PRIVATE -g)
 
 add_custom_command(TARGET aotinvoke POST_BUILD

@@ -1,4 +1,4 @@
-#include "Offsets.h"
+#include "RuntimeOffsets.h"
 
 __attribute__((section("__DATA,offsets"), used)) Offsets kOffsets = {
     0x0,  // exports_rva (filled in by loader)

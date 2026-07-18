@@ -19,9 +19,10 @@
 #include <vector>
 
 #include "mach_exception.hpp"
-#include "macho_loader.hpp"
 #include "offset_finder.hpp"
-#include "types.h"
+#include "rosetta_shared/LoaderTypes.h"
+#include "rosetta_shared/MachoLoader.h"
+#include "rosetta_shared/Offsets.h"
 
 const char* logsEnabled = nullptr;
 

@@ -1,13 +1,18 @@
 #include "RosettaAotApi.h"
 
 #include <dlfcn.h>
-#include <mach-o/loader.h>
-#include <mach/vm_page_size.h>
 
 #include <array>
+#include <optional>
 #include <print>
 #include <stdexcept>
 #include <string_view>
+
+#include "rosetta_shared/MachoLoader.h"
+#include "rosetta_shared/MachoScan.h"
+
+using rosetta_shared::findPattern;
+namespace aarch64 = rosetta_shared::aarch64;
 
 RosettaAotApi g_rosetta_aot;
 
@@ -36,114 +41,74 @@ T load_symbol(void* handle, const char* name) {
     throw std::runtime_error("symbol not found");
 }
 
-bool find_patterns(uintptr_t aot_base, uintptr_t& trans_insn_addr,
-                   uintptr_t& transaction_result_size_addr, uintptr_t& decode_opcode_addr,
-                   uintptr_t& default_free_gpr_mask_addr,
-                   uintptr_t& free_temporary_gpr_addr) {
-    static const std::array<uint8_t, 36> translate_insn_pattern = {
-        0xFF, 0x43, 0x03, 0xD1, 0xFC, 0x6F, 0x07, 0xA9, 0xFA, 0x67, 0x08, 0xA9,
-        0xF8, 0x5F, 0x09, 0xA9, 0xF6, 0x57, 0x0A, 0xA9, 0xF4, 0x4F, 0x0B, 0xA9,
-        0xFD, 0x7B, 0x0C, 0xA9, 0xFD, 0x03, 0x03, 0x91, 0xF3, 0x03, 0x00, 0xAA};
-    static const std::array<uint8_t, 4> transaction_result_size_pattern = {0x00, 0x51, 0x80, 0x52};
-    // Matches mid-instruction at a decode_opcode call site; the BL is at match + 0x0F.
-    static const std::array<uint8_t, 4> decode_opcode_pattern = {0xA3, 0x00, 0x91, 0xE2};
-    // BL sub (tail); MOV W8, #0x3FC00000; STR W8, [X19,#0x210]; LDR W8, [X19,#0x218].
-    // The STR W8, [X19,#0x210] (the free-GPR-mask write) is at match + 6.
-    static const std::array<uint8_t, 14> default_free_gpr_mask_pattern = {
-        0x00, 0x94, 0x08, 0xF8, 0xA7, 0x52, 0x68, 0x12, 0x02, 0xB9, 0x68, 0x1A, 0x42, 0xB9};
-    // free_temporary_gpr prologue: MOV W8,#1; LSR W8,W8,W1; TST W8,... — the
-    // match is the function entry, patched to RET to neuter the free.
-    static const std::array<uint8_t, 12> free_temporary_gpr_pattern = {
-        0x28, 0x00, 0x80, 0x52, 0x08, 0x21, 0xC1, 0x1A, 0x1F, 0x1D, 0x0A, 0x72};
-    // look up __TEXT, __text section
-
-    mach_header_64* header = (mach_header_64*)aot_base;
-    load_command* cmd = (load_command*)(header + 1);
-    section_64* text_section = nullptr;
-
-    for (auto i = 0; i < header->ncmds; i++) {
-        if (cmd->cmd == LC_SEGMENT_64) {
-            auto seg = (segment_command_64*)cmd;
-
-            if (strcmp(seg->segname, "__TEXT") == 0) {
-                section_64* sections = (section_64*)(uintptr_t(seg) + sizeof(segment_command_64));
-                for (auto j = 0; j < seg->nsects; j++) {
-                    auto& sect = sections[j];
-                    if (strcmp(sect.sectname, "__text") == 0) {
-                        text_section = &sect;
-                        break;
-                    }
-                }
-            }
-        }
-        cmd = (load_command*)((uintptr_t)cmd + cmd->cmdsize);
-    }
-
-    if (!text_section) {
+// Scan libRosettaAot.dylib on disk for the addresses we hook and write them into
+// g_rosetta_aot. findPattern returns a file offset into the __TEXT image; since the
+// dylib's __text file offset equals its slid VM offset, adding g_rosetta_aot.base_addr
+// (the loaded base) yields the runtime address.
+bool find_patterns() {
+    MachoLoader loader;
+    if (!loader.open(kRosettaAotPath)) {
+        std::print("Failed to open {} to determine offsets.\n", kRosettaAotPath);
         return false;
     }
 
-    trans_insn_addr = 0;
-    transaction_result_size_addr = 0;
-    decode_opcode_addr = 0;
-    default_free_gpr_mask_addr = 0;
-    free_temporary_gpr_addr = 0;
+    auto findTranslateInsn = [&]() -> std::optional<uint64_t> {
+        // translate_insn function prologue
+        return findPattern(loader.buffer_,
+                           "FF 43 03 D1 FC 6F 07 A9 FA 67 08 A9 "
+                           "F8 5F 09 A9 F6 57 0A A9 F4 4F 0B A9 "
+                           "FD 7B 0C A9 FD 03 03 91 F3 03 00 AA",
+                           "translateInsn");
+    };
 
-    for (size_t offset = 0; offset < text_section->size; offset++) {
-        uintptr_t p = aot_base + text_section->offset + offset;
+    auto findTransactionResultSize = [&]() -> std::optional<uint64_t> {
+        return findPattern(loader.buffer_, "00 51 80 52", "transactionResultSize");
+    };
 
-        if (trans_insn_addr == 0) {
-            if (std::memcmp((void*)p, translate_insn_pattern.data(),
-                            translate_insn_pattern.size()) == 0) {
-                trans_insn_addr = p;
-            }
-        }
+    auto findDecodeOpcode = [&]() -> std::optional<uint64_t> {
+        auto match = findPattern(loader.buffer_, "? ? 00 91 E2 A3 ? 91", "decodeOpcode");
+        if (!match)
+            return std::nullopt;
+        uint64_t blOffset = *match + 0x10;
+        uint32_t blInsn = *reinterpret_cast<uint32_t*>(&loader.buffer_[blOffset]);
+        return aarch64::decodeBl(blInsn, blOffset);
+    };
 
-        if (transaction_result_size_addr == 0) {
-            if (std::memcmp((void*)p, transaction_result_size_pattern.data(),
-                            transaction_result_size_pattern.size()) == 0) {
-                transaction_result_size_addr = p;
-            }
-        }
+    auto findDefaultFreeGPRMask = [&]() -> std::optional<uint64_t> {
+        // BL sub (tail); MOV W8, #0x3FC00000; STR W8, [X19,#0x210]; LDR W8, [X19,#0x218].
+        // The STR W8, [X19,#0x210] (the free-GPR-mask write) is at match + 6.
+        auto match = findPattern(loader.buffer_, "00 94 08 F8 A7 52 68 12 02 B9 68 1A 42 B9",
+                                 "defaultFreeGPRMask");
+        if (!match)
+            return std::nullopt;
+        return *match + 6;  // skip BL tail (2) + MOV (4) to reach the STR
+    };
 
-        if (decode_opcode_addr == 0) {
-            if (std::memcmp((void*)p, decode_opcode_pattern.data(),
-                            decode_opcode_pattern.size()) == 0) {
-                // The BL is at match + 0x0F (pattern starts mid-instruction).
-                uintptr_t bl_ptr = p + 0x0F;
-                uint32_t bl = *reinterpret_cast<uint32_t*>(bl_ptr);
-                int32_t imm26 = bl & 0x03FFFFFF;
-                if (imm26 & (1 << 25))
-                    imm26 |= ~0x03FFFFFF;  // sign-extend from 26 bits
-                decode_opcode_addr = bl_ptr + ((int64_t)imm26 << 2);
-            }
-        }
+    auto findFreeTemporaryGpr = [&]() -> std::optional<uint64_t> {
+        // free_temporary_gpr prologue: MOV W8,#1; LSR W8,W8,W1; TST W8,... — the
+        // match is the function entry, patched to RET to neuter the free.
+        return findPattern(loader.buffer_, "28 00 80 52 08 21 C1 1A 1F 1D 0A 72",
+                           "freeTemporaryGpr");
+    };
 
-        if (default_free_gpr_mask_addr == 0) {
-            if (std::memcmp((void*)p, default_free_gpr_mask_pattern.data(),
-                            default_free_gpr_mask_pattern.size()) == 0) {
-                // The STR W8, [X19,#0x210] is at match + 6 (skip BL tail + MOV).
-                default_free_gpr_mask_addr = p + 6;
-            }
-        }
+    auto translateInsn = findTranslateInsn();
+    auto transactionResultSize = findTransactionResultSize();
+    auto decodeOpcode = findDecodeOpcode();
+    auto defaultFreeGPRMask = findDefaultFreeGPRMask();
+    auto freeTemporaryGpr = findFreeTemporaryGpr();
 
-        if (free_temporary_gpr_addr == 0) {
-            if (std::memcmp((void*)p, free_temporary_gpr_pattern.data(),
-                            free_temporary_gpr_pattern.size()) == 0) {
-                // The match is the function entry; patched to RET later.
-                free_temporary_gpr_addr = p;
-            }
-        }
+    if (!translateInsn || !transactionResultSize || !decodeOpcode || !defaultFreeGPRMask ||
+        !freeTemporaryGpr)
+        return false;
 
-        if (trans_insn_addr != 0 && transaction_result_size_addr != 0 &&
-            decode_opcode_addr != 0 && default_free_gpr_mask_addr != 0 &&
-            free_temporary_gpr_addr != 0) {
-            break;
-        }
-    }
+    uintptr_t aot_base = g_rosetta_aot.base_addr;
+    g_rosetta_aot.translate_insn_addr = aot_base + *translateInsn;
+    g_rosetta_aot.transaction_result_size_addr = aot_base + *transactionResultSize;
+    g_rosetta_aot.decode_opcode_addr = aot_base + *decodeOpcode;
+    g_rosetta_aot.default_free_gpr_mask_addr = aot_base + *defaultFreeGPRMask;
+    g_rosetta_aot.free_temporary_gpr_addr = aot_base + *freeTemporaryGpr;
 
-    return trans_insn_addr != 0 && transaction_result_size_addr != 0 && decode_opcode_addr != 0 &&
-           default_free_gpr_mask_addr != 0 && free_temporary_gpr_addr != 0;
+    return true;
 }
 
 bool load_rosetta_aot() {
@@ -245,11 +210,7 @@ bool load_rosetta_aot() {
     }
     g_rosetta_aot.base_addr = reinterpret_cast<uintptr_t>(dl_info.dli_fbase);
 
-    return find_patterns(g_rosetta_aot.base_addr, g_rosetta_aot.translate_insn_addr,
-                         g_rosetta_aot.transaction_result_size_addr,
-                         g_rosetta_aot.decode_opcode_addr,
-                         g_rosetta_aot.default_free_gpr_mask_addr,
-                         g_rosetta_aot.free_temporary_gpr_addr);
+    return find_patterns();
 }
 
 /*

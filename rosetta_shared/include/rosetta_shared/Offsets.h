@@ -2,7 +2,9 @@
 
 #include <cstdint>
 
-// rosetta_loader writes these offsets into the library at runtime
+// Layout shared between rosetta_loader (which writes these offsets into
+// libRosettaRuntime at runtime) and rosetta_runtime (which reads them). Keep the
+// layout in sync — the static_assert guards the ABI.
 struct Offsets {
     uint64_t init_library_rva;  // used to calculate base address of libRosettaRuntime from exports
                                 // address
@@ -16,5 +18,3 @@ struct Offsets {
 };
 
 static_assert(sizeof(Offsets) == 0x40, "Invalid size for Offsets");
-
-extern Offsets kOffsets;

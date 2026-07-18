@@ -62,5 +62,5 @@ target_compile_definitions(libRuntimeRosettax87 PRIVATE
     "ROSETTA_RUNTIME=1"
 )
 
-target_link_libraries(libRuntimeRosettax87 PRIVATE rosetta_core_runtime)
+target_link_libraries(libRuntimeRosettax87 PRIVATE rosetta_core_runtime rosetta_shared)
 add_dependencies(libRuntimeRosettax87 rosetta_core_runtime)

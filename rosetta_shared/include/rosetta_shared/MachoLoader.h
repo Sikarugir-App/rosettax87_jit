@@ -1,11 +1,29 @@
-#include "macho_loader.hpp"
+#pragma once
 
 #include <mach-o/loader.h>
 #include <mach/vm_page_size.h>
 
+#include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <functional>
+#include <vector>
 
-auto MachoLoader::open(std::filesystem::path const& path) -> bool {
+// Header-only Mach-O reader: loads a Mach-O image from disk into buffer_ and
+// exposes segment/section lookup. Shared by rosetta_loader and available to
+// aotinvoke.
+struct MachoLoader {
+    auto open(std::filesystem::path const& path) -> bool;
+    auto machHeader() const -> mach_header_64*;
+    auto imageSize() const -> size_t;
+    auto getSection(const char* segment, const char* section) -> section_64*;
+    auto getSegment(const char* segment) -> segment_command_64*;
+    auto forEachSegment(std::function<void(segment_command_64* segm)>) -> void;
+
+    std::vector<uint8_t> buffer_;
+};
+
+inline auto MachoLoader::open(std::filesystem::path const& path) -> bool {
     if (!std::filesystem::exists(path)) {
         return false;
     }
@@ -22,11 +40,11 @@ auto MachoLoader::open(std::filesystem::path const& path) -> bool {
     return buffer_.empty() == false;
 }
 
-auto MachoLoader::machHeader() const -> mach_header_64* {
+inline auto MachoLoader::machHeader() const -> mach_header_64* {
     return (mach_header_64*)buffer_.data();
 }
 
-auto MachoLoader::imageSize() const -> size_t {
+inline auto MachoLoader::imageSize() const -> size_t {
     auto header = machHeader();
 
     size_t imageSize = 0;
@@ -50,7 +68,7 @@ auto MachoLoader::imageSize() const -> size_t {
     return imageSize;
 }
 
-auto MachoLoader::getSection(const char* segment, const char* section) -> section_64* {
+inline auto MachoLoader::getSection(const char* segment, const char* section) -> section_64* {
     auto header = machHeader();
 
     load_command* cmd = (load_command*)(header + 1);
@@ -78,7 +96,7 @@ auto MachoLoader::getSection(const char* segment, const char* section) -> sectio
     return nullptr;
 }
 
-auto MachoLoader::getSegment(const char* segment) -> segment_command_64* {
+inline auto MachoLoader::getSegment(const char* segment) -> segment_command_64* {
     auto header = machHeader();
 
     load_command* cmd = (load_command*)(header + 1);
@@ -98,7 +116,8 @@ auto MachoLoader::getSegment(const char* segment) -> segment_command_64* {
     return nullptr;
 }
 
-auto MachoLoader::forEachSegment(std::function<void(segment_command_64* segm)> callback) -> void {
+inline auto MachoLoader::forEachSegment(std::function<void(segment_command_64* segm)> callback)
+    -> void {
     auto header = machHeader();
 
     load_command* cmd = (load_command*)(header + 1);

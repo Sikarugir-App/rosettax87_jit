@@ -6,7 +6,7 @@
 #include <sys/syscall.h>
 
 #include "Export.h"
-#include "Offsets.h"
+#include "RuntimeOffsets.h"
 #include "Log.h"
 #include "SIMDGuard.h"
 #include "X87State.h"

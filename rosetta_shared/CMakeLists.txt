@@ -1,0 +1,3 @@
+add_library(rosetta_shared INTERFACE)
+target_include_directories(rosetta_shared INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(rosetta_shared INTERFACE cxx_std_23)

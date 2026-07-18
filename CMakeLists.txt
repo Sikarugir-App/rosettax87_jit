@@ -10,6 +10,7 @@ foreach(cfg IN ITEMS Debug Release RelWithDebInfo MinSizeRel)
 endforeach()
 
 add_subdirectory(rosetta_config)
+add_subdirectory(rosetta_shared)
 add_subdirectory(rosetta_core)
 add_subdirectory(rosetta_runtime)
 add_subdirectory(rosetta_loader)
