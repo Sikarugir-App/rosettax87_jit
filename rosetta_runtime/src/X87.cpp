@@ -1180,7 +1180,9 @@ void x87_frndint(X87State* state) {
 }
 
 void x87_fscale(X87State* state) {
-    SIMDGuard simdGuard;
+    // Inlined openlibm_scalbn materializes constants in d4/d5 (guest XMM4/5),
+    // so the q0-q3 guard is not enough here.
+    SIMDGuardFull simdGuard;
 
     LOG(1, "x87_fscale\n", 12);
 
