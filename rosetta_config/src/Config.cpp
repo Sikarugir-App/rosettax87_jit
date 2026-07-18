@@ -129,14 +129,14 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_EXTENDED_FPR_SCRATCH"))
         cfg.extended_fpr_scratch = (*v == '1') ? 1 : 0;
 
-    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_CONST_PROMOTE"))
-        cfg.disable_const_promote = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_CONST_PROMOTE"))
+        cfg.const_promote = (*v == '1') ? 1 : 0;
 
     if (const char* v = std::getenv("ROSETTA_FORCE_CPU_MODE32"))
         cfg.force_cpu_mode32 = (*v == '1') ? 1 : 0;
 
-    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_F32_NARROW"))
-        cfg.disable_f32_narrow = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_F32_NARROW"))
+        cfg.f32_narrow = (*v == '1') ? 1 : 0;
 
     if (const char* v = std::getenv("ROSETTA_X87_F32_ARITH"))
         cfg.f32_arith = (*v == '1') ? 1 : 0;

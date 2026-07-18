@@ -58,10 +58,12 @@ All flags are set via environment variables and read at runtime.
 | `ROSETTA_X87_TRANSPARENT_INT=1` | Inline simple register-form `mov`/`lea`/`movzx`/`movsx` into IR runs (implies `ROSETTA_X87_RUN_BRIDGE`) |
 | `ROSETTA_X87_BRIDGE_CARRY=1` | Carry the base-address cache + rounding-control GPRs across bridged gaps (implies `ROSETTA_X87_RUN_BRIDGE`) |
 | `ROSETTA_X87_RUNTIME_KEEPALIVE=1` | Keep the pinned x87 cache GPRs alive across runtime-routine transcendentals (`fsin`/`fcos`/`fptan`/…) instead of breaking the run; independent of `ROSETTA_X87_RUN_BRIDGE` |
-| `ROSETTA_X87_F32_ARITH=1` | Keep f32-sourced arithmetic chains in f32 registers instead of widening intermediates to f64 (not bit-exact vs real x87 f64 intermediates) |
+| `ROSETTA_X87_CONST_PROMOTE=1` | Promote FP loads from read-only absolute addresses to translate-time constants |
+| `ROSETTA_X87_F32_NARROW=1` | Rewrite `narrow(op_f64(widen, widen))` sandwiches to single f32 (S-register) operations |
+| `ROSETTA_X87_F32_ARITH=1` | Keep f32-sourced arithmetic chains in f32 registers instead of widening intermediates to f64 (not bit-exact vs real x87 f64 intermediates; requires `ROSETTA_X87_F32_NARROW`) |
 | `ROSETTA_X87_FAST_RECIP_DIV=1` | Rewrite FDIV by *any* normal constant as FMUL by its reciprocal (up to 1 ulp off; exact power-of-two divisors are always rewritten regardless of this flag) |
 
-Flags in this table that trade fidelity for speed (`FAST_ROUND`, `F32_ARITH`, `FAST_RECIP_DIV`) are opt-in and default to off.
+Flags in this table that trade fidelity for speed (`FAST_ROUND`, `F32_ARITH`, `FAST_RECIP_DIV`) are opt-in and default to off. `CONST_PROMOTE` and `F32_NARROW` are also opt-in: they have caused rare misbehavior in some real workloads, so they default to off.
 
 ### Debugging & Troubleshooting
 
@@ -72,8 +74,6 @@ These flags are primarily useful for narrowing down bugs by selectively disablin
 | `ROSETTA_X87_DISABLE_CACHE=1` | Disable x87 translation cache |
 | `ROSETTA_X87_DISABLE_DEFERRED_FXCH=1` | Disable deferred FXCH optimization |
 | `ROSETTA_X87_DISABLE_IR=1` | Disable IR optimization pipeline |
-| `ROSETTA_X87_DISABLE_CONST_PROMOTE=1` | Don't promote FP loads from read-only absolute addresses to translate-time constants |
-| `ROSETTA_X87_DISABLE_F32_NARROW=1` | Don't rewrite `narrow(op_f64(widen, widen))` sandwiches to single f32 (S-register) operations |
 | `ROSETTA_X87_DISABLE_ADDR_FOLD=1` | Don't fold `[base + disp]` displacements into LDR/STR addressing modes in the singular/fusion translators (materialize the full address instead) |
 | `ROSETTA_X87_DISABLE_ALL_OPS=1` | Disable all translated opcodes (fall back to Rosetta default) |
 | `ROSETTA_X87_DISABLE_ALL_FUSIONS=1` | Disable all instruction fusions |

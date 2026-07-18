@@ -95,9 +95,9 @@ struct RosettaConfig {
     uint8_t  disable_deferred_fxch;  // ROSETTA_X87_DISABLE_DEFERRED_FXCH=1 — disable OPT-G
     uint8_t  disable_x87_ir;         // ROSETTA_X87_DISABLE_IR=1 — disable IR optimization pipeline
     uint8_t  extended_fpr_scratch;   // ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 — expand FPR scratch pool from 8 (V24–V31) to 16 (V16–V31)
-    uint8_t  disable_const_promote;  // ROSETTA_X87_DISABLE_CONST_PROMOTE=1 — don't promote loads from read-only absolute addresses to constants
+    uint8_t  const_promote;          // ROSETTA_X87_CONST_PROMOTE=1 — promote loads from read-only absolute addresses to constants (opt-in)
     uint8_t  force_cpu_mode32;       // ROSETTA_FORCE_CPU_MODE32=1 — force the decoder into 32-bit mode (test-only; lets aotinvoke reach legacy opcodes like ARPL)
-    uint8_t  disable_f32_narrow;     // ROSETTA_X87_DISABLE_F32_NARROW=1 — don't rewrite narrow(op_f64(widen,widen)) to S-form arithmetic
+    uint8_t  f32_narrow;             // ROSETTA_X87_F32_NARROW=1 — rewrite narrow(op_f64(widen,widen)) to S-form arithmetic (opt-in)
     uint8_t  f32_arith;              // ROSETTA_X87_F32_ARITH=1 — keep f32-sourced arithmetic CHAINS in f32 (not bit-exact vs f64 intermediates; opt-in)
     uint8_t  fast_recip_div;         // ROSETTA_X87_FAST_RECIP_DIV=1 — FDiv by ANY normal constant → FMul by reciprocal (up to 1 ulp off; opt-in)
     uint8_t  log_ir_declines;        // ROSETTA_X87_LOG_IR_DECLINES=1 — print address + CompileError for every run the IR pipeline declines

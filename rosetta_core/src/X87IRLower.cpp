@@ -2016,7 +2016,7 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
     // which is always injected into a live guest process; elsewhere
     // range_is_readonly() is stubbed to false, so the flag is inert.
     const bool const_promote =
-        !(g_rosetta_config && g_rosetta_config->disable_const_promote);
+        g_rosetta_config && g_rosetta_config->const_promote;
 
     // NOTE (2026-07-11): a pressure-decline PREFIX RETRY (halve run_length on
     // kFprPressure/kGprPressure and lower the fitting prefix) was implemented

@@ -684,7 +684,7 @@ void optimize(Context& ctx) {
     pass_dse(ctx);
     pass_fneg_fold(ctx);
     const bool f32_narrow_on =
-        !(g_rosetta_config && g_rosetta_config->disable_f32_narrow);
+        g_rosetta_config && g_rosetta_config->f32_narrow;
     const bool f32_chain_on =
         f32_narrow_on && g_rosetta_config && g_rosetta_config->f32_arith;
     if (f32_chain_on) {
