@@ -715,8 +715,8 @@ static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
                 p.src = src.reg.reg.index();
                 node_op = Op::GuestMovRR;
             } else {
-                // Immediate-like kinds share the payload offset (see
-                // try_fuse_fcom_test); kind Immediate may carry a fixup.
+                // Immediate-like kinds share the payload offset (verified
+                // against Rosetta's IR); kind Immediate may carry a fixup.
                 if (src.kind == IROperandKind::Immediate && src.imm.mem_flags != 0)
                     return false;
                 if (dst64) return false;

@@ -96,7 +96,6 @@ struct RosettaConfig {
     uint8_t  disable_x87_ir;         // ROSETTA_X87_DISABLE_IR=1 — disable IR optimization pipeline
     uint8_t  extended_fpr_scratch;   // ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 — expand FPR scratch pool from 8 (V24–V31) to 16 (V16–V31)
     uint8_t  disable_const_promote;  // ROSETTA_X87_DISABLE_CONST_PROMOTE=1 — don't promote loads from read-only absolute addresses to constants
-    uint8_t  fuse_fcom_test;         // ROSETTA_X87_FUSE_FCOM_TEST=1 — fuse fcom+fnstsw+test into FCMP+CSET+TST (leaves AX/status-word CC stale; opt-in)
     uint8_t  force_cpu_mode32;       // ROSETTA_FORCE_CPU_MODE32=1 — force the decoder into 32-bit mode (test-only; lets aotinvoke reach legacy opcodes like ARPL)
     uint8_t  disable_f32_narrow;     // ROSETTA_X87_DISABLE_F32_NARROW=1 — don't rewrite narrow(op_f64(widen,widen)) to S-form arithmetic
     uint8_t  f32_arith;              // ROSETTA_X87_F32_ARITH=1 — keep f32-sourced arithmetic CHAINS in f32 (not bit-exact vs f64 intermediates; opt-in)

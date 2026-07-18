@@ -96,7 +96,7 @@ static const char* operand_form_kind(const IROperand& op) {
         case IROperandKind::MemRef:
         case IROperandKind::AbsMem:   return "m";
         // Immediates arrive in more than one immediate-like kind; the payload
-        // sits at the same offset in all of them (see try_fuse_fcom_test).
+        // sits at the same offset in all of them (verified against Rosetta's IR).
         default: return "i";
     }
 }
@@ -236,14 +236,11 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
         // lowering epilogue, so mid-run entry after a deferred FXCH or partial
         // per-instruction translation still gets IR lowering.
         if (!ir_disabled && cache.active() && cache.run_remaining >= kX87IRMinRun) {
-            int tail_consumed = 0;  // non-x87 instrs consumed past the run
-                                    // (the TEST of a fcom+fnstsw+test fusion)
             X87IR::CompileError error;
             const int ir_consumed =
                 X87IR::compile_run(translation_result, instr_array, num_instrs, insn_idx,
-                                   cache.run_remaining, &tail_consumed, &error);
+                                   cache.run_remaining, &error);
             if (ir_consumed > 0) {
-                // Tick only the x87 run; the consumed tail is not part of it.
                 for (int i = 0; i < ir_consumed; i++)
                     cache.tick();
                 if (cache.active()) {
@@ -254,7 +251,7 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                 translation_result->free_fpr_mask =
                     translation_result->_unoccupied_temporary_fprs_for_xmm_scalars;
                 translation_result->_pinned_temporary_scalars = 0;
-                return insn_idx + ir_consumed + tail_consumed;
+                return insn_idx + ir_consumed;
             } else if (g_rosetta_config && g_rosetta_config->log_ir_declines) {
                 uintptr_t address = translation_result->ir_module_data->text_vmaddr_range + cur_instr->pc;
                 CORE_LOG("X87IR::compile_run error=%d at %lx", static_cast<int>(error), address);

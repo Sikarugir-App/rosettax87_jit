@@ -376,16 +376,6 @@ int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
         int gap = 0;
         int64_t j = i;
         while (j < num_instrs && gap < kMaxBridgeGap &&
-               // fnstsw-adjacency guard (2026-07-17, prerequisite for the
-               // test family audit): a test IMMEDIATELY following fstsw is
-               // the fcom+fnstsw+test fusion's tail — the IR path consumes
-               // it via tail_consumed WITHOUT ticking the run, so counting
-               // it here as a gap op would desync run_remaining and break
-               // the "a run never ends on a bridged instruction" invariant
-               // (deferred TOP/tag discard hazard). Every other test shape
-               // is priced by demand_test like any gap op.
-               !(instr_array[j].opcode() == Opcode::kOpcodeName_test && j > 0 &&
-                 instr_array[j - 1].opcode() == Opcode::kOpcodeName_fstsw) &&
                gap_gpr_demand(&instr_array[j]).value_or(kMaxBridgeDemand + 1) <=
                    kMaxBridgeDemand) {
             j++;

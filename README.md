@@ -57,11 +57,10 @@ All flags are set via environment variables and read at runtime.
 | `ROSETTA_X87_RUN_BRIDGE=1` | Keep an active run's pinned cache GPRs across run-transparent integer instructions (`mov`/`lea`/…) instead of breaking the run |
 | `ROSETTA_X87_TRANSPARENT_INT=1` | Inline simple register-form `mov`/`lea`/`movzx`/`movsx` into IR runs (requires `ROSETTA_X87_RUN_BRIDGE`) |
 | `ROSETTA_X87_BRIDGE_CARRY=1` | Carry the base-address cache + rounding-control GPRs across bridged gaps (implies `ROSETTA_X87_RUN_BRIDGE`) |
-| `ROSETTA_X87_FUSE_FCOM_TEST=1` | Fuse `fcom`+`fnstsw ax`+`test` into FCMP+CSET+TST (~3× faster compares; leaves AX and status-word CC bits stale after the fused pattern) |
 | `ROSETTA_X87_F32_ARITH=1` | Keep f32-sourced arithmetic chains in f32 registers instead of widening intermediates to f64 (not bit-exact vs real x87 f64 intermediates) |
 | `ROSETTA_X87_FAST_RECIP_DIV=1` | Rewrite FDIV by *any* normal constant as FMUL by its reciprocal (up to 1 ulp off; exact power-of-two divisors are always rewritten regardless of this flag) |
 
-Flags in this table that trade fidelity for speed (`FAST_ROUND`, `FUSE_FCOM_TEST`, `F32_ARITH`, `FAST_RECIP_DIV`) are opt-in and default to off.
+Flags in this table that trade fidelity for speed (`FAST_ROUND`, `F32_ARITH`, `FAST_RECIP_DIV`) are opt-in and default to off.
 
 ### Debugging & Troubleshooting
 

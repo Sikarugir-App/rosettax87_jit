@@ -9,7 +9,7 @@
 #                          opt-in perf flags: EXTENDED_FPR_SCRATCH, RUN_BRIDGE,
 #                          TRANSPARENT_INT, BRIDGE_CARRY, F32_ARITH (see
 #                          OPTIMIZED_FLAGS below). Lossy/unsafe flags (FAST_ROUND,
-#                          FAST_RECIP_DIV, FUSE_FCOM_TEST) are intentionally excluded.
+#                          FAST_RECIP_DIV) are intentionally excluded.
 #
 # Usage:
 #   bash scripts/run_benchmarks.sh              # build + run
@@ -59,7 +59,7 @@ ALL_BENCHMARKS=(
 
 # Opt-in performance flags enabled for the "Loader optimized" (JIT) column.
 # Correctness-safe set plus F32_ARITH (game profile is f32-dominant). Lossy/unsafe
-# flags (FAST_ROUND, FAST_RECIP_DIV, FUSE_FCOM_TEST) are intentionally excluded;
+# flags (FAST_ROUND, FAST_RECIP_DIV) are intentionally excluded;
 # FAST_ROUND has its own comparison section at the bottom of this script.
 OPTIMIZED_FLAGS=(
     ROSETTA_X87_EXTENDED_FPR_SCRATCH=1

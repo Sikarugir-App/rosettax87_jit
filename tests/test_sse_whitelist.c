@@ -2,9 +2,9 @@
  * test_sse_whitelist.c — flag-neutral SSE instructions in the post-run
  * EFLAGS deadness scans.
  *
- * nzcv_dead_after_run / no_parity_reader_after may walk across SSE/SSE2
- * data movement (movss, movsd, movaps, ...) and conversions when scanning
- * for the instruction that redefines EFLAGS after an x87 compare run.
+ * nzcv_dead_after_run may walk across SSE/SSE2 data movement (movss, movsd,
+ * movaps, ...) and conversions when scanning for the instruction that
+ * redefines EFLAGS after an x87 compare run.
  *
  * 1. Pre-run guest flags consumed after the run through SSE moves (setcc):
  *    the scan must stay conservative — the NZCV save/restore keeps the

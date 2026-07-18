@@ -32,11 +32,10 @@
 //   - segment forms (mov_segment/pop_segment/...): fixed-allocate pool
 //     slots 0/1.
 //   - string/rep ops, cmpxchg family: fixed slots / runtime BLs.
-// test left this list 2026-07-17 (user decision): the fcom+fnstsw+test
-// fusion consumes an fstsw-adjacent test as an untick'd tail, so lookahead
-// carries an fnstsw-adjacency guard (X87Cache.cpp) that never counts that
-// shape as a gap op — closing the run_remaining desync hazard. All other
-// test shapes bridge via the audited test family below.
+// test left this list 2026-07-17 (user decision) and bridges via the audited
+// test family below — every shape, since the fcom+fnstsw+test fusion (whose
+// untick'd tail consumption once forced an fnstsw-adjacency guard in
+// lookahead) was removed 2026-07-18.
 //
 // Execution constraints: this runs inside the lazy-translation hook on the
 // guest thread with guest SIMD state live in the host vector registers — no

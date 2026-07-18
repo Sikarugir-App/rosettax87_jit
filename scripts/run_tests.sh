@@ -71,7 +71,6 @@ ALL_TESTS=(
     test_addr_fold
     test_const_promote
     test_f32_raw
-    test_fuse_fcom_test
     test_decoder_fcomp_st
     test_decoder_arpl
     test_ir_gpr_pressure
