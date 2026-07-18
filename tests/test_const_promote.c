@@ -17,6 +17,7 @@
  *
  * Build: clang -arch x86_64 -O0 -g -Wl,-pagezero_size,0x4000 -o ...
  */
+#include <mach/mach.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -35,14 +36,17 @@ static void check(const char *name, double got, double expected) {
     }
 }
 
-/* RO block at 0x40000000 (16 KB), RW block at 0x40004000. */
-#define RO_BASE 0x40000000UL
-#define RW_BASE 0x40004000UL
+/* RO block at 0x40000000 (16 KB), RW block at 0x40004000, and a block at
+ * 0x40008000 that is read-only at translation time but flips back to
+ * writable afterwards (max protection stays RW). */
+#define RO_BASE   0x40000000UL
+#define RW_BASE   0x40004000UL
+#define FLIP_BASE 0x40008000UL
 
 static const double kPi = 3.141592653589793;
 
 static int setup_pages(void) {
-    void *p = mmap((void *)RO_BASE, 0x8000, PROT_READ | PROT_WRITE,
+    void *p = mmap((void *)RO_BASE, 0xC000, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
     if (p != (void *)RO_BASE) {
         printf("FAIL  mmap at %#lx returned %p\n", RO_BASE, p);
@@ -65,8 +69,13 @@ static int setup_pages(void) {
                                        0x00, 0x00, 0x80, 0xFF, 0x7F};
     memcpy((void *)(RO_BASE + 56), kInf80, 10);
     *(double *)RW_BASE = 5.0;
-    if (mprotect((void *)RO_BASE, 0x4000, PROT_READ) != 0) {
-        printf("FAIL  mprotect\n");
+    *(double *)FLIP_BASE = 5.0;
+    /* Promotion requires a page that can NEVER become writable, so lower the
+     * MAX protection (mprotect alone leaves max at RW and must not promote). */
+    if (vm_protect(mach_task_self(), RO_BASE, 0x4000, TRUE /*set_maximum*/,
+                   VM_PROT_READ) != KERN_SUCCESS ||
+        mprotect((void *)RO_BASE, 0x4000, PROT_READ) != 0) {
+        printf("FAIL  vm_protect/mprotect\n");
         return 0;
     }
     return 1;
@@ -150,6 +159,18 @@ static double load_rw_m80(void) {
     return out;
 }
 
+/* fldl [FLIP] — page is read-only NOW but its max protection allows write,
+ * so it can be mprotect'ed writable later: must NOT be promoted. */
+static double load_flip(void) {
+    double out;
+    __asm__ volatile(
+        ".byte 0xDD,0x04,0x25,0x00,0x80,0x00,0x40\n\t"  /* fldl [FLIP+0] */
+        "faddl %1\n\t"
+        "fstpl %0\n"
+        : "=m"(out) : "m"((double){1.0}));
+    return out;
+}
+
 /* fldl [RW] — page is writable: must NOT be promoted, must see live value. */
 static double load_rw(void) {
     double out;
@@ -192,6 +213,15 @@ int main(void) {
 
     /* Writable page: change the value between calls — a wrong promotion
      * would freeze the first value into the translated code. */
+    /* Read-only at translation time, but max protection still allows write:
+     * a promotion here would freeze the value into the translated code and
+     * miss the post-flip modification (the "stale constant" bug). */
+    mprotect((void *)FLIP_BASE, 0x4000, PROT_READ);
+    check("flip page, RO at translation", load_flip(), 6.0);
+    mprotect((void *)FLIP_BASE, 0x4000, PROT_READ | PROT_WRITE);
+    *(volatile double *)FLIP_BASE = 42.0;
+    check("flip page, after RW flip + modification", load_flip(), 43.0);
+
     check("RW load, first value", load_rw(), 6.0);
     *(volatile double *)RW_BASE = 42.0;
     check("RW load, after modification", load_rw(), 43.0);

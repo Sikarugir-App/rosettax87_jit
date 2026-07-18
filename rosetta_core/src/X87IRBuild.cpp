@@ -44,7 +44,13 @@ static bool const_promote_addr(const IROperand* op, uint64_t* addr_out) {
 }
 
 #if defined(ROSETTA_RUNTIME)
-// True if [addr, addr+bytes) lies in a mapped, readable, non-writable region.
+// True if [addr, addr+bytes) lies in a mapped, readable region that can
+// NEVER become writable: both protection and max_protection must lack
+// VM_PROT_WRITE. Current protection alone is not enough — a page that is
+// read-only at translation time can be mprotect'ed writable later (asset
+// streaming, Wine's VirtualProtect, unpackers), which would leave the
+// promoted value stale in translated code. mprotect can never exceed
+// max_protection, so a max-RO verdict holds for the mapping's lifetime.
 // Queried via proc_info(PROC_PIDREGIONINFO); the last positive region is
 // cached (translation is single-threaded).
 static bool range_is_readonly(uint64_t addr, uint64_t bytes) {
@@ -69,6 +75,7 @@ static bool range_is_readonly(uint64_t addr, uint64_t bytes) {
     // addr is unmapped — so containment must be checked explicitly.
     if (addr < ri.address || addr + bytes > ri.address + ri.size) return false;
     if ((ri.protection & 0x2 /*VM_PROT_WRITE*/) != 0) return false;
+    if ((ri.max_protection & 0x2 /*VM_PROT_WRITE*/) != 0) return false;
     if ((ri.protection & 0x1 /*VM_PROT_READ*/) == 0) return false;
     cached_lo = ri.address;
     cached_hi = ri.address + ri.size;
