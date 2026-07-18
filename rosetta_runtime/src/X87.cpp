@@ -252,8 +252,9 @@ uint128_t x87_fbstp(X87State* state) {
     auto st0 = state->getSt(0);
     state->pop();
 
-    // convert double to BCD
-    uint8_t bcd[10] = {0};  // Initialize all bytes to 0
+    // convert double to BCD (16 bytes so the uint128_t return can be read
+    // straight out of it; only the first 10 are BCD payload)
+    uint8_t bcd[16] = {0};  // Initialize all bytes to 0
 
     // Handle sign
     bool is_negative = signbit(st0);
@@ -302,10 +303,10 @@ uint128_t x87_fbstp(X87State* state) {
         }
     }
 
-    return {
-        .low = reinterpret_cast<uint64_t*>(bcd)[0],
-        .high = reinterpret_cast<uint64_t*>(bcd)[1],
-    };
+    uint128_t result;
+    memcpy(&result.low, bcd, 8);
+    memcpy(&result.high, bcd + 8, 8);
+    return result;
 }
 
 void x87_fchs(X87State* state) {
@@ -717,6 +718,19 @@ void x87_fincstp(X87State* state) {
     state->statusWord |= (top << 11);                      // Set new TOP value
 }
 
+// Round per the control word's RC field. FIST/FISTT range checks must be
+// applied to the ROUNDED value: a fractional value just past the integer
+// limit (e.g. 32767.25 → 32767) rounds back into range, while the exact
+// limit (e.g. 2147483647.0 for i32) is itself storable.
+static double x87_round_by_rc(double value, uint16_t controlWord) {
+    switch (controlWord & X87ControlWord::kRoundingControlMask) {
+        case X87ControlWord::kRoundDown:   return std::floor(value);
+        case X87ControlWord::kRoundUp:     return std::ceil(value);
+        case X87ControlWord::kRoundToZero: return std::trunc(value);
+        default:                           return std::nearbyint(value);
+    }
+}
+
 X87ResultStatusWord x87_fist_i16(X87State const* state) {
     SIMDGuard simdGuard;
 
@@ -724,44 +738,16 @@ X87ResultStatusWord x87_fist_i16(X87State const* state) {
     auto [value, statusWord] = state->getStConst(0);
     X87ResultStatusWord result{0, statusWord};
 
-    // Special case: value > INT16_MAX or infinity (changed from >=)
-    if (value > static_cast<double>(INT16_MAX)) {
+    const double rounded = x87_round_by_rc(value, state->controlWord);
+
+    // Out of range, infinity, or NaN (fails both comparisons) → indefinite.
+    if (!(rounded >= -32768.0 && rounded <= 32767.0)) {
         result.signedResult = INT16_MIN;  // 0x8000
         result.statusWord |= X87StatusWordFlag::kConditionCode1;
         return result;
     }
 
-    // Special case: value <= INT16_MIN
-    if (value <= static_cast<double>(INT16_MIN)) {
-        result.signedResult = INT16_MIN;
-        result.statusWord |= X87StatusWordFlag::kConditionCode1;
-        return result;
-    }
-
-    // Normal case
-    auto round_bits = state->controlWord & X87ControlWord::kRoundingControlMask;
-
-    switch (round_bits) {
-        case X87ControlWord::kRoundToNearest: {
-            result.signedResult = static_cast<int16_t>(std::nearbyint(value));
-        } break;
-
-        case X87ControlWord::kRoundDown: {
-            result.signedResult = static_cast<int16_t>(std::floor(value));
-            return result;
-        } break;
-
-        case X87ControlWord::kRoundUp: {
-            result.signedResult = static_cast<int16_t>(std::ceil(value));
-            return result;
-        } break;
-
-        case X87ControlWord::kRoundToZero: {
-            result.signedResult = static_cast<int16_t>(value);
-            return result;
-        } break;
-    }
-
+    result.signedResult = static_cast<int16_t>(rounded);
     return result;
 }
 
@@ -772,43 +758,16 @@ X87ResultStatusWord x87_fist_i32(X87State const* state) {
     auto [value, statusWord] = state->getStConst(0);
     X87ResultStatusWord result{0, statusWord};
 
-    // Special case: value >= INT32_MAX or infinity
-    if (value >= static_cast<double>(INT32_MAX)) {
+    const double rounded = x87_round_by_rc(value, state->controlWord);
+
+    // Out of range, infinity, or NaN (fails both comparisons) → indefinite.
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0)) {
         result.signedResult = INT32_MIN;  // 0x80000000
         result.statusWord |= X87StatusWordFlag::kConditionCode1;
         return result;
     }
 
-    // Special case: value <= INT32_MIN
-    if (value <= static_cast<double>(INT32_MIN)) {
-        result.signedResult = INT32_MIN;
-        result.statusWord |= X87StatusWordFlag::kConditionCode1;
-        return result;
-    }
-
-    auto round_bits = state->controlWord & X87ControlWord::kRoundingControlMask;
-
-    switch (round_bits) {
-        case X87ControlWord::kRoundToNearest: {
-            result.signedResult = static_cast<int32_t>(std::nearbyint(value));
-        } break;
-
-        case X87ControlWord::kRoundDown: {
-            result.signedResult = static_cast<int32_t>(std::floor(value));
-            return result;
-        } break;
-
-        case X87ControlWord::kRoundUp: {
-            result.signedResult = static_cast<int32_t>(std::ceil(value));
-            return result;
-        } break;
-
-        case X87ControlWord::kRoundToZero: {
-            result.signedResult = static_cast<int32_t>(value);
-            return result;
-        } break;
-    }
-
+    result.signedResult = static_cast<int32_t>(rounded);
     return result;
 }
 
@@ -821,45 +780,17 @@ X87ResultStatusWord x87_fist_i64(X87State const* state) {
 
     X87ResultStatusWord result{0, statusWord};
 
-    // Special case: value >= INT64_MAX or infinity
-    if (value >= static_cast<double>(INT64_MAX)) {
+    const double rounded = x87_round_by_rc(value, state->controlWord);
+
+    // Out of range, infinity, or NaN (fails both comparisons) → indefinite.
+    // 2^63 itself is out of range; INT64_MIN (-2^63) is exactly storable.
+    if (!(rounded >= -9223372036854775808.0 && rounded < 9223372036854775808.0)) {
         result.signedResult = INT64_MIN;  // 0x8000000000000000
         result.statusWord |= X87StatusWordFlag::kConditionCode1;
         return result;
     }
 
-    // Special case: value <= INT64_MIN
-    if (value <= static_cast<double>(INT64_MIN)) {
-        result.signedResult = INT64_MIN;
-        result.statusWord |= X87StatusWordFlag::kConditionCode1;
-        return result;
-    }
-
-    // Normal case
-
-    auto round_bits = state->controlWord & X87ControlWord::kRoundingControlMask;
-
-    switch (round_bits) {
-        case X87ControlWord::kRoundToNearest: {
-            result.signedResult = static_cast<int64_t>(std::nearbyint(value));
-        } break;
-
-        case X87ControlWord::kRoundDown: {
-            result.signedResult = static_cast<int64_t>(std::floor(value));
-            return result;
-        } break;
-
-        case X87ControlWord::kRoundUp: {
-            result.signedResult = static_cast<int64_t>(std::ceil(value));
-            return result;
-        } break;
-
-        case X87ControlWord::kRoundToZero: {
-            result.signedResult = static_cast<int64_t>(value);
-            return result;
-        } break;
-    }
-
+    result.signedResult = static_cast<int64_t>(rounded);
     return result;
 }
 
@@ -870,7 +801,16 @@ X87ResultStatusWord x87_fistt_i16(X87State const* state) {
     // Get value in ST(0)
     auto [value, statusWord] = state->getStConst(0);
 
-    return {.signedResult = static_cast<int16_t>(value), .statusWord = statusWord};
+    // Truncate, then range-check: out-of-range/Inf/NaN → indefinite (the
+    // bare cast would wrap through the wider integer instead).
+    const double t = std::trunc(value);
+    if (!(t >= -32768.0 && t <= 32767.0)) {
+        return {.signedResult = INT16_MIN,
+                .statusWord =
+                    static_cast<uint16_t>(statusWord | X87StatusWordFlag::kConditionCode1)};
+    }
+
+    return {.signedResult = static_cast<int16_t>(t), .statusWord = statusWord};
 }
 
 X87ResultStatusWord x87_fistt_i32(X87State const* state) {
@@ -880,7 +820,16 @@ X87ResultStatusWord x87_fistt_i32(X87State const* state) {
     // Get value in ST(0)
     auto [value, statusWord] = state->getStConst(0);
 
-    return {.signedResult = static_cast<int32_t>(value), .statusWord = statusWord};
+    // Truncate, then range-check: out-of-range/Inf/NaN → indefinite (the
+    // bare cast would saturate to INT32_MAX on AArch64 instead).
+    const double t = std::trunc(value);
+    if (!(t >= -2147483648.0 && t <= 2147483647.0)) {
+        return {.signedResult = INT32_MIN,
+                .statusWord =
+                    static_cast<uint16_t>(statusWord | X87StatusWordFlag::kConditionCode1)};
+    }
+
+    return {.signedResult = static_cast<int32_t>(t), .statusWord = statusWord};
 }
 
 X87ResultStatusWord x87_fistt_i64(X87State const* state) {
@@ -890,7 +839,16 @@ X87ResultStatusWord x87_fistt_i64(X87State const* state) {
     // Get value in ST(0)
     auto [value, statusWord] = state->getStConst(0);
 
-    return {.signedResult = static_cast<int64_t>(value), .statusWord = statusWord};
+    // Truncate, then range-check: out-of-range/Inf/NaN → indefinite (the
+    // bare cast would saturate to INT64_MAX on AArch64 instead).
+    const double t = std::trunc(value);
+    if (!(t >= -9223372036854775808.0 && t < 9223372036854775808.0)) {
+        return {.signedResult = INT64_MIN,
+                .statusWord =
+                    static_cast<uint16_t>(statusWord | X87StatusWordFlag::kConditionCode1)};
+    }
+
+    return {.signedResult = static_cast<int64_t>(t), .statusWord = statusWord};
 }
 
 void x87_fisub(X87State* state, int val) {
@@ -1110,30 +1068,35 @@ void x87_fprem(X87State* state) {
         return;
     }
 
-    // 3) Compute truncated quotient and remainder
-    double rawDiv = st0 / st1;
-    double truncDiv = std::trunc(rawDiv);  // Q = trunc(ST0/ST1)
-    int q = static_cast<int>(truncDiv);
-    double rem = openlibm_fmod(st0, st1);  // rem = ST0 - Q*ST1
+    // 3) Truncated remainder; fmod is exact (rem = ST0 - Q*ST1, Q integer)
+    double rem = openlibm_fmod(st0, st1);
     state->setSt(0, rem);
 
-    // 4) CC0, CC1, CC3 ← low bits of Q (Q2→CC0, Q0→CC1, Q1→CC3)
+    // 4) CC2 "incomplete" per spec only when the exponent gap D = E0-E1
+    //    reaches 64 (hardware reduces ≤63 bits per FPREM and software loops
+    //    on C2; rem < ST1 makes the next pass complete). The quotient bits
+    //    are undefined in the incomplete case.
+    int D = openlibm_ilogb(st0) - openlibm_ilogb(st1);
+    if (D >= 64) {
+        state->statusWord |= kConditionCode2;
+        return;
+    }
+
+    // 5) CC0, CC1, CC3 ← low 3 bits of |Q| (Q2→CC0, Q0→CC1, Q1→CC3).
+    //    Deriving Q from trunc(st0/st1) can be off by one when the rounded
+    //    division lands exactly on an integer; instead strip the high
+    //    quotient bits exactly with |st0| mod 8|st1|, leaving a quotient in
+    //    [0,8) that one rounded division recovers exactly.
+    const double a = std::fabs(st0), b = std::fabs(st1);
+    const double r8 =
+        (b <= std::numeric_limits<double>::max() / 8) ? openlibm_fmod(a, 8 * b) : a;
+    const int q = static_cast<int>(std::llrint((r8 - std::fabs(rem)) / b));
     if (q & 0x4)
         state->statusWord |= kConditionCode0;
     if (q & 0x1)
         state->statusWord |= kConditionCode1;
     if (q & 0x2)
         state->statusWord |= kConditionCode3;
-
-    // 5) CC2 “incomplete” if exponent gap > 0
-    //    D = E0 – E1; E = std::ilogb(x)
-    int e0 = openlibm_ilogb(st0);
-    int e1 = openlibm_ilogb(st1);
-    int D = e0 - e1;
-    if (D > 0) {
-        state->statusWord |= kConditionCode2;
-        // (optional) you could iterate: rem -= std::ldexp(trunc(rem/st1), D);
-    }
 }
 
 void x87_fprem1(X87State* state) {
@@ -1212,31 +1175,8 @@ void x87_frndint(X87State* state) {
 
     state->statusWord &= ~(X87StatusWordFlag::kConditionCode1);
 
-    // Get current value and round it
-    double value = state->getStFast(0);
-    double rounded;
-    auto round_bits = state->controlWord & X87ControlWord::kRoundingControlMask;
-
-    switch (round_bits) {
-        case X87ControlWord::kRoundToNearest: {
-            rounded = std::nearbyint(value);
-        } break;
-
-        case X87ControlWord::kRoundDown: {
-            rounded = std::floor(value);
-        } break;
-
-        case X87ControlWord::kRoundUp: {
-            rounded = std::ceil(value);
-        } break;
-
-        case X87ControlWord::kRoundToZero: {
-            rounded = std::trunc(value);
-        } break;
-    }
-
-    // Store rounded value and update tag
-    state->setStFast(0, rounded);
+    // Round per RC, store, and update tag
+    state->setStFast(0, x87_round_by_rc(state->getStFast(0), state->controlWord));
 }
 
 void x87_fscale(X87State* state) {
@@ -1645,20 +1585,23 @@ void x87_fxtract(X87State* state) {
     // If the floating-point zero-divide exception (#Z) is masked and the source
     // operand is zero, an exponent value of –∞ is stored in register ST(1) and 0
     // with the sign of the source operand is stored in register ST(0).
+    // Like the normal path, both special cases must PUSH: the exponent goes
+    // to what becomes ST(1) and the significand to the new ST(0).
     if ((state->controlWord & X87ControlWord::kZeroDivideMask) != 0 && st0 == 0.0) {
-        state->setSt(1, -std::numeric_limits<double>::infinity());
+        state->setSt(0, -std::numeric_limits<double>::infinity());
+        state->push();
         state->setSt(0, copysign(0.0, st0));
         return;
     }
 
     if (isinf(st0)) {
-        state->setSt(0, st0);
+        state->setSt(0, std::numeric_limits<double>::infinity());  // exponent
         state->push();
-        state->setSt(0, std::numeric_limits<double>::infinity());
+        state->setSt(0, st0);  // significand keeps the source's sign
         return;
     }
 
-    auto e = std::floor(openlibm_log2(abs(st0)));
+    auto e = std::floor(openlibm_log2(std::fabs(st0)));
     auto m = st0 / openlibm_pow(2.0, e);
 
     state->setSt(0, e);
@@ -1675,8 +1618,18 @@ static inline __attribute__((always_inline)) void fyl2x_common(X87State* state, 
     auto st0 = state->getSt(0);
     auto st1 = state->getSt(1);
 
-    // Calculate y * log2(x)
-    auto result = st1 * (openlibm_log2(st0 + constant));
+    double result;
+    if (constant == 1.0 && std::fabs(st0) < 0x1p-20) {
+        // fyl2xp1 with tiny x: forming 1.0+x rounds the significance away
+        // (hardware guarantees precision here — that is fyl2xp1's purpose).
+        // log2(1+x) = (x - x²/2 + x³/3 - …)·log2(e); the x³ term keeps the
+        // truncation error below 2^-62 relative for |x| < 2^-20.
+        constexpr double kLog2e = 1.4426950408889634074;
+        result = st1 * (st0 * (1.0 - st0 * (0.5 - st0 * (1.0 / 3.0))) * kLog2e);
+    } else {
+        // Calculate y * log2(x + constant)
+        result = st1 * (openlibm_log2(st0 + constant));
+    }
 
     // Pop ST(0)
     state->pop();
