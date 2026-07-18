@@ -22,6 +22,11 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      - name: Run bridge-demand tests
+        # Translation-only (never executes the blob), so no Rosetta/sudo needed.
+        # Uses build/bin/aotinvoke from the Build step + clang/otool on the runner.
+        run: python3 scripts/run_bridge_demand_tests.py
+
       - name: Run tests
         # PT_ATTACH on macOS needs either the debugger entitlement (granted via
         # an interactive system dialog on first launch — not available in
