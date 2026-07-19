@@ -559,6 +559,70 @@ static uint16_t do_ftst(double a) {
 }
 
 /* =========================================================================
+ * Section 8: FPREM / FPREM1 software loop (C2 termination)
+ *
+ * Mirrors the canonical CRT fmod helper (e.g. Oblivion's fFMOD):
+ *     remloop: fprem
+ *              fnstsw %ax / sahf / jp remloop
+ * sahf maps status-word C2 (bit 10) onto PF, so the loop only exits once
+ * FPREM reports the reduction complete (C2=0).  A zero dividend must
+ * terminate on the first pass; a huge exponent gap may take several
+ * partial reductions but must still converge.  iters_out reports the
+ * number of FPREM executions; hitting the cap means C2 is stuck — the
+ * in-game deadlock.
+ * ========================================================================= */
+
+#define PREM_LOOP_CAP 64
+
+static double fprem_loop(double a, double b, int *iters_out) {
+    double r;
+    uint32_t iters = 0;
+    __asm__ volatile(
+        "fldl %3\n"          /* ST0=b */
+        "fldl %2\n"          /* ST0=a ST1=b */
+        "1:\n"
+        "incl %1\n"
+        "cmpl $64, %1\n"
+        "jae 2f\n"           /* cap: C2 stuck, bail out */
+        "fprem\n"
+        "fnstsw %%ax\n"
+        "sahf\n"
+        "jp 1b\n"            /* PF==C2: incomplete, reduce again */
+        "2:\n"
+        "fstpl %0\n"
+        "fstp %%st(0)\n"
+        : "=m"(r), "+r"(iters)
+        : "m"(a), "m"(b)
+        : "ax", "cc");
+    *iters_out = (int)iters;
+    return r;
+}
+
+static double fprem1_loop(double a, double b, int *iters_out) {
+    double r;
+    uint32_t iters = 0;
+    __asm__ volatile(
+        "fldl %3\n"
+        "fldl %2\n"
+        "1:\n"
+        "incl %1\n"
+        "cmpl $64, %1\n"
+        "jae 2f\n"
+        "fprem1\n"
+        "fnstsw %%ax\n"
+        "sahf\n"
+        "jp 1b\n"
+        "2:\n"
+        "fstpl %0\n"
+        "fstp %%st(0)\n"
+        : "=m"(r), "+r"(iters)
+        : "m"(a), "m"(b)
+        : "ax", "cc");
+    *iters_out = (int)iters;
+    return r;
+}
+
+/* =========================================================================
  * main
  * ========================================================================= */
 
@@ -798,6 +862,46 @@ int main(void) {
     check_u16("FTST  -3.0 < 0 LT=0x0100", do_ftst(-3.0), 0x0100);
     check_u16("FTST  0.0 == 0 EQ=0x4000", do_ftst(0.0), 0x4000);
     check_u16("FTST  NaN      UN=0x4500", do_ftst(__builtin_nan("")), 0x4500);
+
+    /* ---- Section 8: FPREM / FPREM1 software loop termination ---- */
+    printf("\n=== FPREM / FPREM1 software loop (C2 termination) ===\n");
+    {
+        int it;
+        double r;
+
+        /* Zero dividend: must terminate on the first pass (C2 clear).
+         * Regression: ilogb(0)=INT_MIN made D wrap positive, wedging C2. */
+        r = fprem_loop(0.0, 360.0, &it);
+        check_d("FPREM loop  fmod(0,360) = +0", r, 0.0);
+        check_i("FPREM loop  (0,360) terminates", it < PREM_LOOP_CAP, 1);
+
+        r = fprem_loop(-0.0, 6.283185307179586, &it);
+        check_d("FPREM loop  fmod(-0,2pi) = -0", r, -0.0);
+        check_i("FPREM loop  (-0,2pi) terminates", it < PREM_LOOP_CAP, 1);
+
+        /* Huge exponent gap, exact multiple: pass 1 legitimately reports
+         * C2 (partial), later passes see a zero dividend and must clear. */
+        r = fprem_loop(0x1p100, 2.0, &it);
+        check_d("FPREM loop  fmod(2^100,2) = +0", r, 0.0);
+        check_i("FPREM loop  (2^100,2) terminates", it < PREM_LOOP_CAP, 1);
+
+        /* Huge exponent gap, nonzero remainder: converges via reduction. */
+        r = fprem_loop(0x1p100, 3.0, &it);
+        check_d("FPREM loop  fmod(2^100,3)", r, fmod(0x1p100, 3.0));
+        check_i("FPREM loop  (2^100,3) terminates", it < PREM_LOOP_CAP, 1);
+
+        r = fprem1_loop(0.0, 360.0, &it);
+        check_d("FPREM1 loop rem(0,360) = +0", r, 0.0);
+        check_i("FPREM1 loop (0,360) terminates", it < PREM_LOOP_CAP, 1);
+
+        r = fprem1_loop(0x1p100, 2.0, &it);
+        check_d("FPREM1 loop rem(2^100,2) = +0", r, 0.0);
+        check_i("FPREM1 loop (2^100,2) terminates", it < PREM_LOOP_CAP, 1);
+
+        r = fprem1_loop(0x1p100, 3.0, &it);
+        check_d("FPREM1 loop rem(2^100,3)", r, remainder(0x1p100, 3.0));
+        check_i("FPREM1 loop (2^100,3) terminates", it < PREM_LOOP_CAP, 1);
+    }
 
     printf("\n%s  (%d failure%s)\n",
            failures == 0 ? "ALL PASS" : "SOME FAILURES",

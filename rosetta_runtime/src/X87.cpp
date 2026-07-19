@@ -1072,6 +1072,15 @@ void x87_fprem(X87State* state) {
     double rem = openlibm_fmod(st0, st1);
     state->setSt(0, rem);
 
+    // Zero dividend: rem is ±0 and CC0-CC3 stay clear (native Rosetta's
+    // zero-dividend early-out does status &= 0xB8FF). Must not reach the
+    // ilogb below — ilogb(0) is the FP_ILOGB0 sentinel (INT_MIN) and the
+    // subtraction wraps positive, setting CC2 on every call so the guest
+    // fprem loop (fstsw/sahf/jp) spins forever.
+    if (st0 == 0.0) {
+        return;
+    }
+
     // 4) CC2 "incomplete" per spec only when the exponent gap D = E0-E1
     //    reaches 64 (hardware reduces ≤63 bits per FPREM and software loops
     //    on C2; rem < ST1 makes the next pass complete). The quotient bits
@@ -1125,6 +1134,13 @@ void x87_fprem1(X87State* state) {
     double rem = openlibm_remquo(st0, st1, &q);
     // rem = ST0 – q*ST1, where q = round-to-nearest(ST0/ST1), ties-to-even
     state->setSt(0, rem);
+
+    // Zero dividend: q is 0 so CC0/1/3 stay clear; skip the ilogb-based CC2
+    // check below — ilogb(0) is the FP_ILOGB0 sentinel (INT_MIN) and D wraps
+    // positive, wedging CC2 set for guest fprem1 software loops.
+    if (st0 == 0.0) {
+        return;
+    }
 
     // 4) CC0, CC1, CC3 from the three low bits of q:
     //    Q2→CC0, Q0→CC1, Q1→CC3
