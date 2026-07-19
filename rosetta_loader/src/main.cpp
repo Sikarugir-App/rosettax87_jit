@@ -709,6 +709,41 @@ int main(int argc, char* argv[]) {
     }
     LOG("Attached successfully\n");
 
+    // Inject apple[] entries from ROSETTA_X87_APPLE env var (semicolon-separated)
+    // and scrub any ROSETTA_X87_* entries the kernel mirrored into apple[].
+    {
+        arm_thread_state64_t state;
+        dbg.copyThreadState(state);
+        uint64_t oldSP = state.__sp;
+
+        uint64_t count;
+        dbg.readMemory(oldSP + 0x20, &count, sizeof(count));
+        uint64_t headerSize = (count + 6) * 8;
+        uint64_t oldAppleBase = oldSP + headerSize;
+
+        LOG("apple[]: SP=0x%llx count=%llu headerSize=%llu appleBase=0x%llx\n",
+            oldSP, count, headerSize, oldAppleBase);
+
+        // Scrub ROSETTA_X87_* entries from existing apple[] — the kernel mirrors
+        // ROSETTA_* env vars into apple[], and with our SIP bypass the runtime
+        // would reject them as "invalid ROSETTA_ environment variable".
+        // NUL the first byte of each matching string so the runtime skips it.
+        {
+            uint64_t ptr;
+            for (uint64_t addr = oldAppleBase; ; addr += 8) {
+                dbg.readMemory(addr, &ptr, 8);
+                if (ptr == 0) break;
+                char prefix[13] = {};
+                dbg.readMemory(ptr, prefix, 12);
+                if (strncmp(prefix, "ROSETTA_X87_", 12) == 0) {
+                    uint8_t nul = 0;
+                    dbg.writeMemory(ptr, &nul, 1);
+                    LOG("apple[]: scrubbed ROSETTA_X87_* entry at 0x%llx\n", ptr);
+                }
+            }
+        }
+    }
+
     OffsetFinder offsetFinder;
     if (!offsetFinder.scanRuntime()) {
         fprintf(stderr, "Fatal: failed to scan rosetta runtime for offsets.\n");
@@ -716,9 +751,10 @@ int main(int argc, char* argv[]) {
     }
     LOG("Found rosetta runtime offsets successfully!\n");
     LOG("offset_exports_fetch=%llx offset_svc_call_entry=%llx offset_svc_call_ret=%llx "
-        "offset_classify_arm_pc=%llx\n",
+        "offset_classify_arm_pc=%llx offset_sys_csrctl=%llx\n",
         offsetFinder.offsetExportsFetch_, offsetFinder.offsetSvcCallEntry_,
-        offsetFinder.offsetSvcCallRet_, offsetFinder.offsetClassifyArmPc_);
+        offsetFinder.offsetSvcCallRet_, offsetFinder.offsetClassifyArmPc_,
+        offsetFinder.offsetSysCsrctl_);
 
     if (!offsetFinder.scanLibRosettaRuntime()) {
         fprintf(stderr, "Fatal: failed to scan libRosettaRuntime for offsets.\n");
@@ -742,6 +778,20 @@ int main(int argc, char* argv[]) {
 
     dbg.writeMemory(runtimeBase + offsetFinder.offsetDisableAot_, &g_disable_aot_value,
                     sizeof(g_disable_aot_value));
+
+    // Patch sys_csrctl to always return 0, bypassing the SIP check so that
+    // injected ROSETTA_* apple[] variables are accepted by main's env loop.
+    // Original: MOV X16,#0x1E3; SVC 0x80; MOV X1,#-1; CSEL X0,X1,X0,CS; RET
+    // Patched:  MOV X0, #0; RET
+    {
+        uint32_t patch[] = {0xD2800000, 0xD65F03C0};  // MOV X0, #0; RET
+        uint64_t csrctlAddr = runtimeBase + offsetFinder.offsetSysCsrctl_;
+        dbg.adjustMemoryProtection(csrctlAddr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
+                                   sizeof(patch));
+        dbg.writeMemory(csrctlAddr, patch, sizeof(patch));
+        dbg.adjustMemoryProtection(csrctlAddr, VM_PROT_READ | VM_PROT_EXECUTE, sizeof(patch));
+        LOG("Patched sys_csrctl at 0x%llx to return 0\n", csrctlAddr);
+    }
 
     // Catch the one planted BRK at THREAD level on the currently stopped thread
     // (the single init thread that will execute exports_fetch). Thread-level

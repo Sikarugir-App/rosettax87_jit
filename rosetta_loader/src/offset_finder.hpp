@@ -12,6 +12,8 @@ struct OffsetFinder {
     uint64_t offsetDisableAot_{};
     uint64_t offsetClassifyArmPc_{};
 
+    uint64_t offsetSysCsrctl_{};
+
     uint64_t offsetTransactionResultSize_{};
     uint64_t offsetTranslateInsn_{};
     uint64_t offsetInitLibrary_{};

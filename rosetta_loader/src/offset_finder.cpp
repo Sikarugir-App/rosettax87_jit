@@ -51,12 +51,20 @@ auto OffsetFinder::scanRuntime() -> bool {
         return aarch64::decodeBl(blInsn, blOffset);
     };
 
+    auto findSysCsrctl = [&]() -> std::optional<uint64_t> {
+        // MOV X16, #0x1E3; SVC 0x80; MOV X1, #-1; CSEL X0, X1, X0, CS; RET
+        return findPattern(loader.buffer_,
+                           "70 3C 80 D2 01 10 00 D4 01 00 80 92 20 20 80 9A C0 03 5F D6",
+                           "sysCsrctl");
+    };
+
     auto exportsFetch = findExportsFetch();
     auto svcCall = findSvcCall();
     auto disableAot = findDisableAot();
     auto classifyArmPc = findClassifyArmPc();
+    auto sysCsrctl = findSysCsrctl();
 
-    if (!exportsFetch || !svcCall || !disableAot || !classifyArmPc)
+    if (!exportsFetch || !svcCall || !disableAot || !classifyArmPc || !sysCsrctl)
         return false;
 
     offsetExportsFetch_ = *exportsFetch;
@@ -64,6 +72,7 @@ auto OffsetFinder::scanRuntime() -> bool {
     offsetSvcCallRet_ = *svcCall + 0xC;
     offsetDisableAot_ = *disableAot;
     offsetClassifyArmPc_ = *classifyArmPc;
+    offsetSysCsrctl_ = *sysCsrctl;
 
     return true;
 }

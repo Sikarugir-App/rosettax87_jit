@@ -63,7 +63,7 @@ All flags are set via environment variables and read at runtime.
 | `ROSETTA_X87_F32_ARITH=1` | Keep f32-sourced arithmetic chains in f32 registers instead of widening intermediates to f64 (not bit-exact vs real x87 f64 intermediates; requires `ROSETTA_X87_F32_NARROW`) |
 | `ROSETTA_X87_FAST_RECIP_DIV=1` | Rewrite FDIV by *any* normal constant as FMUL by its reciprocal (up to 1 ulp off; exact power-of-two divisors are always rewritten regardless of this flag) |
 
-Flags in this table that trade fidelity for speed (`FAST_ROUND`, `F32_ARITH`, `FAST_RECIP_DIV`) are opt-in and default to off. `CONST_PROMOTE` and `F32_NARROW` are also opt-in after causing rare misbehavior in a real workload; `CONST_PROMOTE`'s known cause (promoting from pages whose protection later flipped to writable) is fixed by gating on max-protection.
+Flags that trade fidelity for speed (`FAST_ROUND`, `F32_ARITH`, `FAST_RECIP_DIV`) are opt-in and default to off. `CONST_PROMOTE` and `F32_NARROW` are also opt-in.
 
 ### Debugging & Troubleshooting
 
@@ -83,6 +83,55 @@ These flags are primarily useful for narrowing down bugs by selectively disablin
 | `ROSETTA_X87_LOG_RUN_BREAKS=1` | Log length + breaking opcode + gap-to-next-x87 for every x87 run — useful for finding what terminates runs in real workloads |
 | `ROSETTA_X87_LOGS=1` | Enable verbose logging output from the loader |
 | `ROSETTA_FORCE_CPU_MODE32=1` | Force the decoder into 32-bit mode (test-only; lets `aotinvoke` reach legacy opcodes like ARPL) |
+
+### Unlocked Rosetta Runtime Flags
+
+The loader patches the runtime's SIP check (`sys_csrctl`) to accept `ROSETTA_*` environment variables that are normally blocked. These are Apple's own debugging/diagnostic flags built into `/usr/libexec/rosetta/runtime` — the loader simply makes them accessible.
+
+| Variable | Description |
+|----------|-------------|
+| `ROSETTA_DISABLE_AOT=1` | Skip AOT (ahead-of-time) shared cache translations; force everything through the JIT path |
+| `ROSETTA_PRINT_IR=1` | Print the translator's intermediate representation during compilation |
+| `ROSETTA_PRINT_SEGMENTS=1` | Print segment mapping information during process setup |
+| `ROSETTA_HARDWARE_TRACING_PATH=/path` | Write a binary trace file to the given path (appends `.<pid>`); records JIT translations, code bytes, and runtime mappings (see `scripts/parse_rosetta_trace.py`) |
+| `ROSETTA_SCRIBBLE_TRANSLATIONS=1` | Emit Type 4 (JIT fragment freed) records in the hardware trace; enables tracking translation eviction |
+| `ROSETTA_AOT_ERRORS_ARE_FATAL=1` | Abort on AOT translation errors instead of falling back to JIT |
+| `ROSETTA_DISABLE_EXCEPTIONS=1` | Disable Rosetta's exception handling machinery |
+| `ROSETTA_DISABLE_SIGACTION=1` | Disable Rosetta's `sigaction` interposition |
+| `ROSETTA_ALLOW_GUARD_PAGES=1` | Allow guard page mappings in the translated process |
+| `ROSETTA_ADVERTISE_AVX=1` | Report AVX support in CPUID (translation of AVX instructions is not implied) |
+| `ROSETTA_DEBUGSERVER_PORT=<port>` | Attach Rosetta's internal debug server to the given Mach port |
+| `ROSETTA_MEMORY_ACCESS_INSTRUMENTATION=1` | Enable memory access instrumentation in generated code |
+
+## IDA Pro Tooling
+
+Scripts for loading and analyzing Rosetta JIT traces in IDA Pro 9.x.
+
+### Trace Loader (`scripts/ida_rosetta_trace_loader.py`)
+
+IDA loader plugin that imports hardware trace files (produced by `ROSETTA_HARDWARE_TRACING_PATH`) as IDA databases. Symlink to `<IDA>/loaders/`.
+
+- Creates ARM64 code segments from Type 3 (JIT Code Emitted) records
+- Labels each function as `jit_<x86_source_addr>`
+- Maps the `rt_routines` segment and labels all 98 known runtime stubs
+- Resolves `BR`/`BLR` to `stub_branch_slot` with xrefs to target `jit_` functions
+- Adds `"-> x86 0x... (not in trace)"` comments for calls to functions outside the trace
+
+### Hex-Rays Decompiler Plugin (`scripts/ida_rosetta_hexrays.py`)
+
+Hex-Rays plugin that resolves indirect calls through runtime stubs into direct calls. Symlink to `<IDA>/plugins/`.
+
+- Intercepts `m_call` microcode instructions targeting stub addresses
+- Redirects to the actual `jit_` target using xrefs from the loader
+- Falls back to scanning for `MOV X22, #imm` when no xref exists
+
+### Trace Parser (`scripts/parse_rosetta_trace.py`)
+
+Standalone Python script that parses and pretty-prints Rosetta hardware trace files. Useful for inspecting traces without IDA.
+
+```bash
+python3 scripts/parse_rosetta_trace.py tracee.bin.<pid>
+```
 
 ## Usage with Wine
 
